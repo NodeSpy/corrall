@@ -111,8 +111,8 @@ directory, for a wrapper resolving a project it has not entered yet.
 
 | Field | Default | Description |
 | --- | --- | --- |
-| `proxy.port` | `3456` | Local port |
-| `proxy.host` | `127.0.0.1` | Bind address. Anything non-loopback requires `proxy.apiKey` of at least 16 chars; the server refuses to start otherwise. `TEAMCLAUDE_HOST` overrides |
+| `proxy.port` | `3456` | Local port. `teamclaude server --port N` overrides it for one run |
+| `proxy.host` | `127.0.0.1` | Bind address. Anything non-loopback requires `proxy.apiKey` of at least 16 chars; the server refuses to start otherwise. `TEAMCLAUDE_HOST` overrides, as does `teamclaude server --listen HOST:PORT` for one run |
 | `proxy.apiKey` | generated | Key clients present via `x-api-key` (or `Authorization: Bearer tc-…`, or the Basic password on CONNECT). Generated once as `tc-…` and written back if the file has none; a key you set is never touched |
 | `proxy.clientKeys` | `[]` | `[{ "name", "key" }]`; usage is attributed to `name` |
 | `proxy.requireKeyOnLoopback` | `false` | Require the key even from 127.0.0.1. Recommended on shared hosts |
@@ -207,6 +207,47 @@ A `/pool/<name>` prefix on the control path selects the pool too, so
 its WebSocket upgrade) are relayed to the Anthropic upstream with the client's
 own `authorization` header and no account selection. Hop-by-hop headers and the
 proxy key are stripped.
+
+## Importing from claudeacrobat
+
+`teamclaude import-claudeacrobat` reads the account files of a
+[claudeacrobat](https://github.com/EdnitionCode/claudeacrobat) install and
+writes them into this config. It is a read: claudeacrobat's own files are never
+touched, so both proxies keep working (on their own ports) afterwards.
+
+```bash
+teamclaude import-claudeacrobat --dry-run          # what would land where
+teamclaude import-claudeacrobat                    # keep its pool layout
+teamclaude import-claudeacrobat --pool work        # put everything in one pool
+teamclaude import-claudeacrobat --from /srv/acrobat-state
+```
+
+| Flag | Effect |
+| --- | --- |
+| `--from DIR` | claudeacrobat's state directory. Default: the `state_dir` in `~/.config/claudeacrobat/config.json`, else `~/.local/state/claudeacrobat` |
+| `--pool P` | Import everything into `P` (created if new) instead of the pool each account came from |
+| `--dry-run` | Print the plan and write nothing |
+
+Mapping, the inverse of claudeacrobat's own `import-teamclaude`:
+
+| claudeacrobat | teamclaude |
+| --- | --- |
+| `kind: owned` (it holds and refreshes the tokens) | `type: oauth` with `accessToken` / `refreshToken` / `expiresAt` |
+| `kind: linked` (tokens read live from Claude Code) | `type: oauth` with `importFrom` set to that credentials file |
+| `accounts/` | the pool named by `defaultPool` |
+| `pools/<name>/accounts/` | pool `<name>`, created if new |
+| `profile`, `priority`, `disabled` | `accountUuid`, `orgUuid`, `orgName`, `email`, `subscriptionType`, `rateLimitTier`, `priority`, `disabled` |
+
+Without `--pool`, claudeacrobat's pool layout carries over as it stands: two
+fleets it kept apart stay apart, because merging them would have both rotations
+spending one account's quota without either knowing.
+
+Re-running is safe. An account is matched by `accountUuid` (then by name) and
+refreshed in place, keeping whatever teamclaude-only settings it had — a route,
+a `modelMap`, its own `upstream`. Anything with no teamclaude equivalent is
+reported rather than guessed at: an account with no token, a pool whose name is
+outside [teamclaude's charset](#pools), an API-key or Codex account that already
+holds the same name.
 
 ## Codex
 

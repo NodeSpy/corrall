@@ -27,6 +27,8 @@ pub enum Command {
     Login(LoginArgs),
     /// Import credentials from Claude Code's credential store
     Import(ImportArgs),
+    /// Import accounts from a claudeacrobat install
+    ImportClaudeacrobat(ImportAcrobatArgs),
     /// List configured accounts
     Accounts {
         #[arg(short, long)]
@@ -161,6 +163,13 @@ pub struct ServerArgs {
     /// Append activity lines to FILE
     #[arg(long, value_name = "FILE")]
     pub activity_log: Option<String>,
+    /// Bind this address for this run instead of proxy.host/proxy.port
+    /// (HOST:PORT, :PORT or PORT)
+    #[arg(long, value_name = "ADDR", conflicts_with = "port")]
+    pub listen: Option<String>,
+    /// Bind this port for this run instead of proxy.port
+    #[arg(long, value_name = "PORT")]
+    pub port: Option<u16>,
 }
 
 #[derive(Args, Debug)]
@@ -201,6 +210,20 @@ pub struct ImportArgs {
     /// Pool to put the account in (created if new; moves an existing account)
     #[arg(long)]
     pub pool: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct ImportAcrobatArgs {
+    /// claudeacrobat state directory (default: its config's state_dir, else
+    /// ~/.local/state/claudeacrobat)
+    #[arg(long, value_name = "DIR")]
+    pub from: Option<String>,
+    /// Import every account into this pool instead of the one it came from
+    #[arg(long)]
+    pub pool: Option<String>,
+    /// Show what would be imported without writing anything
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 #[derive(Args, Debug)]
@@ -384,6 +407,61 @@ fn target_pool(cfg: &mut Config, pool: Option<&str>) -> Result<String> {
         eprintln!("Created pool \"{p}\"");
     }
     Ok(p.to_string())
+}
+
+/// Apply a `--listen`/`--port` override to a freshly loaded config.
+///
+/// This lives apart from the server startup because the reload path needs it
+/// too: a config re-read from disk carries the file's port, and without
+/// re-applying the override a reload would move the port the warmer dials and
+/// the status page reports away from the one actually bound.
+pub fn apply_listen_override(cfg: &mut Config, listen: Option<&str>, port: Option<u16>) -> Result<()> {
+    if let Some(addr) = listen {
+        let (host, port) = parse_listen(addr)?;
+        if let Some(h) = host {
+            cfg.proxy.host = Some(h);
+        }
+        cfg.proxy.port = port;
+    }
+    if let Some(port) = port {
+        cfg.proxy.port = port;
+    }
+    // An override can open the port to the network as surely as the config can,
+    // so it faces the same check.
+    cfg.validate()
+}
+
+/// Parse `--listen`: `HOST:PORT`, `:PORT` (keep the configured host) or a bare
+/// `PORT`. An IPv6 host must be bracketed — `[::1]:3456` — because an
+/// unbracketed one cannot be told apart from a host with a port.
+pub fn parse_listen(addr: &str) -> Result<(Option<String>, u16)> {
+    let s = addr.trim();
+    if s.is_empty() {
+        bail!("--listen needs an address: HOST:PORT, :PORT or PORT");
+    }
+    let (host, port) = match s.parse::<u16>() {
+        Ok(port) => (None, port),
+        Err(_) => {
+            let Some((h, p)) = s.rsplit_once(':') else {
+                bail!("--listen {addr:?} is not HOST:PORT, :PORT or PORT");
+            };
+            let h = h.trim();
+            if h.contains(':') && !(h.starts_with('[') && h.ends_with(']')) {
+                bail!("--listen {addr:?}: bracket an IPv6 host, as in [::1]:{}", p.trim());
+            }
+            let port: u16 = p.trim().parse().map_err(|_| anyhow!("--listen {addr:?}: {:?} is not a port", p.trim()))?;
+            ((!h.is_empty()).then(|| h.to_string()), port)
+        }
+    };
+    if port == 0 {
+        bail!("--listen {addr:?}: port 0 would bind an arbitrary port that nothing else could find");
+    }
+    if let Some(h) = &host {
+        if crate::proxy::server::parse_bind(h, port).is_err() {
+            bail!("--listen {addr:?}: {h:?} is not an IP address (or localhost)");
+        }
+    }
+    Ok((host, port))
 }
 
 /// `" in pool \"x\""`, or nothing when the command did not name a pool.
@@ -661,6 +739,145 @@ pub async fn import(args: ImportArgs) -> Result<()> {
     eprintln!("Imported \"{name}\"{}{}", if args.link { " (linked to the credential file)" } else { "" }, pool_note(args.pool.as_deref()));
     notify_reload(&cfg).await;
     Ok(())
+}
+
+/// One account, mapped and with its destination pool resolved.
+struct AcrobatRow {
+    pool: String,
+    kind: &'static str,
+    account: AccountConfig,
+}
+
+pub async fn import_claudeacrobat(args: ImportAcrobatArgs) -> Result<()> {
+    let cfg = Config::load_or_create()?;
+    crate::upstream::init(&cfg)?;
+    let dir = args.from.as_deref().map(oauth::expand_home).unwrap_or_else(crate::migrate::default_state_dir);
+    let plan = crate::migrate::plan(&dir)?;
+
+    // Without --pool, claudeacrobat's pool layout carries over as it stands:
+    // two fleets it kept apart stay apart here, because merging them would have
+    // both rotations spending one account's quota without either knowing.
+    let mut rows: Vec<AcrobatRow> = Vec::new();
+    let mut skipped: Vec<(String, String)> = plan.skipped.iter().map(|s| (s.name.clone(), s.reason.clone())).collect();
+    for m in &plan.accounts {
+        let pool = args.pool.clone().or_else(|| m.pool.clone()).unwrap_or_else(|| cfg.default_pool.clone());
+        // An API-key or Codex account of the same name is a different thing
+        // wearing the same label; overwriting its credential would be a
+        // surprise, so leave it alone and say so.
+        if let Some((p, i)) = locate_by(&cfg, |a| a.name == m.account.name) {
+            let existing = &cfg.pool(&p).expect("locate_by returns a configured pool").accounts[i];
+            if !is_anthropic_oauth(existing) {
+                let what = if existing.is_codex() { "a Codex account" } else { "an API-key account" };
+                skipped.push((m.account.name.clone(), format!("teamclaude already has {what} named that in pool \"{p}\"")));
+                continue;
+            }
+        }
+        rows.push(AcrobatRow { pool, kind: m.kind(), account: m.account.clone() });
+    }
+
+    println!("claudeacrobat state: {}", dir.display());
+    println!("{} account(s):", rows.len());
+    for r in &rows {
+        let disabled = if r.account.disabled { " (disabled)" } else { "" };
+        println!("  {:<28} {:<6} priority {} → pool \"{}\"{disabled}", r.account.name, r.kind, r.account.priority, r.pool);
+    }
+    for (name, reason) in &skipped {
+        println!("  skip {name:<28} {reason}");
+    }
+    if rows.is_empty() {
+        println!("\nNothing to import.");
+        return Ok(());
+    }
+    if args.dry_run {
+        println!("\n(dry run — nothing written)");
+        return Ok(());
+    }
+
+    let mut added = 0usize;
+    let mut updated = 0usize;
+    let cfg = Config::update(|c| {
+        for r in &rows {
+            let pool = target_pool(c, Some(&r.pool))?;
+            if upsert_acrobat(c, &pool, &r.account) {
+                updated += 1;
+            } else {
+                added += 1;
+            }
+        }
+        c.ensure_account_ids();
+        // The imported accounts have to satisfy the same rules as a hand-written
+        // config; a failure here aborts the whole write rather than saving a
+        // file teamclaude would refuse to load.
+        c.validate()
+    })?;
+
+    let pools: Vec<&str> = {
+        let mut v: Vec<&str> = rows.iter().map(|r| r.pool.as_str()).collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    };
+    println!("\nImported {} account(s) into pool{} {}.", added + updated, if pools.len() == 1 { "" } else { "s" }, quoted_list(&pools));
+    if updated > 0 {
+        println!("{updated} of them updated an account teamclaude already had.");
+    }
+    println!("`teamclaude accounts` lists them; `eval \"$(teamclaude env)\"` points Claude Code at this proxy.");
+    for p in pools.iter().filter(|p| **p != cfg.default_pool) {
+        println!("Pool \"{p}\" serves `/pool/{p}`: `eval \"$(teamclaude env --pool {p})\"`.");
+    }
+    println!("claudeacrobat's own files are untouched, so it keeps working on its own port.");
+    notify_reload(&cfg).await;
+    Ok(())
+}
+
+/// Whether an existing entry is the kind of account an import can refresh in
+/// place: an Anthropic OAuth account, not an API key and not Codex.
+fn is_anthropic_oauth(a: &AccountConfig) -> bool {
+    a.kind == AccountType::Oauth && !a.is_codex()
+}
+
+/// Write one imported account into `pool`, returning whether it replaced an
+/// account teamclaude already had. Identity comes from the account uuid when
+/// claudeacrobat recorded one, and the name otherwise.
+///
+/// Only the fields the import actually carries are assigned: an account that
+/// already had teamclaude-only settings — a route, a model map, its own upstream
+/// — keeps them, and only its credential and profile are refreshed.
+fn upsert_acrobat(cfg: &mut Config, pool: &str, src: &AccountConfig) -> bool {
+    let found = src
+        .account_uuid
+        .as_deref()
+        .and_then(|au| {
+            let ou = src.org_uuid.as_deref();
+            locate_by(cfg, |a| is_anthropic_oauth(a) && a.account_uuid.as_deref() == Some(au) && (ou.is_none() || a.org_uuid.as_deref() == ou))
+        })
+        .or_else(|| locate_by(cfg, |a| is_anthropic_oauth(a) && a.name == src.name));
+    let (entry, updated) = entry_at(cfg, pool, found, || src.clone());
+    entry.name = src.name.clone();
+    entry.kind = AccountType::Oauth;
+    entry.priority = src.priority;
+    entry.disabled = src.disabled;
+    entry.import_from = src.import_from.clone();
+    entry.access_token = src.access_token.clone();
+    entry.refresh_token = src.refresh_token.clone();
+    entry.expires_at = src.expires_at;
+    entry.account_uuid = src.account_uuid.clone().or(entry.account_uuid.take());
+    entry.org_uuid = src.org_uuid.clone().or(entry.org_uuid.take());
+    entry.org_name = src.org_name.clone().or(entry.org_name.take());
+    entry.email = src.email.clone().or(entry.email.take());
+    entry.subscription_type = src.subscription_type.clone().or(entry.subscription_type.take());
+    entry.rate_limit_tier = src.rate_limit_tier.clone().or(entry.rate_limit_tier.take());
+    updated
+}
+
+/// `"a"`, `"a" and "b"`, `"a", "b" and "c"`.
+fn quoted_list(items: &[&str]) -> String {
+    let quoted: Vec<String> = items.iter().map(|s| format!("\"{s}\"")).collect();
+    match quoted.split_last() {
+        None => String::new(),
+        Some((last, [])) => last.clone(),
+        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+    }
 }
 
 pub fn accounts(verbose: bool, pool: Option<String>) -> Result<()> {
@@ -1648,5 +1865,101 @@ mod tests {
 
         apply_pool_set(&mut cfg, "work", &set(&[], &[], &[], true)).unwrap();
         assert_eq!(cfg.pool("work").unwrap().match_rules, None);
+    }
+
+    #[test]
+    fn listen_accepts_a_port_a_host_and_a_bare_colon() {
+        assert_eq!(parse_listen("3456").unwrap(), (None, 3456));
+        assert_eq!(parse_listen(":8080").unwrap(), (None, 8080));
+        assert_eq!(parse_listen(" 127.0.0.1:8080 ").unwrap(), (Some("127.0.0.1".into()), 8080));
+        assert_eq!(parse_listen("0.0.0.0:8080").unwrap(), (Some("0.0.0.0".into()), 8080));
+        assert_eq!(parse_listen("[::1]:8080").unwrap(), (Some("[::1]".into()), 8080));
+        assert_eq!(parse_listen("localhost:8080").unwrap(), (Some("localhost".into()), 8080));
+
+        for bad in ["", "  ", "nonsense", "example.com:8080", "127.0.0.1:", "127.0.0.1:notaport", "::1:8080", "0", "127.0.0.1:0", "127.0.0.1:99999"] {
+            assert!(parse_listen(bad).is_err(), "{bad:?} should not parse");
+        }
+        // The IPv6 message says what to do about it.
+        assert!(parse_listen("::1:8080").unwrap_err().to_string().contains("[::1]:8080"));
+    }
+
+    #[test]
+    fn a_listen_override_moves_the_bind_and_still_faces_validation() {
+        let mut cfg = Config::default();
+        apply_listen_override(&mut cfg, None, None).unwrap();
+        assert_eq!((cfg.proxy.host.clone(), cfg.proxy.port), (None, 3456), "no flags, no change");
+
+        apply_listen_override(&mut cfg, None, Some(9001)).unwrap();
+        assert_eq!((cfg.proxy.host.clone(), cfg.proxy.port), (None, 9001), "--port leaves the host alone");
+
+        apply_listen_override(&mut cfg, Some(":9002"), None).unwrap();
+        assert_eq!((cfg.proxy.host.clone(), cfg.proxy.port), (None, 9002));
+
+        apply_listen_override(&mut cfg, Some("127.0.0.2:9003"), None).unwrap();
+        assert_eq!((cfg.proxy.host.as_deref(), cfg.proxy.port), (Some("127.0.0.2"), 9003));
+
+        // Opening the port to the network by flag faces the same key check the
+        // config file does.
+        let mut cfg = Config::default();
+        cfg.proxy.api_key = "short".into();
+        assert!(apply_listen_override(&mut cfg, Some("0.0.0.0:9004"), None).is_err());
+        assert!(apply_listen_override(&mut cfg, Some("127.0.0.1:9004"), None).is_ok());
+    }
+
+    /// Re-importing must refresh the account teamclaude already has rather than
+    /// add a second copy of the same credential, and it must leave the
+    /// teamclaude-only settings on that entry in place.
+    #[test]
+    fn importing_twice_updates_one_account() {
+        let mut cfg = Config::default();
+        let src = AccountConfig {
+            name: "a@example.com".into(),
+            kind: AccountType::Oauth,
+            account_uuid: Some("au".into()),
+            priority: 2,
+            access_token: Some("at".into()),
+            ..Default::default()
+        };
+        let pool = cfg.default_pool.clone();
+        assert!(!upsert_acrobat(&mut cfg, &pool, &src));
+        cfg.pool_mut(&pool).unwrap().accounts[0].upstream = Some("https://alt.example/v1".into());
+
+        // Same uuid, new name and token: one account, refreshed.
+        let src = AccountConfig { name: "renamed".into(), access_token: Some("at2".into()), ..src };
+        assert!(upsert_acrobat(&mut cfg, &pool, &src));
+        let accounts = &cfg.pool(&pool).unwrap().accounts;
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].name, "renamed");
+        assert_eq!(accounts[0].access_token.as_deref(), Some("at2"));
+        assert_eq!(accounts[0].upstream.as_deref(), Some("https://alt.example/v1"), "teamclaude-only settings survive");
+    }
+
+    /// An API-key account is a different thing wearing the same name; an import
+    /// must not adopt it.
+    #[test]
+    fn an_api_key_account_of_the_same_name_is_left_alone() {
+        let mut cfg = Config::default();
+        let pool = cfg.default_pool.clone();
+        cfg.pool_mut(&pool).unwrap().accounts.push(AccountConfig {
+            name: "shared".into(),
+            kind: AccountType::Apikey,
+            api_key: Some("sk-ant-key".into()),
+            ..Default::default()
+        });
+        assert!(!is_anthropic_oauth(&cfg.pool(&pool).unwrap().accounts[0]));
+
+        let src = AccountConfig { name: "shared".into(), kind: AccountType::Oauth, access_token: Some("at".into()), ..Default::default() };
+        assert!(!upsert_acrobat(&mut cfg, &pool, &src), "it must be added, not matched");
+        let accounts = &cfg.pool(&pool).unwrap().accounts;
+        assert_eq!(accounts.len(), 2);
+        assert_eq!(accounts[0].api_key.as_deref(), Some("sk-ant-key"));
+    }
+
+    #[test]
+    fn a_quoted_list_reads_as_a_sentence() {
+        assert_eq!(quoted_list(&[]), "");
+        assert_eq!(quoted_list(&["a"]), "\"a\"");
+        assert_eq!(quoted_list(&["a", "b"]), "\"a\" and \"b\"");
+        assert_eq!(quoted_list(&["a", "b", "c"]), "\"a\", \"b\" and \"c\"");
     }
 }

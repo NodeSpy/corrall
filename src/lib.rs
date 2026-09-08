@@ -5,6 +5,7 @@ pub mod cli;
 pub mod codex;
 pub mod config;
 pub mod manager;
+pub mod migrate;
 pub mod model;
 pub mod oauth;
 pub mod pool_match;
