@@ -7,6 +7,7 @@ pub mod config;
 pub mod manager;
 pub mod model;
 pub mod oauth;
+pub mod pool_match;
 pub mod pools;
 pub mod prober;
 pub mod proxy;

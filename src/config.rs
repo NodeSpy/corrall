@@ -344,9 +344,59 @@ pub struct PoolConfig {
     pub routes: Vec<RouteConfig>,
     pub storm_ramp: StormRamp,
     pub expiry_routing: ExpiryRouting,
+    /// When set, `teamclaude env`/`run` can select this pool from the launch
+    /// context instead of being told which one to use. The default pool is the
+    /// catch-all and needs no rules.
+    #[serde(rename = "match", skip_serializing_if = "Option::is_none")]
+    pub match_rules: Option<PoolMatch>,
     /// Unknown keys are preserved so a hand-edited pool is never stripped.
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
+}
+
+/// Predicates for auto-selecting a pool at launch. A pool matches when **any**
+/// listed path, remote or environment condition matches — the shape a
+/// hand-written wrapper usually takes ("this directory, or anything with that
+/// git remote"). Empty groups are ignored.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct PoolMatch {
+    /// Directories. Matches when the working directory *is* one of them or is
+    /// nested under it. A leading `~` is expanded, and a trailing `/*` or `/**`
+    /// is ignored so `~/Projects/foo` and `~/Projects/foo/**` behave alike.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
+    /// Regular expressions tested against `git remote get-url origin` run in
+    /// the working directory, e.g. `(?i)^git@github\.com:acme/`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub remotes: Vec<String>,
+    /// Environment variable name → regular expression its value must match. An
+    /// empty pattern means "matches whenever the variable is set".
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+}
+
+impl PoolMatch {
+    /// True when no rule is present, which can never match anything.
+    pub fn is_empty(&self) -> bool {
+        self.paths.is_empty() && self.remotes.is_empty() && self.env.is_empty()
+    }
+
+    /// Reject patterns that cannot compile, at config-load time rather than at
+    /// the next launch: a bad regex in a file nobody re-reads would otherwise
+    /// turn into a pool that silently never matches.
+    pub fn validate(&self, pool: &str) -> Result<()> {
+        for r in &self.remotes {
+            regex::Regex::new(r).with_context(|| format!("pools.{pool}.match.remotes: {r:?} is not a valid regular expression"))?;
+        }
+        for (k, r) in &self.env {
+            if r.is_empty() {
+                continue;
+            }
+            regex::Regex::new(r).with_context(|| format!("pools.{pool}.match.env.{k}: {r:?} is not a valid regular expression"))?;
+        }
+        Ok(())
+    }
 }
 
 /// Pool names are routed under the fixed `/pool/` URL keyword, which no real
@@ -614,6 +664,14 @@ impl Config {
         let mut seen_names: BTreeMap<&str, &str> = BTreeMap::new();
         for (pool, p) in &self.pools {
             validate_pool_name(pool).with_context(|| "pools".to_string())?;
+            if let Some(m) = &p.match_rules {
+                m.validate(pool)?;
+                // The default pool is the fallback every unmatched launch lands
+                // on, so rules on it can only ever be dead weight.
+                if pool == &self.default_pool && !m.is_empty() {
+                    tracing::warn!("pool \"{pool}\" is the default pool; its match rules are never consulted");
+                }
+            }
             for a in &p.accounts {
                 if let Some(u) = &a.upstream {
                     validate_upstream(u, &format!("pools.{pool}.accounts[{}].upstream", a.name))?;

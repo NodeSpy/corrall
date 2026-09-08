@@ -55,6 +55,9 @@ every reload instead, so a `/login` there is picked up automatically.
 - Named pools: several independent fleets on one port, each with its own
   accounts, thresholds, routes and sessions, addressed by a `/pool/<name>`
   prefix on the base URL. An install with one pool is unaffected.
+- Pools can select themselves from the launch context — working directory, git
+  remote or an environment variable — so one wrapper puts every project on the
+  right fleet without knowing about any of them.
 - Rotates to the next account when the 5h session or 7d weekly bucket reaches
   the switch threshold (98% by default), preferring the lowest `priority` and,
   among equals, the account whose weekly window resets soonest.
@@ -113,6 +116,8 @@ teamclaude pool list            # pools with their accounts and settings
 teamclaude pool add work        # a second fleet, empty
 teamclaude pool set work --threshold 90 --hold 120
 teamclaude pool set work --account spare@example.com   # move an account in
+teamclaude pool set work --match-path ~/Projects/acme  # auto-select it there
+teamclaude pool set work --match-remote '(?i)acme/'    # ...or by git remote
 teamclaude login --pool work    # add an account to that pool
 teamclaude env --pool work      # export lines pointing at that pool
 teamclaude env                  # export lines for eval "$(teamclaude env)"
@@ -129,6 +134,20 @@ Every account command takes `--pool <name>` (or `TC_POOL` in the environment)
 and defaults to the pool named by `defaultPool`, so nothing has to change until
 a second pool exists. `teamclaude pool rm` refuses a pool that still holds
 accounts unless `--force` is given.
+
+With `--match-path` / `--match-remote` / `--match-env` rules in place, the
+usual wrapper needs no per-project cases at all:
+
+```bash
+eval "$(teamclaude env)"; exec claude "$@"
+```
+
+`env` matches the launch directory (or `--cwd DIR`) against every non-default
+pool in sorted name order, first match wins, default pool otherwise. Exports go
+to stdout; when a rule fires, the pool and the reason go to stderr
+(`[TeamClaude] pool "work" (path ~/Projects/acme)`). With no rules configured
+it stays silent and emits exactly what it always did. `--pool` and `TC_POOL`
+skip matching. See [docs/configuration.md](docs/configuration.md#auto-selecting-a-pool).
 
 ## How it works
 
@@ -191,6 +210,7 @@ upgrade needs no manual work.
     },
     "work": {
       "switchThreshold": 0.9,
+      "match": { "paths": ["~/Projects/acme"], "remotes": ["(?i)^git@github\\.com:acme/"] },
       "accounts": [
         { "name": "work@example.com", "type": "oauth", "accessToken": "sk-ant-oat01-…" }
       ]
@@ -251,8 +271,9 @@ per-client keys, usage dimensions, client token-refresh and Remote Control
 passthrough (including the WebSocket), the state file, the browser dashboard,
 the TUI, and the CLI.
 
-Added: named pools with `/pool/<name>` routing, Prometheus metrics, health
-endpoint, JSON logs (`--log-format json`),
+Added: named pools with `/pool/<name>` routing and launch-context
+auto-selection, Prometheus metrics, health endpoint, JSON logs
+(`--log-format json`),
 `config check`, `import --link`, `requireKeyOnLoopback`, `maxBodyBytes`,
 tunnel allow-lists, graceful shutdown with state persistence, signed release
 builds with provenance attestations, and the security changes above.

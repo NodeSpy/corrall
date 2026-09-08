@@ -38,7 +38,7 @@ which no real API path uses, so a pool may be called `v1` or `api`.
 
 Per-pool fields: `accounts`, `routes`, `switchThreshold`, `holdSeconds`,
 `distributeSessions`, `quotaProbeSeconds`, `blockedModels`, `stormRamp`,
-`expiryRouting`. Everything else in the table below is daemon-global.
+`expiryRouting`, `match`. Everything else in the table below is daemon-global.
 
 ### Reaching a pool
 
@@ -64,6 +64,48 @@ HTTPS_PROXY=http://~work:@127.0.0.1:3456
 `teamclaude env --pool work` emits the right form for whichever mode is
 configured. The default pool is never named in either form, so a one-pool
 install emits byte-for-byte what it emitted before pools existed.
+
+### Auto-selecting a pool
+
+A pool can carry a `match` block, and then `teamclaude env` / `teamclaude run`
+picks it from the launch context — no per-project wrapper needed:
+
+```json
+"work": {
+  "match": {
+    "paths": ["~/Projects/acme"],
+    "remotes": ["(?i)^git@github\\.com:acme/"],
+    "env": { "TC_CTX": "^work-", "ACME_CI": "" }
+  }
+}
+```
+
+| Group | Matches when |
+| --- | --- |
+| `paths` | The launch directory is one of these directories, or nested under it. A leading `~` expands; a trailing `/*` or `/**` is ignored |
+| `remotes` | A regular expression matches `git remote get-url origin`, run in the launch directory. No repo or no `origin` fails the rule quietly |
+| `env` | Variable → regular expression its value must match. An empty pattern means "matches whenever the variable is set"; an unset or empty variable never matches |
+
+A pool matches when **any** one condition in its block does. Non-default pools
+are tried in sorted name order and the first match wins, so the outcome does
+not depend on config order; with nothing matching, the default pool serves.
+Rules on the default pool itself are ignored — it is already the fallback — and
+`config check` warns about them. Every pattern must compile, checked when the
+config loads and when `pool set` writes it.
+
+`--pool` and `TC_POOL` skip matching entirely. When nothing matches, `env`
+emits exactly the lines it emitted before pools existed and says nothing on
+stderr, so an install that writes no rules is unaffected. When a rule does
+fire, the chosen pool and the reason go to **stderr** while the exports still
+go to stdout:
+
+```
+$ eval "$(teamclaude env)"
+[TeamClaude] pool "work" (path ~/Projects/acme)
+```
+
+`teamclaude env --cwd DIR` matches against `DIR` instead of the current
+directory, for a wrapper resolving a project it has not entered yet.
 
 ## Top level
 
@@ -127,7 +169,7 @@ Bucket keys: `unified5h`, `unified7d`, `unified7dFable`, `unified7dSonnet`,
 | Variable | Effect |
 | --- | --- |
 | `TC_ACCT` | Pin `teamclaude run` / `env` to one account (uuid, org uuid, `uuid/org`, name or email). Removed from the child environment |
-| `TC_POOL` | Send `teamclaude run` / `env` to one pool, the same way `TC_ACCT` chooses an account. `--pool` wins over it. Removed from the child environment |
+| `TC_POOL` | Send `teamclaude run` / `env` to one pool, the same way `TC_ACCT` chooses an account. `--pool` wins over it, and either skips `match` rules. Removed from the child environment |
 | `TEAMCLAUDE_CONFIG` | Config path |
 | `TEAMCLAUDE_HOST` | Override `proxy.host` |
 | `TEAMCLAUDE_LOG` | `tracing` filter, e.g. `debug` |
