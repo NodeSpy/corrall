@@ -19,6 +19,16 @@ use crate::session::SessionTracker;
 
 const TOKEN_REFRESH_AHEAD_MS: i64 = 5 * 60 * 1000;
 const FORCED_REFRESH_FLOOR_MS: i64 = 30 * 1000;
+
+/// What a failed refresh should do to the account's health. Live request
+/// traffic disables the account and fails over (`MarkDead`); background
+/// diagnostics like the quota probe must never disable an account (`Keep`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum OnRefreshFail {
+    MarkDead,
+    Keep,
+}
+
 const ENTITLEMENT_COOLDOWN_MS: i64 = 5 * 60 * 1000;
 const THROTTLE_PROBE_FLOOR_MS: i64 = 30 * 1000;
 
@@ -634,7 +644,7 @@ impl Manager {
 
     /// Refresh the OAuth token when it is close to expiry (or `force`d by a
     /// 401). Concurrent callers coalesce on one refresh per account.
-    pub async fn ensure_token_fresh(&self, id: &str, force: bool) -> Option<String> {
+    pub async fn ensure_token_fresh(&self, id: &str, force: bool, on_fail: OnRefreshFail) -> Option<String> {
         let (needs, lock, name, refresh_token) = self.with(|f| {
             let lock = f.refresh_locks.entry(id.to_string()).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))).clone();
             let Some(a) = f.account_mut(id) else { return (false, lock, String::new(), None) };
@@ -643,7 +653,7 @@ impl Manager {
             }
             let Some(rt) = a.refresh_token.clone() else { return (false, lock, a.name.clone(), None) };
             if a.dead_refresh_token.as_deref() == Some(rt.as_str()) {
-                if a.status != Status::Error {
+                if on_fail == OnRefreshFail::MarkDead && a.status != Status::Error {
                     a.status = Status::Error;
                     a.error_message = Some("refresh token rejected; run: teamclaude login".into());
                 }
@@ -726,7 +736,7 @@ impl Manager {
             }
             Err(e) => {
                 self.log(format!("Token refresh failed for \"{name}\": {e}"));
-                if e.is_auth_rejection() {
+                if e.is_auth_rejection() && on_fail == OnRefreshFail::MarkDead {
                     self.with(|f| {
                         if let Some(a) = f.account_mut(id) {
                             a.status = Status::Error;
@@ -1954,6 +1964,35 @@ mod tests {
         assert_eq!(select_name(&m, None).as_deref(), Some("c"));
         // sticky: stays on c
         assert_eq!(select_name(&m, None).as_deref(), Some("c"));
+    }
+
+    #[tokio::test]
+    async fn probe_refresh_never_disables_account() {
+        // A refresh token already known dead. The fast path in ensure_token_fresh
+        // returns without any network call, so this exercises the health-mutation
+        // gating hermetically.
+        let cfg = cfg_with(vec![acct("a", 0)]);
+        let m = mgr(&cfg);
+        let id = m.account_ids()[0].0.clone();
+        m.with(|f| f.account_mut(&id).unwrap().dead_refresh_token = Some("rt".into()));
+
+        // Keep: still no usable credential is minted, but the account stays healthy.
+        let cred = m.ensure_token_fresh(&id, false, OnRefreshFail::Keep).await;
+        assert_eq!(cred.as_deref(), Some("tok"));
+        m.with(|f| {
+            let a = f.account(&id).unwrap();
+            assert_eq!(a.status, Status::Active);
+            assert!(a.error_message.is_none());
+            assert_eq!(a.dead_refresh_token.as_deref(), Some("rt"));
+        });
+
+        // MarkDead: live traffic disables the account and asks for re-login.
+        let _ = m.ensure_token_fresh(&id, false, OnRefreshFail::MarkDead).await;
+        m.with(|f| {
+            let a = f.account(&id).unwrap();
+            assert_eq!(a.status, Status::Error);
+            assert!(a.error_message.as_deref().unwrap().contains("teamclaude login"));
+        });
     }
 
     #[test]
