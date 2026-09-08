@@ -499,6 +499,13 @@ fn spend_line(account: &Value, paint: Paint) -> Option<String> {
     }
     let amount = format_money(spend);
     let label = paint.dim(&pad("Spend", 8));
+    // An explicit $0 spend limit means extra usage is turned off for the
+    // account, whatever the enabled flag reports — say so instead of warning
+    // about billing that cannot actually happen.
+    if f(spend, "limitMinor").is_some_and(|l| l == 0.0) {
+        let text = if spent { format!("extra usage disabled — {amount} used this month") } else { "extra usage disabled".to_string() };
+        return Some(format!("{label} {}", paint.gray(&text)));
+    }
     if enabled {
         let text = if spent {
             format!("billing real money — {amount} used this month")
@@ -758,6 +765,20 @@ mod tests {
         assert_eq!(format_money(&sp), "€1,234.56 of €5,000.00");
         let sp = json!({ "usedMinor": null, "limitMinor": null });
         assert_eq!(format_money(&sp), "unknown");
+    }
+
+    #[test]
+    fn spend_zero_limit_reads_as_disabled() {
+        let p = Paint { on: false };
+        // $0 limit with prior spend: disabled note keeps the used amount.
+        let acct = json!({ "quota": { "spend": { "enabled": true, "usedMinor": 2426.0, "limitMinor": 0.0, "currency": "USD", "exponent": 2 } } });
+        assert_eq!(spend_line(&acct, p).as_deref(), Some("Spend    extra usage disabled — $24.26 used this month"));
+        // $0 limit, enabled, nothing spent: bare disabled note, no billing warning.
+        let acct = json!({ "quota": { "spend": { "enabled": true, "usedMinor": 0.0, "limitMinor": 0.0, "currency": "USD", "exponent": 2 } } });
+        assert_eq!(spend_line(&acct, p).as_deref(), Some("Spend    extra usage disabled"));
+        // $0 limit, not enabled, nothing spent: no line, as before.
+        let acct = json!({ "quota": { "spend": { "enabled": false, "usedMinor": 0.0, "limitMinor": 0.0, "currency": "USD", "exponent": 2 } } });
+        assert_eq!(spend_line(&acct, p), None);
     }
 
     #[test]
