@@ -56,8 +56,16 @@ every reload instead, so a `/login` there is picked up automatically.
   cannot wedge a session with a non-retryable 400.
 - TUI with quota bars, reset countdowns, live activity log, account switching,
   config reload and a one-shot quota probe.
-- `/teamclaude/status`, `/teamclaude/quota`, `/teamclaude/metrics` (Prometheus)
-  and `/teamclaude/health` endpoints.
+- OpenAI Codex subscriptions pooled alongside Claude accounts (`login --codex`,
+  `import --codex`), rotating independently on the same port.
+- Expiry-pressure routing (`expiry on`): prefer the account whose ample weekly
+  quota is about to be forfeited, and re-rank when a window rolls over.
+- Keep-warm (`warmup N`), quota probe (`probe N`), session titles from Claude
+  Code's own files (`titles on`), usage dimensions for per-project attribution.
+- Client-side OAuth token refresh and Remote Control (`/v1/code/*`, including
+  its WebSocket) pass through untouched with the client's own credentials.
+- Browser dashboard at `/teamclaude/dashboard`, plus `/teamclaude/status`,
+  `/teamclaude/quota`, `/teamclaude/metrics` (Prometheus) and `/teamclaude/health`.
 
 ## Everyday commands
 
@@ -71,6 +79,11 @@ teamclaude priority <name> 1    # rotation order, lower = preferred
 teamclaude threshold 90         # switch at 90% (or: threshold unified7d=90)
 teamclaude distribute on        # spread sessions across equal-priority accounts
 teamclaude probe 300            # background quota probe every 300s (zero-spend)
+teamclaude warmup 600           # keep idle accounts' 5h windows running (spends a little)
+teamclaude expiry on            # expiry-pressure routing (--tolerance 1.5 --preempt on)
+teamclaude titles on            # name activity rows after the Claude Code session
+teamclaude login --codex        # add an OpenAI Codex subscription
+teamclaude import --codex       # or import the Codex CLI's login
 teamclaude route add fable --match '*fable*' --accounts personal-max
 teamclaude env                  # export lines for eval "$(teamclaude env)"
 teamclaude ca-path              # where the MITM CA certificate lives
@@ -149,8 +162,9 @@ short:
   MiB default), control bodies at 64 KiB, the session map at 10 000 entries
   with validated ids, request logs truncated and swept.
 - **Atomic, private persistence.** Config, state, certificate keys and request
-  logs are written with a temp file + rename at mode 0600 and a cross-process
-  lock, so a crash mid-write cannot destroy every refresh token.
+  logs are written with a temp file + rename at mode 0600. Config updates take
+  a cross-process `flock` and re-read before writing, so a CLI command running
+  while the server refreshes a token cannot clobber the rotated refresh token.
 - **Safer MITM defaults.** Blind CONNECT tunnels to other hosts are off unless
   `mitm.allowTunnel` is set, and then refuse private addresses and non-443
   ports. The CA private key is never written to disk.
@@ -169,24 +183,39 @@ processes run.
 
 ## Compared with the original
 
-Ported: rotation and threshold logic, per-model buckets, the two kinds of 429,
-storm control, session tracking and distribution, routes and route pins,
-`TC_ACCT` pinning (both modes), MITM proxy with local CA, hold on exhaustion,
-token refresh with the dead-token guard, quota probe, `importFrom`, third-party
-backends with `modelMap`/`stripRequestFields`, request logging with bounds and
-retention, per-client keys and usage attribution, the state file, the TUI, and
-the CLI.
+Ported: rotation and threshold logic, per-model buckets, the two kinds of 429
+with one failover hop, storm control, session tracking and distribution,
+expiry-pressure routing with rollover preemption, routes and route pins,
+`TC_ACCT` pinning in both modes, MITM proxy with a local CA, hold on
+exhaustion, token refresh with the dead-token guard, quota probe, keep-warm,
+session titles, `importFrom`, Codex accounts, third-party backends with
+`modelMap`/`stripRequestFields`, request logging with bounds and retention,
+per-client keys, usage dimensions, client token-refresh and Remote Control
+passthrough (including the WebSocket), the state file, the browser dashboard,
+the TUI, and the CLI.
 
 Added: Prometheus metrics, health endpoint, JSON logs (`--log-format json`),
 `config check`, `import --link`, `requireKeyOnLoopback`, `maxBodyBytes`,
-tunnel allow-lists, graceful shutdown with state persistence, and the security
-changes above.
+tunnel allow-lists, graceful shutdown with state persistence, signed release
+builds with provenance attestations, and the security changes above.
 
-Not ported (by choice or scope): the self-updater, the sx.org residential
-egress integration, the egress-IP guard, keep-warm scheduling (it spends quota
-by spawning `claude`), session titles from `~/.claude/projects`, the remote TUI
-(`attach`), the browser dashboard page, shell alias installation, Codex/OpenAI
-accounts, launchd service files, and the Nix packaging.
+Not ported (by choice): the self-updater, the sx.org residential egress
+integration, the egress-IP guard, the remote TUI (`attach`), shell alias
+installation, the launchd service file, warm-up wall-clock schedules (interval
+mode only), and the Nix packaging.
+
+## Testing
+
+`cargo test` runs the unit tests and an integration suite (`tests/proxy.rs`)
+that drives the proxy in-process against a mock upstream speaking the
+Anthropic wire shape. Each integration test corresponds to a behaviour the
+original project learned from a real incident: quota-vs-rate-limit 429s,
+family-bucket diversion, storm control, session distribution, pins, credential
+stripping, passthrough, WebSocket relay, MITM interception and the auth gate.
+
+What is **not** covered: the OAuth login and refresh flows against the real
+Anthropic and OpenAI endpoints. Those need a real account; run
+`teamclaude login` and `teamclaude api /api/oauth/profile` to exercise them.
 
 ## Building
 
@@ -197,6 +226,17 @@ cargo clippy --all-targets -- -D warnings
 ```
 
 Rust 1.80 or newer. No OpenSSL: TLS is rustls with the ring provider.
+
+Tagged releases (`v*`) are built for Linux (x86_64/aarch64, musl) and macOS
+(x86_64/aarch64) by GitHub Actions, with `SHA256SUMS` signed keylessly through
+Sigstore and a build-provenance attestation per archive. Verify with:
+
+```bash
+cosign verify-blob --bundle SHA256SUMS.sigstore.json \
+  --certificate-identity-regexp 'github.com/NodeSpy/teamclaude' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com SHA256SUMS
+gh attestation verify teamclaude-*.tar.gz --repo NodeSpy/teamclaude
+```
 
 ## License
 

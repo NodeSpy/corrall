@@ -1,0 +1,726 @@
+//! Integration tests: the proxy runs in-process against a mock upstream that
+//! speaks the Anthropic wire shape (rate-limit headers, SSE, 429 flavours).
+//! Each test mirrors a behaviour the original project learned from a real
+//! incident: quota-vs-rate-limit 429s, family buckets, storm control, pins,
+//! session affinity, credential stripping, passthrough and MITM.
+
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
+
+use bytes::Bytes;
+use http_body_util::{BodyExt, Full};
+use hyper::body::Incoming;
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper::{Request, Response, StatusCode};
+use hyper_util::rt::TokioIo;
+use serde_json::{json, Value};
+use tokio::net::TcpListener;
+
+use teamclaude::config::{AccountConfig, AccountType, Config, ProxyConfig};
+use teamclaude::manager::Manager;
+use teamclaude::proxy::server::{run, Ctx, CtxInner, Metrics};
+
+const KEY: &str = "tc-test-key-0123456789abcdef";
+
+#[derive(Debug, Clone)]
+struct Seen {
+    path: String,
+    headers: HashMap<String, String>,
+    body: Value,
+}
+
+#[derive(Default)]
+struct MockState {
+    seen: Vec<Seen>,
+    /// token -> behaviour for the next matching request
+    behaviours: HashMap<String, Vec<Behaviour>>,
+}
+
+#[derive(Debug, Clone)]
+enum Behaviour {
+    Ok,
+    QuotaRejected { retry_after: u64 },
+    FamilyRejected,
+    RateLimited { retry_after: u64 },
+    Unauthorized,
+    ServerError,
+    EntitlementDenied,
+}
+
+#[derive(Clone)]
+struct Mock {
+    addr: SocketAddr,
+    state: Arc<Mutex<MockState>>,
+    in_flight: Arc<AtomicU32>,
+    max_in_flight: Arc<AtomicU32>,
+    delay_ms: Arc<AtomicU32>,
+}
+
+impl Mock {
+    fn url(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+    fn seen(&self) -> Vec<Seen> {
+        self.state.lock().unwrap().seen.clone()
+    }
+    fn queue(&self, token: &str, b: Behaviour) {
+        self.state.lock().unwrap().behaviours.entry(token.to_string()).or_default().push(b);
+    }
+}
+
+fn token_of(h: &HashMap<String, String>) -> String {
+    h.get("authorization").map(|a| a.trim_start_matches("Bearer ").to_string()).or_else(|| h.get("x-api-key").cloned()).unwrap_or_default()
+}
+
+async fn mock_handler(mock: Mock, req: Request<Incoming>) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    let path = req.uri().path_and_query().map(|p| p.to_string()).unwrap_or_default();
+    let is_upgrade = req.headers().get("upgrade").is_some();
+    let headers: HashMap<String, String> = req.headers().iter().map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string())).collect();
+    if is_upgrade {
+        // Answer a WebSocket-style 101; the test then talks raw bytes.
+        tokio::spawn(async move {
+            if let Ok(up) = hyper::upgrade::on(req).await {
+                let mut io = TokioIo::new(up);
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 64];
+                if let Ok(n) = io.read(&mut buf).await {
+                    let _ = io.write_all(&buf[..n]).await;
+                    let _ = io.write_all(b" echoed").await;
+                }
+            }
+        });
+        let r = Response::builder()
+            .status(101)
+            .header("upgrade", "websocket")
+            .header("connection", "Upgrade")
+            .header("sec-websocket-accept", "x")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        return Ok(r);
+    }
+    let body = req.into_body().collect().await?.to_bytes();
+    let body_json: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    let tok = token_of(&headers);
+    let behaviour = {
+        let mut st = mock.state.lock().unwrap();
+        st.seen.push(Seen { path: path.clone(), headers: headers.clone(), body: body_json.clone() });
+        st.behaviours.get_mut(&tok).and_then(|v| if v.is_empty() { None } else { Some(v.remove(0)) }).unwrap_or(Behaviour::Ok)
+    };
+    let cur = mock.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+    mock.max_in_flight.fetch_max(cur, Ordering::SeqCst);
+    let delay = mock.delay_ms.load(Ordering::SeqCst);
+    if delay > 0 {
+        tokio::time::sleep(Duration::from_millis(delay as u64)).await;
+    }
+    mock.in_flight.fetch_sub(1, Ordering::SeqCst);
+    let now = chrono::Utc::now().timestamp();
+    let base = |status: u16| {
+        Response::builder()
+            .status(status)
+            .header("anthropic-ratelimit-unified-5h-utilization", "0.40")
+            .header("anthropic-ratelimit-unified-7d-utilization", "0.20")
+            .header("anthropic-ratelimit-unified-7d-reset", (now + 86_400).to_string())
+            .header("anthropic-ratelimit-unified-status", "allowed")
+    };
+    let resp = match behaviour {
+        Behaviour::Ok => {
+            let stream = body_json.get("stream").and_then(Value::as_bool).unwrap_or(false);
+            if stream {
+                let sse = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":11,\"output_tokens\":1}}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"hi\"}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":9}}\n\n";
+                base(200).header("content-type", "text/event-stream").body(Full::new(Bytes::from(sse))).unwrap()
+            } else {
+                let out = json!({ "id": "msg", "type": "message", "served_by": tok, "model": body_json.get("model"), "usage": { "input_tokens": 11, "output_tokens": 3 } });
+                base(200).header("content-type", "application/json").body(Full::new(Bytes::from(out.to_string()))).unwrap()
+            }
+        }
+        Behaviour::QuotaRejected { retry_after } => base(429)
+            .header("anthropic-ratelimit-unified-5h-status", "rejected")
+            .header("anthropic-ratelimit-unified-5h-utilization", "1.0")
+            .header("anthropic-ratelimit-unified-5h-reset", (now + 600).to_string())
+            .header("retry-after", retry_after.to_string())
+            .body(Full::new(Bytes::from(r#"{"type":"error","error":{"type":"rate_limit_error","message":"spent"}}"#)))
+            .unwrap(),
+        Behaviour::FamilyRejected => base(429)
+            .header("anthropic-ratelimit-unified-7d_oi-status", "rejected")
+            .header("anthropic-ratelimit-unified-7d_oi-utilization", "1.0")
+            .header("anthropic-ratelimit-unified-7d_oi-reset", (now + 86_400).to_string())
+            .header("retry-after", "30")
+            .body(Full::new(Bytes::from(r#"{"type":"error","error":{"type":"rate_limit_error","message":"fable spent"}}"#)))
+            .unwrap(),
+        Behaviour::RateLimited { retry_after } => base(429)
+            .header("retry-after", retry_after.to_string())
+            .body(Full::new(Bytes::from(r#"{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}"#)))
+            .unwrap(),
+        Behaviour::Unauthorized => Response::builder()
+            .status(401)
+            .body(Full::new(Bytes::from(r#"{"type":"error","error":{"type":"authentication_error","message":"bad token"}}"#)))
+            .unwrap(),
+        Behaviour::ServerError => Response::builder()
+            .status(529)
+            .body(Full::new(Bytes::from(r#"{"type":"error","error":{"type":"overloaded_error","message":"overloaded"}}"#)))
+            .unwrap(),
+        Behaviour::EntitlementDenied => Response::builder()
+            .status(403)
+            .body(Full::new(Bytes::from(
+                r#"{"type":"error","error":{"type":"permission_error","message":"no","details":{"error_code":"oauth_not_allowed_for_organization"}}}"#,
+            )))
+            .unwrap(),
+    };
+    Ok(resp)
+}
+
+async fn spawn_mock() -> Mock {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock = Mock {
+        addr: listener.local_addr().unwrap(),
+        state: Default::default(),
+        in_flight: Default::default(),
+        max_in_flight: Default::default(),
+        delay_ms: Default::default(),
+    };
+    let m2 = mock.clone();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let m = m2.clone();
+            tokio::spawn(async move {
+                let svc = service_fn(move |req| mock_handler(m.clone(), req));
+                let _ = http1::Builder::new().serve_connection(TokioIo::new(stream), svc).with_upgrades().await;
+            });
+        }
+    });
+    mock
+}
+
+fn test_env() {
+    static ONCE: OnceLock<()> = OnceLock::new();
+    ONCE.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!("teamclaude-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("TEAMCLAUDE_CONFIG", dir.join("teamclaude.json"));
+        let cfg = Config { proxy: ProxyConfig { api_key: KEY.into(), ..Default::default() }, ..Default::default() };
+        teamclaude::upstream::init(&cfg).unwrap();
+    });
+}
+
+fn account(name: &str, token: &str, prio: i32, upstream: &str) -> AccountConfig {
+    AccountConfig {
+        name: name.into(),
+        kind: AccountType::Oauth,
+        access_token: Some(token.into()),
+        // no refresh token: a 401 must not try the network
+        refresh_token: None,
+        expires_at: Some(chrono::Utc::now().timestamp_millis() + 3_600_000),
+        priority: prio,
+        upstream: Some(upstream.into()),
+        account_uuid: Some(format!("{:0>8}-0000-0000-0000-000000000000", name.len())),
+        ..Default::default()
+    }
+}
+
+struct Proxy {
+    port: u16,
+    ctx: Ctx,
+    manager: Manager,
+}
+
+impl Proxy {
+    fn url(&self, path: &str) -> String {
+        format!("http://127.0.0.1:{}{}", self.port, path)
+    }
+}
+
+async fn spawn_proxy(mut cfg: Config) -> Proxy {
+    test_env();
+    cfg.proxy.api_key = KEY.into();
+    cfg.ensure_account_ids();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    cfg.proxy.port = port;
+    let manager = Manager::new(&cfg);
+    let (tx, _) = tokio::sync::broadcast::channel(64);
+    let ctx = Ctx(Arc::new(CtxInner {
+        manager: manager.clone(),
+        config: parking_lot::RwLock::new(Arc::new(cfg.clone())),
+        logger: None,
+        hold_ms: cfg.hold_seconds * 1000,
+        activity: tx,
+        reload: None,
+        metrics: Metrics::default(),
+        tls: parking_lot::RwLock::new(None),
+        titles: teamclaude::titles::Titles::new(&cfg.session_titles),
+    }));
+    let (_stx, srx) = tokio::sync::watch::channel(false);
+    let bind: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let c2 = ctx.clone();
+    tokio::spawn(async move {
+        let _ = run(c2, bind, srx).await;
+    });
+    std::mem::forget(_stx);
+    for _ in 0..50 {
+        if tokio::net::TcpStream::connect(bind).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    Proxy { port, ctx, manager }
+}
+
+fn http() -> reqwest::Client {
+    reqwest::Client::builder().no_proxy().build().unwrap()
+}
+
+fn msg(model: &str) -> Value {
+    json!({ "model": model, "max_tokens": 5, "messages": [{ "role": "user", "content": "hi" }] })
+}
+
+async fn post(p: &Proxy, path: &str, body: Value) -> (StatusCode, Value, reqwest::header::HeaderMap) {
+    let r = http().post(p.url(path)).header("host", format!("127.0.0.1:{}", p.port)).json(&body).send().await.unwrap();
+    let st = r.status();
+    let h = r.headers().clone();
+    let v: Value = r.json().await.unwrap_or(Value::Null);
+    (StatusCode::from_u16(st.as_u16()).unwrap(), v, h)
+}
+
+fn cfg_with(accounts: Vec<AccountConfig>) -> Config {
+    Config { accounts, ..Default::default() }
+}
+
+// ── tests ─────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn auth_gate_loopback_rebinding_browser_and_keys() {
+    let mock = spawn_mock().await;
+    let p = spawn_proxy(cfg_with(vec![account("a", "tok-a", 0, &mock.url())])).await;
+    let c = http();
+    let ok = c.get(p.url("/teamclaude/health")).send().await.unwrap();
+    assert_eq!(ok.status(), 200, "loopback with loopback Host is exempt");
+    let rebind = c.get(p.url("/teamclaude/status")).header("host", "attacker.example:3456").send().await.unwrap();
+    assert_eq!(rebind.status(), 401, "DNS rebinding: non-loopback Host is refused");
+    let origin = c.get(p.url("/teamclaude/status")).header("origin", "http://evil").send().await.unwrap();
+    assert_eq!(origin.status(), 401, "browser-originated request is refused");
+    let sfs = c.post(p.url("/v1/messages")).header("sec-fetch-site", "cross-site").json(&msg("claude-opus-5")).send().await.unwrap();
+    assert_eq!(sfs.status(), 401, "no-cors POST from a page is refused on data paths too");
+    let keyed = c.get(p.url("/teamclaude/status")).header("host", "attacker.example").header("x-api-key", KEY).send().await.unwrap();
+    assert_eq!(keyed.status(), 200, "a valid key works regardless of Host");
+    let wrong = c.get(p.url("/teamclaude/status")).header("host", "attacker.example").header("x-api-key", "nope").send().await.unwrap();
+    assert_eq!(wrong.status(), 401);
+    assert!(mock.seen().is_empty(), "nothing reached upstream");
+}
+
+#[tokio::test]
+async fn client_credentials_are_stripped_and_account_token_injected() {
+    let mock = spawn_mock().await;
+    let p = spawn_proxy(cfg_with(vec![account("a", "tok-a", 0, &mock.url())])).await;
+    let r = http()
+        .post(p.url("/v1/messages"))
+        .header("authorization", "Bearer CLIENT-SECRET")
+        .header("x-api-key", "CLIENT-KEY")
+        .header("cookie", "session=1")
+        .json(&json!({ "model": "claude-sonnet-4-6", "messages": [], "metadata": { "user_id": "{\"device_id\":\"d\",\"account_uuid\":\"00000000-0000-0000-0000-000000000000\"}" } }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let seen = mock.seen();
+    assert_eq!(seen.len(), 1);
+    let h = &seen[0].headers;
+    assert_eq!(h.get("authorization").unwrap(), "Bearer tok-a");
+    assert!(!h.contains_key("x-api-key"));
+    assert!(!h.contains_key("cookie"));
+    let user_id = seen[0].body["metadata"]["user_id"].as_str().unwrap();
+    assert!(user_id.contains("00000001-0000-0000-0000-000000000000"), "account_uuid rewritten: {user_id}");
+}
+
+#[tokio::test]
+async fn quota_rejection_rotates_but_rate_limit_retries_same_account() {
+    let mock = spawn_mock().await;
+    let p = spawn_proxy(cfg_with(vec![account("a", "tok-a", 0, &mock.url()), account("b", "tok-b", 1, &mock.url())])).await;
+    // quota 429 on a → served by b, a throttled
+    mock.queue("tok-a", Behaviour::QuotaRejected { retry_after: 30 });
+    let (st, v, _) = post(&p, "/v1/messages", msg("claude-opus-5")).await;
+    assert_eq!(st, 200);
+    assert_eq!(v["served_by"], "tok-b");
+    let status = p.manager.status(false);
+    let a = &status["accounts"][0];
+    assert_eq!(a["status"], "throttled");
+    assert!(a["blocked"].as_str().unwrap().contains("rate-limited"));
+    // rate-limit 429 on b with a short retry-after → same account retried, no rotation
+    mock.queue("tok-b", Behaviour::RateLimited { retry_after: 1 });
+    let n = mock.seen().len();
+    let (st, v, _) = post(&p, "/v1/messages", msg("claude-opus-5")).await;
+    assert_eq!(st, 200);
+    assert_eq!(v["served_by"], "tok-b");
+    let after = mock.seen();
+    assert_eq!(after.len(), n + 2, "one 429 then one retry");
+    assert!(after[n..].iter().all(|s| token_of(&s.headers) == "tok-b"));
+}
+
+#[tokio::test]
+async fn family_rejection_diverts_only_that_family() {
+    let mock = spawn_mock().await;
+    let p = spawn_proxy(cfg_with(vec![account("a", "tok-a", 0, &mock.url()), account("b", "tok-b", 0, &mock.url())])).await;
+    let (_, v, _) = post(&p, "/v1/messages", msg("claude-opus-5")).await;
+    assert_eq!(v["served_by"], "tok-a");
+    mock.queue("tok-a", Behaviour::FamilyRejected);
+    let (st, v, _) = post(&p, "/v1/messages", msg("claude-fable-5-1")).await;
+    assert_eq!(st, 200);
+    assert_eq!(v["served_by"], "tok-b", "fable diverted");
+    let (_, v, _) = post(&p, "/v1/messages", msg("claude-opus-5")).await;
+    assert_eq!(v["served_by"], "tok-a", "opus stays on a");
+    let (_, v, _) = post(&p, "/v1/messages", msg("claude-fable-5-1")).await;
+    assert_eq!(v["served_by"], "tok-b", "fable keeps going to b while the reading is spent");
+    let st = p.manager.status(false);
+    assert_eq!(st["accounts"][0]["models"]["fable"], false);
+    assert_eq!(st["accounts"][0]["models"]["opus"], true);
+}
+
+#[tokio::test]
+async fn streaming_passes_through_and_usage_is_recorded() {
+    let mock = spawn_mock().await;
+    let p = spawn_proxy(cfg_with(vec![account("a", "tok-a", 0, &mock.url())])).await;
+    let mut body = msg("claude-sonnet-4-6");
+    body["stream"] = json!(true);
+    let r = http().post(p.url("/v1/messages")).header("x-claude-code-session-id", "11111111-2222-3333-4444-555555555555").json(&body).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    assert!(r.headers().get("content-type").unwrap().to_str().unwrap().contains("text/event-stream"));
+    let text = r.text().await.unwrap();
+    assert!(text.contains("message_start") && text.contains("message_delta"));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let st = p.manager.status(true);
+    assert_eq!(st["accounts"][0]["usage"]["inputTokens"], 11);
+    assert_eq!(st["accounts"][0]["usage"]["outputTokens"], 9, "message_delta supersedes the placeholder");
+    assert_eq!(st["sessions"]["known"], 1);
+    let items = st["sessions"]["items"].as_array().unwrap();
+    assert_eq!(items[0]["tokens"]["unified7dSonnet"]["output"], 9);
+}
+
+#[tokio::test]
+async fn pins_never_fail_over_and_unknown_pin_is_404() {
+    let mock = spawn_mock().await;
+    let p = spawn_proxy(cfg_with(vec![account("a", "tok-a", 0, &mock.url()), account("b", "tok-b", 1, &mock.url())])).await;
+    let (st, v, _) = post(&p, "/tc-acct/b/v1/messages", msg("claude-opus-5")).await;
+    assert_eq!(st, 200);
+    assert_eq!(v["served_by"], "tok-b");
+    assert_eq!(mock.seen().last().unwrap().path, "/v1/messages", "pin prefix stripped");
+    let (st, _, _) = post(&p, "/tc-acct/nobody/v1/messages", msg("claude-opus-5")).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    mock.queue("tok-b", Behaviour::ServerError);
+    let (st, _, _) = post(&p, "/tc-acct/b/v1/messages", msg("claude-opus-5")).await;
+    assert!(st.is_server_error(), "a pinned account's failure is not hidden by failover: {st}");
+    assert!(mock.seen().iter().all(|s| token_of(&s.headers) != "tok-a"));
+}
+
+#[tokio::test]
+async fn oauth_token_refresh_passthrough_keeps_client_credentials() {
+    let mock = spawn_mock().await;
+    let mut cfg = cfg_with(vec![account("a", "tok-a", 0, &mock.url())]);
+    cfg.upstream = mock.url();
+    let p = spawn_proxy(cfg).await;
+    // The client's own refresh must not get an account token injected.
+    let r = http()
+        .post(p.url("/v1/oauth/token"))
+        .header("authorization", "Bearer CLIENT-OWN")
+        .header("x-api-key", KEY)
+        .json(&json!({ "grant_type": "refresh_token" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let seen = mock.seen();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].path, "/v1/oauth/token");
+    assert_eq!(seen[0].headers.get("authorization").unwrap(), "Bearer CLIENT-OWN");
+    assert!(!seen[0].headers.contains_key("x-api-key"), "the proxy key never leaves");
+}
+
+#[tokio::test]
+async fn websocket_upgrade_is_relayed() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mock = spawn_mock().await;
+    let mut cfg = cfg_with(vec![account("a", "tok-a", 0, &mock.url())]);
+    cfg.upstream = mock.url();
+    let p = spawn_proxy(cfg).await;
+    let mut s = tokio::net::TcpStream::connect(("127.0.0.1", p.port)).await.unwrap();
+    s.write_all(format!("GET /v1/code/sessions/abc/ws HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n", p.port).as_bytes()).await.unwrap();
+    let mut buf = vec![0u8; 4096];
+    let mut got = Vec::new();
+    loop {
+        let n = tokio::time::timeout(Duration::from_secs(5), s.read(&mut buf)).await.unwrap().unwrap();
+        got.extend_from_slice(&buf[..n]);
+        if got.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+    }
+    let head = String::from_utf8_lossy(&got);
+    assert!(head.starts_with("HTTP/1.1 101"), "got: {head}");
+    s.write_all(b"ping").await.unwrap();
+    let mut echo = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while echo.len() < "ping echoed".len() && tokio::time::Instant::now() < deadline {
+        let n = tokio::time::timeout(Duration::from_secs(5), s.read(&mut buf)).await.unwrap().unwrap();
+        if n == 0 {
+            break;
+        }
+        echo.extend_from_slice(&buf[..n]);
+    }
+    assert_eq!(String::from_utf8_lossy(&echo), "ping echoed");
+}
+
+#[tokio::test]
+async fn blocked_models_and_body_limits() {
+    let mock = spawn_mock().await;
+    let mut cfg = cfg_with(vec![account("a", "tok-a", 0, &mock.url())]);
+    cfg.blocked_models = vec!["*fable*".into()];
+    cfg.proxy.max_body_bytes = 2048;
+    let p = spawn_proxy(cfg).await;
+    let (st, _, _) = post(&p, "/v1/messages", msg("claude-fable-5-1")).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let big = json!({ "model": "claude-opus-5", "messages": [{ "role": "user", "content": "x".repeat(5000) }] });
+    let (st, _, _) = post(&p, "/v1/messages", big).await;
+    assert_eq!(st, StatusCode::PAYLOAD_TOO_LARGE);
+    let r = http().post(p.url("/teamclaude/switch")).body("a".repeat(70_000)).send().await.unwrap();
+    assert_eq!(r.status(), 413);
+    assert!(mock.seen().is_empty());
+}
+
+#[tokio::test]
+async fn unauthorized_upstream_marks_account_and_fails_over() {
+    let mock = spawn_mock().await;
+    let p = spawn_proxy(cfg_with(vec![account("a", "tok-a", 0, &mock.url()), account("b", "tok-b", 1, &mock.url())])).await;
+    mock.queue("tok-a", Behaviour::Unauthorized);
+    let (st, v, _) = post(&p, "/v1/messages", msg("claude-opus-5")).await;
+    assert_eq!(st, 200);
+    assert_eq!(v["served_by"], "tok-b");
+    let status = p.manager.status(false);
+    assert_eq!(status["accounts"][0]["status"], "error");
+}
+
+#[tokio::test]
+async fn entitlement_denial_cools_the_account_down() {
+    let mock = spawn_mock().await;
+    let p = spawn_proxy(cfg_with(vec![account("a", "tok-a", 0, &mock.url()), account("b", "tok-b", 1, &mock.url())])).await;
+    mock.queue("tok-a", Behaviour::EntitlementDenied);
+    let (st, v, _) = post(&p, "/v1/messages", msg("claude-opus-5")).await;
+    assert_eq!(st, 200);
+    assert_eq!(v["served_by"], "tok-b");
+    let (_, v, _) = post(&p, "/v1/messages", msg("claude-opus-5")).await;
+    assert_eq!(v["served_by"], "tok-b", "a stays out during the cooldown");
+    assert!(p.manager.status(false)["accounts"][0]["blocked"].as_str().unwrap().contains("oauth not allowed"));
+}
+
+#[tokio::test]
+async fn overloaded_upstream_takes_one_failover_hop() {
+    let mock = spawn_mock().await;
+    let p = spawn_proxy(cfg_with(vec![account("a", "tok-a", 0, &mock.url()), account("b", "tok-b", 1, &mock.url())])).await;
+    mock.queue("tok-a", Behaviour::ServerError);
+    let (st, v, _) = post(&p, "/v1/messages", msg("claude-opus-5")).await;
+    assert_eq!(st, 200);
+    assert_eq!(v["served_by"], "tok-b");
+}
+
+#[tokio::test]
+async fn all_exhausted_returns_429_with_retry_after_then_hold_waits() {
+    let mock = spawn_mock().await;
+    let p = spawn_proxy(cfg_with(vec![account("a", "tok-a", 0, &mock.url())])).await;
+    mock.queue("tok-a", Behaviour::QuotaRejected { retry_after: 600 });
+    let (st, _, h) = post(&p, "/v1/messages", msg("claude-opus-5")).await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS);
+    assert!(h.get("retry-after").is_some());
+    // With holdSeconds the request waits for the throttle to lift instead.
+    let mock2 = spawn_mock().await;
+    let mut cfg = cfg_with(vec![account("a", "tok-a", 0, &mock2.url())]);
+    cfg.hold_seconds = 20;
+    let p2 = spawn_proxy(cfg).await;
+    mock2.queue("tok-a", Behaviour::QuotaRejected { retry_after: 2 });
+    let t0 = std::time::Instant::now();
+    let (st, v, _) = post(&p2, "/v1/messages", msg("claude-opus-5")).await;
+    assert_eq!(st, 200, "held until the account recovered");
+    assert_eq!(v["served_by"], "tok-a");
+    assert!(t0.elapsed() >= Duration::from_secs(2));
+}
+
+#[tokio::test]
+async fn storm_control_paces_a_fresh_account() {
+    let mock = spawn_mock().await;
+    let mut cfg = cfg_with(vec![account("a", "tok-a", 0, &mock.url())]);
+    cfg.storm_ramp.start_conc = 1;
+    cfg.storm_ramp.step_conc = 1;
+    cfg.storm_ramp.step_ms = 150;
+    cfg.storm_ramp.window_ms = 10_000;
+    let p = spawn_proxy(cfg).await;
+    mock.delay_ms.store(120, Ordering::SeqCst);
+    let mut tasks = Vec::new();
+    for _ in 0..8 {
+        let url = p.url("/v1/messages");
+        tasks.push(tokio::spawn(async move { http().post(url).json(&msg("claude-opus-5")).send().await.unwrap().status().as_u16() }));
+    }
+    for t in tasks {
+        assert_eq!(t.await.unwrap(), 200);
+    }
+    let max = mock.max_in_flight.load(Ordering::SeqCst);
+    assert!(max <= 4, "burst was paced onto the fresh account (max in flight {max})");
+}
+
+#[tokio::test]
+async fn distribute_sessions_pins_and_spreads() {
+    let mock = spawn_mock().await;
+    let mut cfg = cfg_with(vec![account("a", "tok-a", 0, &mock.url()), account("b", "tok-b", 0, &mock.url())]);
+    cfg.distribute_sessions = true;
+    let p = spawn_proxy(cfg).await;
+    let s1 = "11111111-1111-1111-1111-111111111111";
+    let s2 = "22222222-2222-2222-2222-222222222222";
+    let send = |sid: &'static str| {
+        let url = p.url("/v1/messages");
+        async move {
+            let r = http().post(url).header("x-claude-code-session-id", sid).json(&msg("claude-opus-5")).send().await.unwrap();
+            r.json::<Value>().await.unwrap()["served_by"].as_str().unwrap().to_string()
+        }
+    };
+    let first = send(s1).await;
+    let second = send(s2).await;
+    assert_ne!(first, second, "two new sessions spread across equal-priority accounts");
+    for _ in 0..3 {
+        assert_eq!(send(s1).await, first, "session keeps its account for cache reuse");
+        assert_eq!(send(s2).await, second);
+    }
+}
+
+#[tokio::test]
+async fn routes_restrict_and_route_pin_endpoint_works() {
+    let mock = spawn_mock().await;
+    let mut cfg = cfg_with(vec![account("a", "tok-a", 0, &mock.url()), account("b", "tok-b", 5, &mock.url())]);
+    cfg.routes.push(teamclaude::config::RouteConfig {
+        name: "fable".into(),
+        patterns: vec!["*fable*".into()],
+        accounts: vec!["b".into()],
+        ..Default::default()
+    });
+    let p = spawn_proxy(cfg).await;
+    let (_, v, _) = post(&p, "/v1/messages", msg("claude-fable-5-1")).await;
+    assert_eq!(v["served_by"], "tok-b");
+    let (_, v, _) = post(&p, "/v1/messages", msg("claude-opus-5")).await;
+    assert_eq!(v["served_by"], "tok-a");
+    let r = http().post(p.url("/teamclaude/switch")).json(&json!({ "account": "b" })).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let (_, v, _) = post(&p, "/v1/messages", msg("claude-opus-5")).await;
+    assert_eq!(v["served_by"], "tok-a", "a has strictly better priority, so the switch is a weak preference");
+}
+
+#[tokio::test]
+async fn tool_pairs_are_repaired_and_model_map_applied() {
+    let mock = spawn_mock().await;
+    let mut third = account("deepseek", "sk-third", 0, &mock.url());
+    third.kind = AccountType::Apikey;
+    third.api_key = Some("sk-third".into());
+    third.access_token = None;
+    third.model_map = Some([("claude-sonnet-4-6".to_string(), "deepseek-v4".to_string())].into_iter().collect());
+    third.strip_request_fields = vec!["context_management".into()];
+    let p = spawn_proxy(cfg_with(vec![third])).await;
+    let body = json!({
+        "model": "claude-sonnet-4-6", "context_management": {},
+        "messages": [
+            { "role": "assistant", "content": [ { "type": "text", "text": "t" }, { "type": "tool_use", "id": "t1", "name": "x", "input": {} } ] },
+            { "role": "user", "content": [ { "type": "text", "text": "no result for t1" } ] }
+        ]
+    });
+    let (st, _, _) = post(&p, "/v1/messages", body).await;
+    assert_eq!(st, 200);
+    let seen = mock.seen();
+    let sent = &seen[0].body;
+    assert_eq!(sent["model"], "deepseek-v4");
+    assert!(sent.get("context_management").is_none());
+    assert_eq!(sent["messages"][0]["content"].as_array().unwrap().len(), 1, "orphaned tool_use dropped");
+    assert_eq!(seen[0].headers.get("x-api-key").unwrap(), "sk-third");
+    assert!(!seen[0].headers.contains_key("authorization"));
+}
+
+#[tokio::test]
+async fn subscription_token_is_never_sent_to_a_third_party_host() {
+    let mock = spawn_mock().await;
+    // An OAuth account pointing at a non-Anthropic, non-loopback host: refused.
+    let mut a = account("a", "tok-a", 0, "https://api.deepseek.com/anthropic");
+    a.refresh_token = Some("rt".into());
+    let p = spawn_proxy(cfg_with(vec![a, account("b", "tok-b", 1, &mock.url())])).await;
+    let (st, v, _) = post(&p, "/v1/messages", msg("claude-opus-5")).await;
+    assert_eq!(st, 200);
+    assert_eq!(v["served_by"], "tok-b");
+}
+
+#[tokio::test]
+async fn codex_requests_use_codex_pool_only() {
+    let mock = spawn_mock().await;
+    let mut codex = account("cx", "tok-cx", 0, &mock.url());
+    codex.provider = Some("codex".into());
+    codex.account_id = Some("acct_9".into());
+    let p = spawn_proxy(cfg_with(vec![account("a", "tok-a", 0, &mock.url()), codex])).await;
+    let (st, _, _) = post(&p, "/backend-api/codex/responses", json!({ "model": "gpt-5", "input": "hi" })).await;
+    assert_eq!(st, 200);
+    let seen = mock.seen();
+    assert_eq!(seen.last().unwrap().headers.get("authorization").unwrap(), "Bearer tok-cx");
+    assert_eq!(seen.last().unwrap().headers.get("chatgpt-account-id").unwrap(), "acct_9");
+    let (_, v, _) = post(&p, "/v1/messages", msg("claude-opus-5")).await;
+    assert_eq!(v["served_by"], "tok-a", "Anthropic requests never land on the Codex account");
+}
+
+#[tokio::test]
+async fn usage_dimensions_are_consumed_and_attributed() {
+    let mock = spawn_mock().await;
+    let mut cfg = cfg_with(vec![account("a", "tok-a", 0, &mock.url())]);
+    cfg.proxy.usage_dimensions = vec![teamclaude::config::UsageDimension { name: "project".into(), header: "x-teamclaude-project".into() }];
+    let p = spawn_proxy(cfg).await;
+    let r = http().post(p.url("/v1/messages")).header("x-teamclaude-project", "NodeSpy/teamclaude").json(&msg("claude-opus-5")).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    assert!(!mock.seen()[0].headers.contains_key("x-teamclaude-project"), "dimension header stays on this side");
+    let st = p.manager.status(false);
+    assert_eq!(st["usageDimensions"]["project"]["NodeSpy/teamclaude"]["totalRequests"], 1);
+}
+
+#[tokio::test]
+async fn control_plane_endpoints() {
+    let mock = spawn_mock().await;
+    let p = spawn_proxy(cfg_with(vec![account("a", "tok-a", 0, &mock.url())])).await;
+    let _ = post(&p, "/v1/messages", msg("claude-opus-5")).await;
+    let c = http();
+    let metrics = c.get(p.url("/teamclaude/metrics")).send().await.unwrap().text().await.unwrap();
+    assert!(metrics.contains("teamclaude_requests_total 1"));
+    assert!(metrics.contains("teamclaude_account_quota_utilization{account=\"a\",bucket=\"unified5h\"} 0.4"));
+    let quota: Value = c.get(p.url("/teamclaude/quota")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(quota["accounts"][0]["unified5h"], 0.4);
+    let dash = c.get(p.url("/teamclaude/dashboard")).send().await.unwrap();
+    assert_eq!(dash.status(), 200);
+    assert!(dash.headers().get("content-security-policy").is_some());
+    let reload = c.post(p.url("/teamclaude/reload")).send().await.unwrap();
+    assert_eq!(reload.status(), 501, "no reload hook in tests");
+    let _ = p.ctx.config();
+}
+
+#[tokio::test]
+async fn mitm_connect_intercepts_with_local_ca_and_refuses_blind_tunnels() {
+    let mock = spawn_mock().await;
+    let mut cfg = cfg_with(vec![account("a", "tok-a", 0, &mock.url())]);
+    cfg.upstream = mock.url();
+    let p = spawn_proxy(cfg).await;
+    let ca = std::fs::read(teamclaude::proxy::mitm::ca_cert_path())
+        .or_else(|_| {
+            p.ctx.tls_config().unwrap();
+            std::fs::read(teamclaude::proxy::mitm::ca_cert_path())
+        })
+        .unwrap();
+    let cert = reqwest::Certificate::from_pem(&ca).unwrap();
+    let client = reqwest::Client::builder().proxy(reqwest::Proxy::all(p.url("")).unwrap()).add_root_certificate(cert).use_rustls_tls().build().unwrap();
+    let r = client.get("https://www.example.org/").send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    assert!(r.text().await.unwrap().contains("MITM proxy is working"));
+    let r = client.post("https://api.anthropic.com/v1/messages").json(&msg("claude-opus-5")).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let v: Value = r.json().await.unwrap();
+    assert_eq!(v["served_by"], "tok-a", "intercepted CONNECT went through account selection");
+    let blind = client.get("https://example.com/").send().await;
+    assert!(blind.is_err(), "blind tunnels are off by default");
+}

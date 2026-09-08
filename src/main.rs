@@ -1,18 +1,6 @@
 //! TeamClaude: multi-account Claude proxy with quota-based rotation.
 
-mod cli;
-mod config;
-mod manager;
-mod model;
-mod oauth;
-mod prober;
-mod proxy;
-mod quota;
-mod security;
-mod session;
-mod status;
-mod tui;
-mod upstream;
+use teamclaude::*;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -76,6 +64,9 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Command::Threshold { value } => cli::threshold(value).await,
         Command::Distribute { value } => cli::distribute(value).await,
         Command::Probe { value } => cli::probe(value).await,
+        Command::Warmup { value } => cli::warmup(value).await,
+        Command::Expiry { value, tolerance, preempt } => cli::expiry(value, tolerance, preempt).await,
+        Command::Titles { value } => cli::titles(value).await,
         Command::Route { cmd } => cli::route(cmd).await,
         Command::Env(a) => cli::env(a),
         Command::Run(a) => cli::run(a).await,
@@ -113,17 +104,24 @@ async fn server(args: ServerArgs, interactive: bool) -> Result<()> {
     }
     let (activity_tx, _) = tokio::sync::broadcast::channel(512);
     let prober = prober::Prober::new(manager.clone(), cfg.quota_probe_seconds);
+    let warmer = warmer::Warmer::new(manager.clone(), cfg.proxy.port, &cfg.proxy.api_key, cfg.warmup_seconds);
+    let titles = titles::Titles::new(&cfg.session_titles);
     let hold_ms = cfg.hold_seconds * 1000;
 
     let ctx_cell: Arc<parking_lot::Mutex<Option<Ctx>>> = Arc::new(parking_lot::Mutex::new(None));
     let reload: Box<dyn Fn() -> Result<usize> + Send + Sync> = {
         let manager = manager.clone();
         let prober = prober.clone();
+        let warmer = warmer.clone();
+        let titles = titles.clone();
         let cell = ctx_cell.clone();
         Box::new(move || {
             let cfg = Config::load()?.context("config file disappeared")?;
             let added = manager.sync_config(&cfg);
             prober.set_interval(cfg.quota_probe_seconds);
+            warmer.set_interval(cfg.warmup_seconds);
+            warmer.set_api_key(&cfg.proxy.api_key);
+            titles.configure(&cfg.session_titles);
             if let Some(ctx) = cell.lock().clone() {
                 ctx.set_config(cfg);
                 *ctx.tls.write() = None;
@@ -140,6 +138,7 @@ async fn server(args: ServerArgs, interactive: bool) -> Result<()> {
         reload: Some(reload),
         metrics: Metrics::default(),
         tls: RwLock::new(None),
+        titles: titles.clone(),
     }));
     *ctx_cell.lock() = Some(ctx.clone());
 
@@ -155,6 +154,7 @@ async fn server(args: ServerArgs, interactive: bool) -> Result<()> {
 
     // Background: prober, state saver, log sweeper, signals.
     tokio::spawn(prober.clone().run());
+    tokio::spawn(warmer.clone().run());
     {
         let manager = manager.clone();
         let mut rx = shutdown_rx.clone();
@@ -238,7 +238,8 @@ async fn server(args: ServerArgs, interactive: bool) -> Result<()> {
                 Ok(a) = rx.recv() => {
                     let line = match a {
                         proxy::server::Activity::Start { id, method, path, model, session, client } => {
-                            format!("→ {id} {}{} {method} {path}{}", client.map(|c| format!("[{c}] ")).unwrap_or_default(), session.map(|s| s.chars().take(6).collect::<String>()).unwrap_or_default(), model.map(|m| format!(" ({m})")).unwrap_or_default())
+                            let label = ctx.titles.label(session.as_deref(), quota::now_ms());
+                            format!("→ {id} {}{label} {method} {path}{}", client.map(|c| format!("[{c}] ")).unwrap_or_default(), model.map(|m| format!(" ({m})")).unwrap_or_default())
                         }
                         proxy::server::Activity::Account { .. } => continue,
                         proxy::server::Activity::End { id, account, status, elapsed_ms, ok } => format!("{} {id} → {account} {status} ({:.1}s)", if ok { "✓" } else { "✗" }, elapsed_ms as f64 / 1000.0),

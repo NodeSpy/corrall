@@ -60,6 +60,18 @@ pub enum Command {
     Distribute { value: Option<String> },
     /// Background quota probe interval in seconds (off|N)
     Probe { value: Option<String> },
+    /// Keep idle accounts' 5h windows running (off|N seconds, min 60; spends quota)
+    Warmup { value: Option<String> },
+    /// Expiry-pressure routing (on|off), with --tolerance and --preempt
+    Expiry {
+        value: Option<String>,
+        #[arg(long)]
+        tolerance: Option<f64>,
+        #[arg(long)]
+        preempt: Option<String>,
+    },
+    /// Session titles in the activity log (on|off)
+    Titles { value: Option<String> },
     /// Per-model routing rules
     Route {
         #[command(subcommand)]
@@ -110,6 +122,9 @@ pub struct LoginArgs {
     /// Add an Anthropic API key account instead of OAuth
     #[arg(long)]
     pub api: bool,
+    /// Sign in to an OpenAI Codex subscription instead
+    #[arg(long)]
+    pub codex: bool,
     /// Do not try to open a browser
     #[arg(long)]
     pub no_browser: bool,
@@ -126,6 +141,9 @@ pub struct ImportArgs {
     /// Keep reading tokens from the file on every reload instead of copying them
     #[arg(long)]
     pub link: bool,
+    /// Import a Codex CLI login (default path ~/.codex/auth.json)
+    #[arg(long)]
+    pub codex: bool,
     #[arg(long)]
     pub name: Option<String>,
 }
@@ -297,6 +315,32 @@ pub async fn login(args: LoginArgs) -> Result<()> {
         notify_reload(&cfg).await;
         return Ok(());
     }
+    if args.codex {
+        let c = crate::codex::login_browser(!args.no_browser).await?;
+        let access = c.access_token.clone().ok_or_else(|| anyhow!("OpenAI returned no access token"))?;
+        let name = args.name.clone().or(c.email.clone()).unwrap_or_else(|| "codex".into());
+        let cfg = Config::update(|cfg| {
+            let entry = match cfg.accounts.iter().position(|a| a.is_codex() && (a.account_id == c.account_id && c.account_id.is_some() || a.name == name)) {
+                Some(i) => &mut cfg.accounts[i],
+                None => {
+                    cfg.accounts.push(AccountConfig { name: name.clone(), kind: AccountType::Oauth, provider: Some("codex".into()), ..Default::default() });
+                    cfg.accounts.last_mut().unwrap()
+                }
+            };
+            entry.name = name.clone();
+            entry.import_from = None;
+            entry.access_token = Some(access.clone());
+            entry.refresh_token = c.refresh_token.clone();
+            entry.expires_at = c.expires_at;
+            entry.account_id = c.account_id.clone().or(entry.account_id.take());
+            entry.email = c.email.clone().or(entry.email.take());
+            entry.plan_type = c.plan_type.clone().or(entry.plan_type.take());
+            Ok(())
+        })?;
+        eprintln!("Added Codex account \"{name}\"{}", c.plan_type.as_ref().map(|p| format!(" (plan {p})")).unwrap_or_default());
+        notify_reload(&cfg).await;
+        return Ok(());
+    }
     let tokens = if args.token { oauth::login_paste().await? } else { oauth::login_browser(!args.no_browser).await? };
     let profile = match oauth::fetch_profile(&tokens.access_token).await {
         Ok(p) => Some(p),
@@ -340,6 +384,40 @@ fn read_secret() -> Result<String> {
 pub async fn import(args: ImportArgs) -> Result<()> {
     let cfg = Config::load_or_create()?;
     crate::upstream::init(&cfg)?;
+    if args.codex {
+        let from = if args.from == oauth::DEFAULT_CREDENTIALS_PATH { crate::codex::DEFAULT_CREDENTIALS_PATH.to_string() } else { args.from.clone() };
+        let c = crate::codex::import_credentials(&from)?;
+        let access = c.access_token.clone().filter(|t| !t.is_empty()).ok_or_else(|| anyhow!("{from} carries no access token"))?;
+        let name = args.name.clone().or(c.email.clone()).unwrap_or_else(|| "codex".into());
+        let cfg = Config::update(|cfg| {
+            let entry = match cfg.accounts.iter().position(|a| a.is_codex() && (a.account_id == c.account_id && c.account_id.is_some() || a.name == name)) {
+                Some(i) => &mut cfg.accounts[i],
+                None => {
+                    cfg.accounts.push(AccountConfig { name: name.clone(), kind: AccountType::Oauth, provider: Some("codex".into()), ..Default::default() });
+                    cfg.accounts.last_mut().unwrap()
+                }
+            };
+            entry.name = name.clone();
+            if args.link {
+                entry.import_from = Some(from.clone());
+                entry.access_token = None;
+                entry.refresh_token = None;
+                entry.expires_at = None;
+            } else {
+                entry.import_from = None;
+                entry.access_token = Some(access.clone());
+                entry.refresh_token = c.refresh_token.clone();
+                entry.expires_at = c.expires_at;
+            }
+            entry.account_id = c.account_id.clone().or(entry.account_id.take());
+            entry.email = c.email.clone().or(entry.email.take());
+            entry.plan_type = c.plan_type.clone().or(entry.plan_type.take());
+            Ok(())
+        })?;
+        eprintln!("Imported Codex account \"{name}\"{}", if args.link { " (linked)" } else { "" });
+        notify_reload(&cfg).await;
+        return Ok(());
+    }
     let creds = oauth::import_credentials(&args.from)?;
     let access = creds.access_token.clone().filter(|t| !t.is_empty()).ok_or_else(|| anyhow!("{} carries no access token", args.from))?;
     let profile = match oauth::fetch_profile(&access).await {
@@ -381,9 +459,10 @@ pub fn accounts(verbose: bool) -> Result<()> {
     }
     println!("{:<30} {:<7} {:>4} {:<9} {}", "NAME", "TYPE", "PRI", "STATE", if verbose { "DETAILS" } else { "" });
     for a in &cfg.accounts {
-        let kind = match a.kind {
-            AccountType::Oauth => "oauth",
-            AccountType::Apikey => "apikey",
+        let kind = match (a.is_codex(), &a.kind) {
+            (true, _) => "codex",
+            (false, AccountType::Oauth) => "oauth",
+            (false, AccountType::Apikey) => "apikey",
         };
         let state = if a.disabled { "disabled" } else { "enabled" };
         let mut details = String::new();
@@ -574,6 +653,75 @@ pub async fn probe(value: Option<String>) -> Result<()> {
             Config::update(|c| {
                 c.quota_probe_seconds = secs;
                 eprintln!("quotaProbeSeconds: {secs}");
+                Ok(())
+            })?
+        }
+    };
+    notify_reload(&cfg).await;
+    Ok(())
+}
+
+pub async fn warmup(value: Option<String>) -> Result<()> {
+    let cfg = match value {
+        None => {
+            let c = Config::load()?.unwrap_or_default();
+            println!("warmupSeconds: {}", c.warmup_seconds);
+            return Ok(());
+        }
+        Some(v) => {
+            let secs: u64 = if v.eq_ignore_ascii_case("off") { 0 } else { v.parse().context("seconds must be a number or off")? };
+            if secs != 0 && secs < 60 {
+                bail!("minimum keep-warm interval is 60 seconds");
+            }
+            Config::update(|c| {
+                c.warmup_seconds = secs;
+                eprintln!("warmupSeconds: {secs}{}", if secs > 0 { " (spends a little quota per idle account per window)" } else { "" });
+                Ok(())
+            })?
+        }
+    };
+    notify_reload(&cfg).await;
+    Ok(())
+}
+
+pub async fn expiry(value: Option<String>, tolerance: Option<f64>, preempt: Option<String>) -> Result<()> {
+    if value.is_none() && tolerance.is_none() && preempt.is_none() {
+        let c = Config::load()?.unwrap_or_default();
+        println!("{}", serde_json::to_string_pretty(&c.expiry_routing)?);
+        return Ok(());
+    }
+    let cfg = Config::update(|c| {
+        if let Some(v) = &value {
+            c.expiry_routing.enabled = parse_on_off(v)?;
+        }
+        if let Some(t) = tolerance {
+            if t.is_nan() || t < 1.0 {
+                bail!("tolerance must be >= 1.0");
+            }
+            c.expiry_routing.tolerance = t;
+        }
+        if let Some(p) = &preempt {
+            c.expiry_routing.preempt = parse_on_off(p)?;
+        }
+        eprintln!("expiryRouting = {}", serde_json::to_string(&c.expiry_routing)?);
+        Ok(())
+    })?;
+    notify_reload(&cfg).await;
+    Ok(())
+}
+
+pub async fn titles(value: Option<String>) -> Result<()> {
+    let cfg = match value {
+        None => {
+            let c = Config::load()?.unwrap_or_default();
+            println!("{}", serde_json::to_string_pretty(&c.session_titles)?);
+            return Ok(());
+        }
+        Some(v) => {
+            let on = parse_on_off(&v)?;
+            Config::update(|c| {
+                c.session_titles.enabled = on;
+                eprintln!("sessionTitles.enabled: {on}");
                 Ok(())
             })?
         }

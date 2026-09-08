@@ -61,10 +61,15 @@ impl Tui {
     fn on_activity(&mut self, a: Activity) {
         match a {
             Activity::Start { id, method, path, model, session, client } => {
-                let sess = session.map(|s| s.chars().take(6).collect::<String>()).unwrap_or_default();
+                let width = if self.ctx.titles.enabled() { self.ctx.titles.width() } else { 6 };
+                let mut sess = self.ctx.titles.label(session.as_deref(), crate::quota::now_ms());
+                if sess.chars().count() > width {
+                    sess = sess.chars().take(width).collect();
+                }
+                let sess = format!("{sess:<width$}");
                 let who = client.map(|c| format!("[{c}] ")).unwrap_or_default();
                 let model = model.map(|m| format!(" ({m})")).unwrap_or_default();
-                let line = format!("{who}{sess:<6} {method} {path}{model}");
+                let line = format!("{who}{sess} {method} {path}{model}");
                 self.inflight.push(InFlight { id, started: std::time::Instant::now(), line: safe_text(&line, 200), account: String::new() });
             }
             Activity::Account { id, account } => {

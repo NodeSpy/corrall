@@ -11,8 +11,8 @@ use parking_lot::Mutex;
 use serde::Serialize;
 use serde_json::{json, Value};
 
-use crate::config::{AccountConfig, AccountType, Config, RouteConfig, StormRamp, Threshold};
-use crate::model::{any_glob_matches, weekly_bucket_for, Family, BUCKET_5H, BUCKET_7D, BUCKET_7D_FABLE, BUCKET_7D_SONNET};
+use crate::config::{AccountConfig, AccountType, Config, ExpiryRouting, RouteConfig, StormRamp, Threshold};
+use crate::model::{any_glob_matches, weekly_bucket_for, BUCKET_5H, BUCKET_7D, BUCKET_7D_FABLE, BUCKET_7D_SONNET};
 use crate::oauth;
 use crate::quota::{now_ms, Quota, UsagePayload};
 use crate::session::SessionTracker;
@@ -42,11 +42,42 @@ pub struct Usage {
     pub cache_creation_tokens: i64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Provider {
+    Anthropic,
+    Codex,
+}
+
+impl Provider {
+    pub fn for_path(path: &str) -> Provider {
+        if crate::codex::is_codex_path(path) {
+            Provider::Codex
+        } else {
+            Provider::Anthropic
+        }
+    }
+    pub fn for_host(host: &str) -> Provider {
+        if crate::codex::is_codex_host(host) {
+            Provider::Codex
+        } else {
+            Provider::Anthropic
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Account {
     pub id: String,
     pub name: String,
     pub kind: AccountType,
+    pub provider: Provider,
+    /// ChatGPT account id (Codex).
+    pub account_id: Option<String>,
+    pub plan_type: Option<String>,
+    /// Governing weekly reset observed when this account was last confirmed
+    /// as the resting choice, per bucket (expiry-routing preemption).
+    pub rollover_baseline: HashMap<String, i64>,
     pub account_uuid: Option<String>,
     pub org_uuid: Option<String>,
     pub org_name: Option<String>,
@@ -86,6 +117,10 @@ impl Account {
             id: c.id.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
             name: c.name.clone(),
             kind: c.kind.clone(),
+            provider: if c.is_codex() { Provider::Codex } else { Provider::Anthropic },
+            account_id: c.account_id.clone(),
+            plan_type: c.plan_type.clone(),
+            rollover_baseline: HashMap::new(),
             account_uuid: c.account_uuid.clone(),
             org_uuid: c.org_uuid.clone(),
             org_name: c.org_name.clone(),
@@ -128,6 +163,35 @@ impl Account {
             AccountType::Apikey => {
                 self.credential = c.api_key.clone().filter(|k| !k.is_empty());
             }
+            AccountType::Oauth if self.provider == Provider::Codex => {
+                let path = c.import_from.clone();
+                let stored = c.access_token.clone().filter(|t| !t.is_empty());
+                if stored.is_some() && path.is_none() {
+                    self.credential = stored;
+                    self.refresh_token = c.refresh_token.clone().filter(|t| !t.is_empty());
+                    self.expires_at = c.expires_at;
+                } else {
+                    let p = path.unwrap_or_else(|| crate::codex::DEFAULT_CREDENTIALS_PATH.to_string());
+                    match crate::codex::import_credentials(&p) {
+                        Ok(cc) if cc.access_token.as_deref().map(|t| !t.is_empty()).unwrap_or(false) => {
+                            self.credential = cc.access_token;
+                            self.refresh_token = cc.refresh_token;
+                            self.expires_at = cc.expires_at;
+                            if self.account_id.is_none() {
+                                self.account_id = cc.account_id;
+                            }
+                            if self.email.is_none() {
+                                self.email = cc.email;
+                            }
+                            if self.plan_type.is_none() {
+                                self.plan_type = cc.plan_type;
+                            }
+                        }
+                        Ok(_) => tracing::warn!("account \"{}\": {p} carries no access token; skipping", self.name),
+                        Err(e) => tracing::warn!("account \"{}\": cannot read {p}: {e}", self.name),
+                    }
+                }
+            }
             AccountType::Oauth => {
                 if let Some(path) = &c.import_from {
                     match oauth::import_credentials(path) {
@@ -155,12 +219,21 @@ impl Account {
         self.kind == AccountType::Oauth
     }
 
-    /// Upstream base URL. Subscription tokens are only ever sent to Anthropic.
+    /// Upstream base URL. Subscription tokens are only ever sent to their
+    /// provider's hosts (Anthropic, or chatgpt.com for Codex).
     pub fn upstream_for(&self, default: &str) -> Result<String> {
-        let u = self.upstream.clone().unwrap_or_else(|| default.to_string());
+        let u = match (&self.upstream, self.provider) {
+            (Some(u), _) => u.clone(),
+            (None, Provider::Codex) => crate::codex::UPSTREAM.to_string(),
+            (None, Provider::Anthropic) => default.to_string(),
+        };
         if self.is_subscription() {
             let host = url::Url::parse(&u).ok().and_then(|p| p.host_str().map(str::to_string)).unwrap_or_default();
-            if !oauth::is_anthropic_host(&host) && !crate::security::is_loopback_host(&host) {
+            let allowed = match self.provider {
+                Provider::Anthropic => oauth::is_anthropic_host(&host),
+                Provider::Codex => crate::codex::is_codex_host(&host),
+            };
+            if !allowed && !crate::security::is_loopback_host(&host) {
                 anyhow::bail!("account \"{}\" holds a subscription token but points at {u}; refusing to send it there", self.name);
             }
         }
@@ -180,6 +253,8 @@ pub struct Selected {
     pub id: String,
     pub name: String,
     pub kind: AccountType,
+    pub provider: Provider,
+    pub account_id: Option<String>,
     pub credential: String,
     pub account_uuid: Option<String>,
     pub upstream: String,
@@ -212,6 +287,7 @@ pub struct SelectRequest<'a> {
     pub pin: Option<&'a str>,
     pub exclude: HashSet<String>,
     pub allow_probe: bool,
+    pub provider: Option<Provider>,
 }
 
 pub struct Fleet {
@@ -227,8 +303,14 @@ pub struct Fleet {
     pub sessions: SessionTracker,
     pub started_at: i64,
     pub client_usage: BTreeMap<String, Usage>,
+    /// dimension name -> value -> usage
+    pub dimension_usage: BTreeMap<String, BTreeMap<String, Usage>>,
+    pub expiry: ExpiryRouting,
     refresh_locks: HashMap<String, Arc<tokio::sync::Mutex<()>>>,
 }
+
+pub const DIMENSION_MAX_VALUES: usize = 500;
+pub const DIMENSION_OVERFLOW_KEY: &str = "(other)";
 
 #[derive(Clone)]
 pub struct Manager {
@@ -252,6 +334,8 @@ impl Manager {
             sessions: SessionTracker::new(),
             started_at: now_ms(),
             client_usage: BTreeMap::new(),
+            dimension_usage: BTreeMap::new(),
+            expiry: cfg.expiry_routing.clone(),
             refresh_locks: HashMap::new(),
         };
         let m = Manager { inner: Arc::new(Mutex::new(fleet)), events: tx };
@@ -287,6 +371,12 @@ impl Manager {
             f.storm = cfg.storm_ramp.clone();
             f.distribute_sessions = cfg.distribute_sessions;
             f.default_upstream = cfg.upstream.clone();
+            if !cfg.expiry_routing.enabled || !cfg.expiry_routing.preempt {
+                for a in &mut f.accounts {
+                    a.rollover_baseline.clear();
+                }
+            }
+            f.expiry = cfg.expiry_routing.clone();
             let mut next: Vec<Account> = Vec::with_capacity(cfg.accounts.len());
             for c in &cfg.accounts {
                 let id = c.id.clone().unwrap_or_default();
@@ -303,6 +393,7 @@ impl Manager {
                     a.org_uuid = c.org_uuid.clone().or(a.org_uuid);
                     a.org_name = c.org_name.clone().or(a.org_name);
                     a.email = c.email.clone().or(a.email);
+                    a.account_id = c.account_id.clone().or(a.account_id);
                     a.import_from = c.import_from.clone();
                     // Take on-disk tokens when they differ from what we hold: a
                     // re-login elsewhere rotated them. Keep ours otherwise (we may
@@ -373,6 +464,7 @@ impl Manager {
             for (k, v) in &f.client_usage {
                 st.client_usage.insert(k.clone(), serde_json::to_value(v).unwrap_or(Value::Null));
             }
+            st.dimension_usage = serde_json::to_value(&f.dimension_usage).unwrap_or(Value::Null);
             st
         })
     }
@@ -405,6 +497,9 @@ impl Manager {
                 if let Ok(u) = serde_json::from_value::<UsageDe>(v.clone()) {
                     f.client_usage.insert(k.clone(), u.into());
                 }
+            }
+            if let Ok(d) = serde_json::from_value::<BTreeMap<String, BTreeMap<String, UsageDe>>>(st.dimension_usage.clone()) {
+                f.dimension_usage = d.into_iter().map(|(k, m)| (k, m.into_iter().map(|(v, u)| (v, u.into())).collect())).collect();
             }
         });
     }
@@ -521,7 +616,12 @@ impl Manager {
         }
         let rt: String = rt?;
         self.log(format!("Refreshing token for account \"{name}\"..."));
-        match oauth::refresh_access_token(&rt).await {
+        let provider = self.with(|f| f.account(id).map(|a| a.provider).unwrap_or(Provider::Anthropic));
+        let refreshed = match provider {
+            Provider::Anthropic => oauth::refresh_access_token(&rt).await,
+            Provider::Codex => crate::codex::refresh_access_token(&rt).await,
+        };
+        match refreshed {
             Ok(t) => {
                 let (access, refresh, exp) = (t.access_token.clone(), t.refresh_token.clone().unwrap_or(rt), t.expires_at);
                 self.with(|f| {
@@ -580,7 +680,15 @@ impl Manager {
         self.with(|f| {
             let th = f.threshold.clone();
             if let Some(a) = f.account_mut(id) {
-                a.quota.apply_headers(headers, now);
+                match a.provider {
+                    Provider::Anthropic => a.quota.apply_headers(headers, now),
+                    Provider::Codex => {
+                        crate::codex::apply_codex_headers(&mut a.quota, headers, now);
+                        if let Some(p) = headers.get("x-codex-plan-type") {
+                            a.plan_type = Some(p.trim().to_string());
+                        }
+                    }
+                }
                 a.usage.total_requests += 1;
                 a.usage.last_used = Some(chrono::Utc::now().to_rfc3339());
                 if a.probing && a.quota.unified7d.reset_at.is_some() {
@@ -700,9 +808,32 @@ impl Manager {
     }
 
     pub fn record_token_usage(&self, id: &str, session: Option<&str>, client: Option<&str>, model: Option<&str>, usage: &Value) {
+        self.record_token_usage_dims(id, session, client, &[], model, usage)
+    }
+
+    pub fn record_token_usage_dims(
+        &self,
+        id: &str,
+        session: Option<&str>,
+        client: Option<&str>,
+        dims: &[(String, String)],
+        model: Option<&str>,
+        usage: &Value,
+    ) {
         let now = now_ms();
         let g = |k: &str| usage.get(k).and_then(Value::as_i64).unwrap_or(0);
         self.with(|f| {
+            for (dim, value) in dims {
+                let table = f.dimension_usage.entry(dim.clone()).or_default();
+                let key = if table.contains_key(value) || table.len() < DIMENSION_MAX_VALUES { value.clone() } else { DIMENSION_OVERFLOW_KEY.to_string() };
+                let u = table.entry(key).or_default();
+                u.total_requests += 1;
+                u.input_tokens += g("input_tokens");
+                u.output_tokens += g("output_tokens");
+                u.cache_read_tokens += g("cache_read_input_tokens");
+                u.cache_creation_tokens += g("cache_creation_input_tokens");
+                u.last_used = Some(chrono::Utc::now().to_rfc3339());
+            }
             if let Some(a) = f.account_mut(id) {
                 a.usage.input_tokens += g("input_tokens");
                 a.usage.output_tokens += g("output_tokens");
@@ -775,7 +906,22 @@ impl Manager {
         self.with(|f| {
             f.accounts
                 .iter()
-                .filter(|a| a.kind == AccountType::Oauth && a.credential.is_some() && a.upstream.is_none())
+                .filter(|a| a.kind == AccountType::Oauth && a.provider == Provider::Anthropic && a.credential.is_some() && a.upstream.is_none())
+                .map(|a| (a.id.clone(), a.name.clone()))
+                .collect()
+        })
+    }
+
+    /// Accounts keep-warm may touch: idle Anthropic subscription accounts
+    /// whose 5h window is not running.
+    pub fn warm_candidates(&self) -> Vec<(String, String)> {
+        let now = now_ms();
+        self.with(|f| {
+            f.accounts
+                .iter()
+                .filter(|a| a.kind == AccountType::Oauth && a.provider == Provider::Anthropic && a.upstream.is_none() && a.credential.is_some())
+                .filter(|a| f.unavailable_reason(a, None, None, now).is_none())
+                .filter(|a| a.quota.unified5h.reset_at.map(|r| r <= now).unwrap_or(true))
                 .map(|a| (a.id.clone(), a.name.clone()))
                 .collect()
         })
@@ -934,11 +1080,23 @@ impl Fleet {
     /// reasons (near threshold) are prefixed `quota:` so the probe path can
     /// tell them from hard exclusions.
     pub fn unavailable_reason(&self, a: &Account, model: Option<&str>, advisor: Option<&str>, now: i64) -> Option<String> {
+        self.unavailable_reason_for(a, model, advisor, None, now)
+    }
+
+    pub fn unavailable_reason_for(&self, a: &Account, model: Option<&str>, advisor: Option<&str>, provider: Option<Provider>, now: i64) -> Option<String> {
+        if let Some(p) = provider {
+            if a.provider != p {
+                return Some("other provider".into());
+            }
+        }
         if a.disabled {
             return Some("disabled".into());
         }
         if a.credential.is_none() {
             return Some("no credential".into());
+        }
+        if a.upstream_for(&self.default_upstream).is_err() {
+            return Some("upstream refused: subscription token must stay with its provider".into());
         }
         if a.status == Status::Error {
             return Some(format!("error: {}", a.error_message.clone().unwrap_or_else(|| "needs re-login".into())));
@@ -959,15 +1117,6 @@ impl Fleet {
         if advisor.is_some() && !self.route_allows(a, advisor) {
             return Some("route excludes the advisor model".into());
         }
-        if let Some(m) = model {
-            if !a.model_map.is_empty() || a.upstream.is_some() {
-                // Third-party backends only serve what they map or what a route sends them.
-                let route_names = self.route_for(m).map(|r| !r.accounts.is_empty()).unwrap_or(false);
-                if !route_names && !a.model_map.contains_key(m) && Family::of(Some(m)) != Family::Other {
-                    // Anthropic-family model on a third-party backend with no mapping: allowed only as fallback.
-                }
-            }
-        }
         if let Some(b) = self.capped_bucket(a, model) {
             return Some(format!("capped: {b}"));
         }
@@ -987,8 +1136,77 @@ impl Fleet {
         None
     }
 
-    fn is_available(&self, a: &Account, model: Option<&str>, advisor: Option<&str>, now: i64) -> bool {
-        self.unavailable_reason(a, model, advisor, now).is_none()
+    fn is_available_for(&self, a: &Account, req: &SelectRequest, now: i64) -> bool {
+        self.unavailable_reason_for(a, req.model, req.advisor_model, req.provider, now).is_none()
+    }
+
+    /// Expiry pressure: spendable headroom in the governing weekly bucket per
+    /// second until it resets, and whether the reset was actually known. A
+    /// known utilization with no reset is ranked by a lower bound (a full
+    /// week out) so it never beats a measured account.
+    fn pressure(&self, a: &Account, model: Option<&str>, now: i64) -> (Option<f64>, bool) {
+        let key = self.weekly_key_for(model);
+        let b = a.quota.bucket(key).copied().unwrap_or_default();
+        let Some(u) = b.utilization else { return (None, false) };
+        let spendable = 1.0 - u.clamp(0.0, 1.0);
+        match b.reset_at {
+            Some(r) if r > now => (Some(spendable / ((r - now) as f64 / 1000.0)), true),
+            Some(_) => (Some(0.0), true),
+            None => (Some(spendable / (7.0 * 24.0 * 3600.0)), false),
+        }
+    }
+
+    /// Restrict the top priority tier to the accounts within `tolerance` of
+    /// the highest known pressure, highest pressure first. Accounts with no
+    /// utilization reading stay in (being used is how they become known).
+    fn band<'a>(&self, mut v: Vec<&'a Account>, model: Option<&str>, now: i64) -> Vec<&'a Account> {
+        if !self.expiry.enabled || v.len() <= 1 {
+            return v;
+        }
+        let top = v.iter().map(|a| a.priority).min().unwrap();
+        let known: Vec<f64> = v
+            .iter()
+            .filter(|a| a.priority == top)
+            .filter_map(|a| {
+                let (p, measured) = self.pressure(a, model, now);
+                p.filter(|_| measured)
+            })
+            .collect();
+        let Some(max) = known.iter().cloned().reduce(f64::max) else { return v };
+        let ratio = if self.expiry.tolerance.is_finite() && self.expiry.tolerance > 0.0 { self.expiry.tolerance } else { 1.0 };
+        let floor = (max / ratio).min(max);
+        v.retain(|a| a.priority != top || self.pressure(a, model, now).0.map(|p| p >= floor).unwrap_or(true));
+        v.sort_by(|a, b| {
+            a.priority.cmp(&b.priority).then_with(|| {
+                let pa = self.pressure(a, model, now).0.unwrap_or(f64::INFINITY);
+                let pb = self.pressure(b, model, now).0.unwrap_or(f64::INFINITY);
+                pb.partial_cmp(&pa).unwrap_or(std::cmp::Ordering::Equal)
+            })
+        });
+        v
+    }
+
+    /// With preemption on: has the governing weekly window of `a` rolled over
+    /// since we last confirmed it as the resting choice?
+    fn rolled_over(&self, a: &Account, model: Option<&str>) -> bool {
+        if !(self.expiry.enabled && self.expiry.preempt) {
+            return false;
+        }
+        let key = self.weekly_key_for(model);
+        let Some(reset) = a.quota.bucket(key).and_then(|b| b.reset_at) else { return false };
+        a.rollover_baseline.get(key).map(|base| reset > *base).unwrap_or(false)
+    }
+
+    fn note_baseline(&mut self, id: &str, model: Option<&str>) {
+        if !(self.expiry.enabled && self.expiry.preempt) {
+            return;
+        }
+        let key = self.weekly_key_for(model).to_string();
+        if let Some(a) = self.account_mut(id) {
+            if let Some(r) = a.quota.bucket(&key).and_then(|b| b.reset_at) {
+                a.rollover_baseline.insert(key, r);
+            }
+        }
     }
 
     fn clear_expired_all(&mut self, now: i64) {
@@ -1018,6 +1236,8 @@ impl Fleet {
             id: a.id.clone(),
             name: a.name.clone(),
             kind: a.kind.clone(),
+            provider: a.provider,
+            account_id: a.account_id.clone(),
             credential: a.credential.clone()?,
             account_uuid: a.account_uuid.clone(),
             upstream,
@@ -1030,8 +1250,11 @@ impl Fleet {
     /// (unknown last), then fewest active sessions when distributing.
     fn ranked_available(&self, req: &SelectRequest, now: i64) -> Vec<&Account> {
         let stats = if self.distribute_sessions { Some(self.sessions.stats(now)) } else { None };
-        let mut v: Vec<&Account> =
-            self.accounts.iter().filter(|a| !req.exclude.contains(&a.id) && self.is_available(a, req.model, req.advisor_model, now)).collect();
+        let v: Vec<&Account> = self.accounts.iter().filter(|a| !req.exclude.contains(&a.id) && self.is_available_for(a, req, now)).collect();
+        if self.expiry.enabled {
+            return self.band(v, req.model, now);
+        }
+        let mut v = v;
         v.sort_by(|a, b| {
             a.priority.cmp(&b.priority).then_with(|| {
                 if let Some(st) = &stats {
@@ -1083,7 +1306,7 @@ impl Fleet {
             let Some(id) = mgr_resolve(self, pin) else { return Selection::PinUnknown };
             let a = self.account(&id).unwrap().clone();
             // A pin bypasses the switch threshold but never a hard cap or a dead token.
-            match self.unavailable_reason(&a, req.model, req.advisor_model, now) {
+            match self.unavailable_reason_for(&a, req.model, req.advisor_model, req.provider, now) {
                 None => {}
                 Some(r) if r.starts_with("quota:") => {}
                 Some(r) => return Selection::PinUnavailable { name: a.name.clone(), reason: r },
@@ -1099,7 +1322,7 @@ impl Fleet {
             if let Some(route) = self.route_for(m) {
                 if let Some(id) = self.route_pins.get(&route.name).cloned() {
                     if let Some(a) = self.account(&id) {
-                        if !req.exclude.contains(&id) && self.is_available(a, req.model, req.advisor_model, now) {
+                        if !req.exclude.contains(&id) && self.is_available_for(a, req, now) {
                             if let Some(s) = self.snapshot(a) {
                                 return Selection::Account(s);
                             }
@@ -1120,14 +1343,20 @@ impl Fleet {
                 }
             });
             if let Some(id) = pinned {
-                if let Some(a) = self.account(&id) {
-                    if !req.exclude.contains(&id) && self.is_available(a, req.model, req.advisor_model, now) {
-                        // Priority still wins: a strictly better-priority account preempts the pin.
+                if let Some(a) = self.account(&id).cloned() {
+                    if !req.exclude.contains(&id) && self.is_available_for(&a, req, now) {
+                        // Priority still wins: a strictly better-priority account preempts the pin,
+                        // and so does a rollover of the governing weekly window (expiry routing).
                         let better = self.ranked_available(req, now).first().map(|b| b.priority < a.priority).unwrap_or(false);
-                        if !better {
-                            if let Some(s) = self.snapshot(a) {
+                        let rolled = self.rolled_over(&a, req.model);
+                        if !better && !rolled {
+                            self.note_baseline(&id, req.model);
+                            if let Some(s) = self.snapshot(&a) {
                                 return Selection::Account(s);
                             }
+                        }
+                        if rolled {
+                            mgr.log(format!("Weekly window of \"{}\" rolled over; re-ranking the pinned session", a.name));
                         }
                     }
                 }
@@ -1158,22 +1387,39 @@ impl Fleet {
                     if let Some(best) = self.ranked_available(req, now).first().cloned() {
                         let id = best.id.clone();
                         self.set_current(&id, now, mgr, false);
+                        self.note_baseline(&id, req.model);
                         if let Some(s) = self.snapshot(self.account(&id).unwrap()) {
                             return Selection::Account(s);
                         }
                     }
                 }
-                if !req.exclude.contains(&cur) && self.is_available(&a, req.model, req.advisor_model, now) {
-                    // A strictly lower priority number elsewhere preempts.
+                if !req.exclude.contains(&cur) && self.is_available_for(&a, req, now) {
+                    // A strictly lower priority number elsewhere preempts, and so
+                    // does a rollover of the governing weekly window (expiry routing).
                     let better = self.ranked_available(req, now).first().map(|b| b.priority < a.priority).unwrap_or(false);
-                    if !better {
+                    let rolled = self.rolled_over(&a, req.model);
+                    if !better && !rolled {
+                        self.note_baseline(&cur, req.model);
                         if let Some(s) = self.snapshot(&a) {
+                            return Selection::Account(s);
+                        }
+                    }
+                    if rolled {
+                        mgr.log(format!("Weekly window of \"{}\" rolled over; re-ranking", a.name));
+                    }
+                    if let Some(best) = self.ranked_available(req, now).first().cloned() {
+                        let id = best.id.clone();
+                        if id != cur {
+                            self.set_current(&id, now, mgr, false);
+                        }
+                        self.note_baseline(&id, req.model);
+                        if let Some(s) = self.snapshot(self.account(&id).unwrap()) {
                             return Selection::Account(s);
                         }
                     }
                 } else {
                     // Barred only for this model (family bucket / route / cap)? Divert without moving the cursor.
-                    let scoped = self.unavailable_reason(&a, None, None, now).is_none() && !req.exclude.contains(&cur);
+                    let scoped = self.unavailable_reason_for(&a, None, None, req.provider, now).is_none() && !req.exclude.contains(&cur);
                     if let Some(best) = self.ranked_available(req, now).first().cloned() {
                         let id = best.id.clone();
                         self.set_current(&id, now, mgr, scoped);
@@ -1189,6 +1435,7 @@ impl Fleet {
         if let Some(best) = self.ranked_available(req, now).first().cloned() {
             let id = best.id.clone();
             self.set_current(&id, now, mgr, false);
+            self.note_baseline(&id, req.model);
             if let Some(s) = self.snapshot(self.account(&id).unwrap()) {
                 return Selection::Account(s);
             }
@@ -1202,7 +1449,7 @@ impl Fleet {
                 if req.exclude.contains(&a.id) {
                     continue;
                 }
-                match self.unavailable_reason(a, req.model, req.advisor_model, now) {
+                match self.unavailable_reason_for(a, req.model, req.advisor_model, req.provider, now) {
                     Some(r) if r.starts_with("quota:") => {}
                     _ => continue,
                 }
@@ -1234,6 +1481,11 @@ impl Fleet {
         let mut soonest: Option<i64> = None;
         let mut parts = Vec::new();
         for a in &self.accounts {
+            if let Some(p) = req.provider {
+                if a.provider != p {
+                    continue;
+                }
+            }
             let reason = self.unavailable_reason(a, req.model, req.advisor_model, now).unwrap_or_else(|| "tried".into());
             parts.push(format!("{}: {}", a.name, reason));
             let r = a.rate_limited_until.or_else(|| a.quota.soonest_reset());
@@ -1286,6 +1538,9 @@ impl Fleet {
             "id": a.id,
             "name": a.name,
             "type": match a.kind { AccountType::Oauth => "oauth", AccountType::Apikey => "apikey" },
+            "provider": a.provider,
+            "planType": a.plan_type,
+            "pressure": self.pressure(a, None, now).0,
             "email": a.email,
             "accountUuid": a.account_uuid,
             "orgUuid": a.org_uuid,
@@ -1347,6 +1602,8 @@ impl Fleet {
             "distributeSessions": self.distribute_sessions,
             "stormRamp": self.storm,
             "blockedModels": self.blocked_models,
+            "expiryRouting": self.expiry,
+            "usageDimensions": self.dimension_usage,
             "routes": routes,
             "accounts": self.accounts.iter().map(|a| self.account_json(a, now)).collect::<Vec<_>>(),
             "sessions": {

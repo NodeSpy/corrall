@@ -207,6 +207,49 @@ pub struct AccountConfig {
     pub seat_tier: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subscription_type: Option<String>,
+    /// `codex` for an OpenAI Codex subscription; absent = Anthropic.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// ChatGPT account id (Codex).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan_type: Option<String>,
+}
+
+impl AccountConfig {
+    pub fn is_codex(&self) -> bool {
+        self.provider.as_deref() == Some("codex")
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ExpiryRouting {
+    pub enabled: bool,
+    pub tolerance: f64,
+    pub preempt: bool,
+}
+
+impl Default for ExpiryRouting {
+    fn default() -> Self {
+        Self { enabled: false, tolerance: 1.5, preempt: true }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SessionTitles {
+    pub enabled: bool,
+    pub width: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub projects_dir: Option<String>,
+}
+
+impl Default for SessionTitles {
+    fn default() -> Self {
+        Self { enabled: false, width: 18, projects_dir: None }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -294,6 +337,10 @@ pub struct Config {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub routes: Vec<RouteConfig>,
     pub storm_ramp: StormRamp,
+    pub expiry_routing: ExpiryRouting,
+    pub session_titles: SessionTitles,
+    /// Keep-warm interval in seconds (0 = off). Spends a little quota.
+    pub warmup_seconds: u64,
     pub mitm: MitmConfig,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub log_dir: Option<String>,
@@ -325,6 +372,9 @@ impl Default for Config {
             accounts: Vec::new(),
             routes: Vec::new(),
             storm_ramp: StormRamp::default(),
+            expiry_routing: ExpiryRouting::default(),
+            session_titles: SessionTitles::default(),
+            warmup_seconds: 0,
             mitm: MitmConfig::default(),
             log_dir: None,
             log_level: LogLevel::Body,
@@ -374,6 +424,7 @@ impl Config {
     pub fn update<F: FnOnce(&mut Config) -> Result<()>>(f: F) -> Result<Config> {
         static LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
         let _g = LOCK.lock();
+        let _file_lock = crate::security::FileLock::acquire(&config_path()).context("locking config")?;
         let mut cfg = Config::load()?.unwrap_or_default();
         f(&mut cfg)?;
         cfg.save()?;
@@ -503,6 +554,7 @@ pub struct State {
     pub saved_at: Option<String>,
     pub accounts: BTreeMap<String, Value>,
     pub client_usage: BTreeMap<String, Value>,
+    pub dimension_usage: Value,
 }
 
 impl State {

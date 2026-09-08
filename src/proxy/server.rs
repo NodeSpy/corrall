@@ -26,7 +26,7 @@ use super::forward::{error_response, json_response};
 use super::log::RequestLogger;
 use super::mitm::{self, HostMode};
 use crate::config::{Config, EventLogging};
-use crate::manager::Manager;
+use crate::manager::{Manager, Provider};
 
 pub type BoxBody = http_body_util::combinators::BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -45,6 +45,11 @@ pub struct ReqInfo {
     pub pin: Option<String>,
     #[allow(dead_code)]
     pub started: std::time::Instant,
+    pub provider: Provider,
+    /// The request body parsed once; rewrites work on this.
+    pub parsed: Option<Arc<super::body::Obj>>,
+    /// (dimension name, sanitized value) pairs from configured usage headers.
+    pub dimensions: Vec<(String, String)>,
 }
 
 /// Activity events for the TUI / activity log.
@@ -65,6 +70,7 @@ pub struct CtxInner {
     pub reload: Option<Box<dyn Fn() -> Result<usize> + Send + Sync>>,
     pub metrics: Metrics,
     pub tls: RwLock<Option<Arc<tokio_rustls::rustls::ServerConfig>>>,
+    pub titles: crate::titles::Titles,
 }
 
 #[derive(Default)]
@@ -121,6 +127,9 @@ impl Ctx {
         }
         if !hosts.iter().any(|h| h == "api.anthropic.com") {
             hosts.push("api.anthropic.com".to_string());
+        }
+        if cfg.accounts.iter().any(|a| a.is_codex()) {
+            hosts.push(crate::codex::HOST.to_string());
         }
         hosts
     }
@@ -212,6 +221,20 @@ async fn handle(ctx: Ctx, req: Request<Incoming>, peer: IpAddr, tunnel: Option<&
     let path = req.uri().path().to_string();
     let path_and_query = req.uri().path_and_query().map(|p| p.to_string()).unwrap_or_else(|| "/".into());
 
+    // The dashboard page is a static asset with no data in it; everything it
+    // shows is fetched with the key. Serving it unauthenticated lets a browser
+    // load it, which an address bar cannot do with a header.
+    if req.method() == Method::GET && path == "/teamclaude/dashboard" && tunnel.is_none() {
+        let mut r = Response::new(Full::new(Bytes::from_static(super::dashboard::HTML.as_bytes())).map_err(|e| match e {}).boxed());
+        r.headers_mut().insert("content-type", HeaderValue::from_static("text/html; charset=utf-8"));
+        r.headers_mut().insert("cache-control", HeaderValue::from_static("no-store"));
+        r.headers_mut().insert(
+            "content-security-policy",
+            HeaderValue::from_static("default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'"),
+        );
+        return r;
+    }
+
     // Auth. Inside a tunnel the CONNECT already authenticated.
     let auth = match tunnel {
         Some(t) => t.auth.clone(),
@@ -228,6 +251,28 @@ async fn handle(ctx: Ctx, req: Request<Incoming>, peer: IpAddr, tunnel: Option<&
     // Control plane.
     if path.starts_with("/teamclaude/") && tunnel.is_none() {
         return control(&ctx, req, &auth).await;
+    }
+
+    // Passthrough paths carry the client's own upstream session (its token
+    // refresh, Remote Control): no account is selected and no credential
+    // injected. Anthropic only; Codex has no such paths.
+    let provider = match tunnel {
+        Some(t) => Provider::for_host(&t.host),
+        None => Provider::for_path(&path),
+    };
+    if provider == Provider::Anthropic && super::relay::is_passthrough_path(&path) {
+        let upstream = cfg.upstream.clone();
+        let is_upgrade = req.headers().get("upgrade").and_then(|v| v.to_str().ok()).map(|u| u.eq_ignore_ascii_case("websocket")).unwrap_or(false);
+        let _ = ctx.activity.send(Activity::Log(format!("passthrough {} {}", req.method(), crate::security::safe_text(&path, 100))));
+        if is_upgrade {
+            return super::relay::relay_upgrade(&upstream, req).await;
+        }
+        let (parts, body) = req.into_parts();
+        let body = match read_body(body, CONTROL_BODY_LIMIT * 16).await {
+            Ok(b) => b,
+            Err(_) => return error_response(StatusCode::PAYLOAD_TOO_LARGE, "invalid_request_error", "request body too large"),
+        };
+        return super::relay::passthrough(&upstream, parts, body).await;
     }
 
     // Deprecated path pin.
@@ -262,7 +307,39 @@ async fn handle(ctx: Ctx, req: Request<Incoming>, peer: IpAddr, tunnel: Option<&
         }
     };
 
-    let (model, advisor) = if body.is_empty() { (None, None) } else { crate::model::models_in_body(&body) };
+    let parsed = if body.is_empty() || provider == Provider::Codex { None } else { super::body::parse(&body).map(Arc::new) };
+    let (model, advisor) = match &parsed {
+        Some(m) => {
+            let main = m.get("model").and_then(serde_json::Value::as_str).map(str::to_string);
+            let adv = m.get("tools").and_then(serde_json::Value::as_array).and_then(|tools| {
+                tools.iter().find_map(|t| {
+                    let ty = t.get("type")?.as_str()?;
+                    if ty.to_ascii_lowercase().starts_with("advisor") {
+                        t.get("model")?.as_str().map(str::to_string)
+                    } else {
+                        None
+                    }
+                })
+            });
+            (main, adv)
+        }
+        None if provider == Provider::Codex => (crate::model::request_model(&body), None),
+        None => (None, None),
+    };
+    let dimensions: Vec<(String, String)> = cfg
+        .proxy
+        .usage_dimensions
+        .iter()
+        .filter_map(|d| {
+            let v = parts.headers.get(d.header.to_ascii_lowercase().as_str())?.to_str().ok()?;
+            let v = crate::security::safe_text(v.trim(), 200);
+            if v.is_empty() {
+                None
+            } else {
+                Some((d.name.clone(), v))
+            }
+        })
+        .collect();
     if let Some(m) = &model {
         if ctx.manager.is_model_blocked(m) {
             return error_response(StatusCode::BAD_REQUEST, "invalid_request_error", "This model is blocked by the proxy configuration (blockedModels)");
@@ -281,6 +358,9 @@ async fn handle(ctx: Ctx, req: Request<Incoming>, peer: IpAddr, tunnel: Option<&
         client,
         pin,
         started: std::time::Instant::now(),
+        provider,
+        parsed,
+        dimensions,
     };
 
     let show = !(path.starts_with("/api/event_logging") && cfg.event_logging == EventLogging::Hide);
@@ -335,6 +415,8 @@ async fn control(ctx: &Ctx, req: Request<Incoming>, auth: &Auth) -> Response<Box
             st["quotaProbeSeconds"] = json!(cfg.quota_probe_seconds);
             st["mitm"] = json!({ "caPath": mitm::ca_cert_path(), "http1Only": cfg.mitm.http1_only, "allowTunnel": cfg.mitm.allow_tunnel });
             st["client"] = json!(auth.client_name());
+            st["sessionTitles"] = json!(cfg.session_titles);
+            st["warmupSeconds"] = json!(cfg.warmup_seconds);
             json_response(StatusCode::OK, st)
         }
         (Method::GET, "/teamclaude/quota") => json_response(StatusCode::OK, ctx.manager.quota_summary()),
@@ -450,7 +532,15 @@ async fn handle_connect(ctx: Ctx, req: Request<Incoming>, peer: IpAddr) -> Respo
         Ok(x) => x,
         Err(_) => return error_response(StatusCode::BAD_REQUEST, "invalid_request_error", "bad CONNECT authority"),
     };
-    let mode = mitm::host_mode(&host, port, &ctx.intercept_hosts(), &cfg.mitm);
+    let mode = if host.eq_ignore_ascii_case(crate::codex::NEVER_INTERCEPT) {
+        if cfg.mitm.allow_tunnel {
+            mitm::HostMode::Tunnel
+        } else {
+            mitm::HostMode::Refuse("telemetry host is never intercepted; enable mitm.allowTunnel to pass it through")
+        }
+    } else {
+        mitm::host_mode(&host, port, &ctx.intercept_hosts(), &cfg.mitm)
+    };
 
     // Pins only matter for intercepted hosts; validate them there so a typo
     // meant for Anthropic cannot take down unrelated tunnels.

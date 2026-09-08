@@ -1878,6 +1878,7 @@ dependencies = [
  "url",
  "uuid",
  "webbrowser",
+ "webpki-roots",
  "x509-parser",
 ]
 

@@ -27,6 +27,9 @@ beside it. Safe to delete; quota is re-learned from traffic.
 | `blockedModels` | `[]` | Globs of models rejected with a fast 400 |
 | `routes` | `[]` | `[{ "name", "match": [globs], "accounts": [names], "bucket"?, "color"? }]`, first match wins |
 | `stormRamp` | on | `{ "enabled", "startConc": 1, "stepConc": 1, "stepMs": 250, "windowMs": 30000 }` |
+| `expiryRouting` | off | `{ "enabled", "tolerance": 1.5, "preempt": true }`: rank the top priority tier by headroom ÷ seconds-to-reset of the governing weekly bucket, keep accounts within `tolerance` of the best, and with `preempt` re-rank the sticky/pinned account when its window rolls over |
+| `warmupSeconds` | `0` | Keep-warm interval (min 60). Spawns `claude -p --bare --model haiku` per idle account through this proxy; spends a little quota |
+| `sessionTitles` | off | `{ "enabled", "width": 18, "projectsDir"? }`: label activity rows with the Claude Code session title read from `~/.claude/projects` |
 | `mitm.http1Only` | `true` | Offer only HTTP/1.1 inside the intercepted tunnel (needed for WebSocket / Remote Control) |
 | `mitm.allowTunnel` | `false` | Allow blind CONNECT tunnels to non-intercepted hosts (port 443, public addresses only) |
 | `mitm.tunnelAllow` | `[]` | Explicit `host` or `host:port` allow-list for blind tunnels |
@@ -44,6 +47,8 @@ beside it. Safe to delete; quota is re-learned from traffic.
 | `id` | Stable id issued on first read. Leave alone |
 | `name` | Display name; also accepted by every command and by `TC_ACCT` |
 | `type` | `oauth` or `apikey` |
+| `provider` | `codex` for an OpenAI Codex subscription (default Anthropic). Codex tokens default to `importFrom: ~/.codex/auth.json` when no tokens are stored |
+| `accountId` / `planType` | ChatGPT account id and plan (Codex), filled from the login |
 | `priority` | Lower is preferred (default 0) |
 | `disabled` | Excluded from rotation |
 | `accessToken` / `refreshToken` / `expiresAt` | OAuth tokens (ms epoch). Written back on refresh |
@@ -82,9 +87,35 @@ refused.
 | Endpoint | Description |
 | --- | --- |
 | `GET health` | `{ ok, version }` |
+| `GET dashboard` | Static HTML page; asks for the key and polls `status` |
 | `GET status` | Full account, quota, route, session and client-usage view |
 | `GET quota` | Tier-weighted fleet quota for status lines |
 | `GET metrics` | Prometheus text format |
 | `POST reload` | Re-read the config |
 | `POST switch` `{ "account": "…" }` | Prefer one account |
 | `POST route-pin` `{ "route": "…", "account": "…" }` | Pin a route (omit `account` to clear) |
+
+## Passthrough paths
+
+`/v1/oauth/token`, `/api/oauth/*` and `/v1/code/*` (Remote Control, including
+its WebSocket upgrade) are relayed to the Anthropic upstream with the client's
+own `authorization` header and no account selection. Hop-by-hop headers and the
+proxy key are stripped.
+
+## Codex
+
+Point the Codex CLI at the proxy in `~/.codex/config.toml`:
+
+```toml
+model_provider = "teamclaude"
+
+[model_providers.teamclaude]
+name = "teamclaude"
+base_url = "http://127.0.0.1:3456/backend-api/codex"
+wire_api = "responses"
+```
+
+or launch it behind the MITM proxy (`eval "$(teamclaude env)"`), which
+intercepts `chatgpt.com` as soon as one Codex account is configured
+(`ab.chatgpt.com`, OpenAI's telemetry host, is never intercepted). Codex and
+Anthropic accounts rotate independently on one port.

@@ -10,6 +10,10 @@ readme = "README.md"
 keywords = ["claude", "anthropic", "proxy", "load-balancer", "multi-account"]
 categories = ["command-line-utilities", "network-programming"]
 
+[lib]
+name = "teamclaude"
+path = "src/lib.rs"
+
 [[bin]]
 name = "teamclaude"
 path = "src/main.rs"
@@ -26,6 +30,7 @@ rcgen = { version = "0.13", default-features = false, features = ["ring", "pem",
 time = "0.3"
 x509-parser = "0.16"
 rustls-pemfile = "2"
+webpki-roots = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 clap = { version = "4", features = ["derive", "wrap_help"] }

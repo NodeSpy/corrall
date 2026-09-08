@@ -30,7 +30,7 @@ items below are the gaps.
 | # | Severity | Finding (original) | Disposition here |
 | --- | --- | --- | --- |
 | 1 | Medium | Config and state written with truncate-in-place; a crash mid-write leaves an unparsable file holding every refresh token. | Fixed. `security::write_private_atomic`: temp file, fsync, rename, 0600. |
-| 2 | Medium | Cross-process lost update: a CLI `login` running while the server refreshed a token could overwrite the rotated refresh token with a stale one. | Reduced. `Config::update` re-reads immediately before writing under a process lock and every CLI mutation does its network work first; the server persists refreshes through the same path. |
+| 2 | Medium | Cross-process lost update: a CLI `login` running while the server refreshed a token could overwrite the rotated refresh token with a stale one. | Fixed. `Config::update` takes a cross-process `flock` on `teamclaude.lock`, re-reads under it, then writes atomically; every CLI mutation does its network work first and mutates inside the lock. |
 | 3 | Medium | An OAuth account with a third-party `upstream` sends its Anthropic bearer token to that host. | Fixed. `Account::upstream_for` refuses non-Anthropic hosts for subscription accounts; the account is skipped and the reason logged. |
 | 4 | Low | Anthropic OAuth callback listener bound all interfaces; the `error` parameter was honoured before the `state` check, so a LAN host could abort a login. | Fixed. Binds 127.0.0.1, ignores non-loopback peers, checks `state` first. |
 | 5 | Low | Session map keyed on an unbounded, attacker-controlled header. | Fixed. Ids validated (charset, ≤128), map capped at 10 000 with idle eviction. |
@@ -72,6 +72,6 @@ and state output.
 - The MITM leaf key on disk (0600) lets a same-user process impersonate
   `api.anthropic.com` to a client that trusts the local CA. This is inherent to
   the MITM feature; use `--no-mitm` where that matters.
-- `Config::update` serialises writers within one process and re-reads before
-  writing, but two different processes racing within the same few milliseconds
-  can still lose an update. A file lock would close this fully.
+- A same-user process that can reach the loopback listener can spend the
+  fleet's quota unless `proxy.requireKeyOnLoopback` is on. That is the same
+  trust boundary as the original and is documented rather than closed.

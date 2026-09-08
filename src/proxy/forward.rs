@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 
 use super::server::{BoxBody, Ctx, ReqInfo};
 use crate::config::AccountType;
-use crate::manager::{SelectRequest, Selected, Selection};
+use crate::manager::{Provider, SelectRequest, Selected, Selection};
 use crate::upstream::{body_idle_timeout, client, headers_timeout};
 
 const MAX_ATTEMPTS: usize = 6;
@@ -97,6 +97,7 @@ pub async fn forward(ctx: &Ctx, info: &ReqInfo, mut headers: HeaderMap, body: By
             pin: info.pin.as_deref(),
             exclude: tried.clone(),
             allow_probe: true,
+            provider: Some(info.provider),
         });
         let account = match sel {
             Selection::Account(a) => a,
@@ -182,7 +183,7 @@ fn is_entitlement_denied(body: &[u8]) -> bool {
 
 fn rl_headers(h: &reqwest::header::HeaderMap) -> BTreeMap<String, String> {
     h.iter()
-        .filter(|(k, _)| k.as_str().starts_with("anthropic-ratelimit-"))
+        .filter(|(k, _)| k.as_str().starts_with("anthropic-ratelimit-") || k.as_str().starts_with("x-codex-"))
         .filter_map(|(k, v)| v.to_str().ok().map(|s| (k.as_str().to_string(), s.to_string())))
         .collect()
 }
@@ -197,16 +198,14 @@ async fn attempt(ctx: &Ctx, info: &ReqInfo, account: &Selected, headers: &Header
         AccountType::Apikey => account.credential.clone(),
     };
 
-    // Body rewrites (Anthropic-shaped only).
-    let mut send = body.clone();
-    if account.upstream.contains("anthropic.com") || account.model_map.is_empty() {
-        send = super::body::sanitize_tool_pairs(&send);
-        if let Some(uuid) = &account.account_uuid {
-            send = super::body::patch_account_uuid(&send, uuid);
+    // Body rewrites, one pass over the body parsed once in `handle`. A Codex
+    // (Responses API) body has no Anthropic shape to repair and is sent as is.
+    let send = match account.provider {
+        Provider::Codex => body.clone(),
+        Provider::Anthropic => {
+            super::body::apply_all(body, info.parsed.as_deref(), account.account_uuid.as_deref(), true, &account.model_map, &account.strip_request_fields)
         }
-    }
-    send = super::body::rewrite_model(&send, &account.model_map);
-    send = super::body::strip_fields(&send, &account.strip_request_fields);
+    };
 
     let url = format!("{}{}", account.upstream.trim_end_matches('/'), info.path_and_query);
     let method = reqwest::Method::from_bytes(info.method.as_bytes()).unwrap_or(reqwest::Method::POST);
@@ -218,12 +217,20 @@ async fn attempt(ctx: &Ctx, info: &ReqInfo, account: &Selected, headers: &Header
             out_headers.push((k.as_str().to_string(), s.to_string()));
         }
     }
-    match account.kind {
-        AccountType::Oauth => {
+    match (account.provider, &account.kind) {
+        (Provider::Codex, _) => {
+            req = req.header("authorization", format!("Bearer {credential}"));
+            out_headers.push(("authorization".into(), format!("Bearer {credential}")));
+            if let Some(aid) = &account.account_id {
+                req = req.header("chatgpt-account-id", aid);
+                out_headers.push(("chatgpt-account-id".into(), aid.clone()));
+            }
+        }
+        (Provider::Anthropic, AccountType::Oauth) => {
             req = req.header("authorization", format!("Bearer {credential}"));
             out_headers.push(("authorization".into(), format!("Bearer {credential}")));
         }
-        AccountType::Apikey => {
+        (Provider::Anthropic, AccountType::Apikey) => {
             req = req.header("x-api-key", &credential);
             out_headers.push(("x-api-key".into(), credential.clone()));
         }
@@ -354,6 +361,7 @@ async fn attempt(ctx: &Ctx, info: &ReqInfo, account: &Selected, headers: &Header
     let session = info.session_id.clone();
     let client_name = info.client.clone();
     let model_owned = info.model.clone();
+    let dims = info.dimensions.clone();
     let logger = ctx.logger.clone();
     let log_req = (info.id.clone(), account.name.clone(), info.method.clone(), url.clone(), out_headers, send.clone(), status.as_u16(), res_headers);
     let elapsed_notify = ctx.clone();
@@ -397,7 +405,7 @@ async fn attempt(ctx: &Ctx, info: &ReqInfo, account: &Selected, headers: &Header
             }
             usage_acc.flush(&buf);
             if let Some(u) = usage_acc.merged() {
-                manager.record_token_usage(&account_id, session.as_deref(), client_name.as_deref(), model_owned.as_deref(), &u);
+                manager.record_token_usage_dims(&account_id, session.as_deref(), client_name.as_deref(), &dims, model_owned.as_deref(), &u);
             }
             elapsed_notify.notify_end(&info_c, &acct_name, status.as_u16(), started.elapsed(), ok);
             if let Some(l) = logger {
@@ -421,7 +429,7 @@ async fn attempt(ctx: &Ctx, info: &ReqInfo, account: &Selected, headers: &Header
     };
     if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
         if let Some(u) = v.get("usage") {
-            ctx.manager.record_token_usage(&account.id, info.session_id.as_deref(), info.client.as_deref(), info.model.as_deref(), u);
+            ctx.manager.record_token_usage_dims(&account.id, info.session_id.as_deref(), info.client.as_deref(), &info.dimensions, info.model.as_deref(), u);
         }
     }
     ctx.notify_end(info, &account.name, status.as_u16(), started.elapsed(), status.is_success());

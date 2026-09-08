@@ -145,6 +145,51 @@ pub fn set_mode(path: &Path, mode: u32) {
 #[cfg(not(unix))]
 pub fn set_mode(_path: &Path, _mode: u32) {}
 
+/// Cross-process advisory lock on `<path>.lock` (flock on unix). Held for the
+/// lifetime of the value.
+pub struct FileLock {
+    #[allow(dead_code)]
+    file: std::fs::File,
+}
+
+impl FileLock {
+    pub fn acquire(path: &Path) -> std::io::Result<FileLock> {
+        if let Some(dir) = path.parent() {
+            if !dir.as_os_str().is_empty() {
+                std::fs::create_dir_all(dir)?;
+            }
+        }
+        let lock_path = path.with_extension("lock");
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let file = opts.open(&lock_path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+            if rc != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        Ok(FileLock { file })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        use std::os::unix::io::AsRawFd;
+        unsafe {
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
