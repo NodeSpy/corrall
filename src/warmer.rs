@@ -8,10 +8,11 @@ use std::time::Duration;
 use parking_lot::Mutex;
 
 use crate::manager::Manager;
+use crate::pools::Pools;
 
 #[derive(Clone)]
 pub struct Warmer {
-    manager: Manager,
+    pools: Arc<Pools>,
     port: u16,
     api_key: Arc<Mutex<String>>,
     interval: Arc<Mutex<u64>>,
@@ -20,9 +21,9 @@ pub struct Warmer {
 }
 
 impl Warmer {
-    pub fn new(manager: Manager, port: u16, api_key: &str, interval_secs: u64) -> Warmer {
+    pub fn new(pools: Arc<Pools>, port: u16, api_key: &str, interval_secs: u64) -> Warmer {
         Warmer {
-            manager,
+            pools,
             port,
             api_key: Arc::new(Mutex::new(api_key.to_string())),
             interval: Arc::new(Mutex::new(interval_secs)),
@@ -51,7 +52,7 @@ impl Warmer {
                 continue;
             }
             if !was_on {
-                self.manager.log(format!("Keep-warm enabled (every {secs}s); this spends a little quota"));
+                self.pools.default().log(format!("Keep-warm enabled (every {secs}s); this spends a little quota"));
                 was_on = true;
                 self.warm_all().await;
             }
@@ -64,14 +65,20 @@ impl Warmer {
 
     pub async fn warm_all(&self) {
         let Ok(_g) = self.running.try_lock() else { return };
-        for (id, name) in self.manager.warm_candidates() {
-            self.warm_one(&id, &name).await;
+        let default = self.pools.default_name();
+        for (pool, m) in self.pools.each() {
+            // The pin resolves inside its own pool, so the warm-up request has
+            // to arrive addressed to that pool.
+            let prefix = if pool == default { String::new() } else { format!("{}{pool}", crate::pools::POOL_PREFIX) };
+            for (id, name) in m.warm_candidates() {
+                self.warm_one(&m, &prefix, &id, &name).await;
+            }
         }
     }
 
-    async fn warm_one(&self, id: &str, name: &str) {
+    async fn warm_one(&self, m: &Manager, prefix: &str, id: &str, name: &str) {
         let key = self.api_key.lock().clone();
-        let base = format!("http://127.0.0.1:{}/tc-acct/{}", self.port, id);
+        let base = format!("http://127.0.0.1:{}{prefix}/tc-acct/{}", self.port, id);
         let mut cmd = tokio::process::Command::new("claude");
         cmd.args(["-p", "--bare", "--model", &self.model, "--output-format", "text", "hi"])
             .env_remove("TC_ACCT")
@@ -87,10 +94,10 @@ impl Warmer {
             .stderr(std::process::Stdio::null())
             .kill_on_drop(true);
         match tokio::time::timeout(Duration::from_secs(120), cmd.status()).await {
-            Ok(Ok(st)) if st.success() => self.manager.log(format!("Keep-warm: warmed \"{name}\"")),
-            Ok(Ok(st)) => self.manager.log(format!("Keep-warm: claude exited {} for \"{name}\"", st.code().unwrap_or(-1))),
-            Ok(Err(e)) => self.manager.log(format!("Keep-warm: cannot run claude: {e}")),
-            Err(_) => self.manager.log(format!("Keep-warm: timed out warming \"{name}\"")),
+            Ok(Ok(st)) if st.success() => m.log(format!("Keep-warm: warmed \"{name}\"")),
+            Ok(Ok(st)) => m.log(format!("Keep-warm: claude exited {} for \"{name}\"", st.code().unwrap_or(-1))),
+            Ok(Err(e)) => m.log(format!("Keep-warm: cannot run claude: {e}")),
+            Err(_) => m.log(format!("Keep-warm: timed out warming \"{name}\"")),
         }
     }
 }

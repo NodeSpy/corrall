@@ -36,22 +36,64 @@ pub fn countdown(secs: Option<i64>) -> String {
     }
 }
 
+/// The status payload has one section per pool, and — for backward
+/// compatibility — the default pool's section is also flattened onto the top
+/// level. With a single pool the two are the same object, so rendering the top
+/// level gives exactly the pre-pools output.
 pub fn render(st: &Value) -> String {
+    let pools = st.get("pools").and_then(Value::as_array).filter(|p| p.len() > 1);
     let mut out = String::new();
-    let current = st.get("current").and_then(Value::as_str).unwrap_or("-");
     out.push_str(&format!(
-        "TeamClaude v{}  uptime {}  current: {}\n",
+        "TeamClaude v{}  uptime {}  ",
         st.get("version").and_then(Value::as_str).unwrap_or("?"),
         countdown(st.get("uptimeSeconds").and_then(Value::as_i64)),
-        current
     ));
+    match pools {
+        // With several fleets there is no single "current" account, so name the
+        // pool that serves requests arriving without a /pool/<name> prefix.
+        Some(ps) => out.push_str(&format!("{} pools (default: {})\n", ps.len(), st.get("defaultPool").and_then(Value::as_str).unwrap_or("-"))),
+        None => out.push_str(&format!("current: {}\n", st.get("current").and_then(Value::as_str).unwrap_or("-"))),
+    }
     out.push_str(&format!(
-        "upstream: {}   via: {}   threshold: {}   distribute: {}\n",
+        "upstream: {}   via: {}",
         st.get("upstream").and_then(Value::as_str).unwrap_or("?"),
         st.get("upstreamProxy").and_then(Value::as_str).unwrap_or("direct"),
-        st.get("switchThreshold").map(|t| t.to_string()).unwrap_or_default(),
-        st.get("distributeSessions").and_then(Value::as_bool).unwrap_or(false)
     ));
+    if pools.is_none() {
+        out.push_str(&format!("   threshold: {}   distribute: {}", threshold(st), distribute(st)));
+    }
+    out.push('\n');
+    match pools {
+        Some(ps) => {
+            for p in ps {
+                out.push_str(&format!(
+                    "\npool {}{}   current: {}   threshold: {}   distribute: {}\n",
+                    crate::security::safe_text(p.get("pool").and_then(Value::as_str).unwrap_or("?"), 24),
+                    if p.get("default").and_then(Value::as_bool).unwrap_or(false) { " *" } else { "" },
+                    p.get("current").and_then(Value::as_str).unwrap_or("-"),
+                    threshold(p),
+                    distribute(p),
+                ));
+                out.push_str(&pool_section(p));
+            }
+            out.push_str("\n* serves requests with no /pool/<name> prefix\n");
+        }
+        None => out.push_str(&pool_section(st)),
+    }
+    out
+}
+
+fn threshold(p: &Value) -> String {
+    p.get("switchThreshold").map(|t| t.to_string()).unwrap_or_default()
+}
+
+fn distribute(p: &Value) -> bool {
+    p.get("distributeSessions").and_then(Value::as_bool).unwrap_or(false)
+}
+
+/// One pool's sessions line, account table, routes, and client usage.
+fn pool_section(st: &Value) -> String {
+    let mut out = String::new();
     if let Some(s) = st.get("sessions") {
         out.push_str(&format!(
             "sessions: {} active, {} known, {} in flight\n",

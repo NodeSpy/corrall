@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 
 use super::server::{BoxBody, Ctx, ReqInfo};
 use crate::config::AccountType;
-use crate::manager::{Provider, SelectRequest, Selected, Selection};
+use crate::manager::{Manager, Provider, SelectRequest, Selected, Selection};
 use crate::upstream::{body_idle_timeout, client, headers_timeout};
 
 const MAX_ATTEMPTS: usize = 6;
@@ -64,7 +64,9 @@ enum Attempt {
     Abort(Response<BoxBody>),
 }
 
-pub async fn forward(ctx: &Ctx, info: &ReqInfo, mut headers: HeaderMap, body: Bytes) -> Response<BoxBody> {
+/// `mgr` is the manager of `info.pool` — resolved once by the caller so every
+/// attempt in this request stays inside the pool the client selected.
+pub async fn forward(ctx: &Ctx, mgr: &Manager, info: &ReqInfo, mut headers: HeaderMap, body: Bytes) -> Response<BoxBody> {
     // Strip hop-by-hop, client credentials, dimension headers, and encodings
     // we cannot faithfully relay.
     let strip: HashSet<String> = ctx.dimension_headers();
@@ -80,7 +82,7 @@ pub async fn forward(ctx: &Ctx, info: &ReqInfo, mut headers: HeaderMap, body: By
     let session = info.session_id.as_deref();
     let (model, advisor) = (info.model.as_deref(), info.advisor_model.as_deref());
     let mut tried: HashSet<String> = HashSet::new();
-    let hold_deadline = if ctx.hold_ms > 0 { Some(tokio::time::Instant::now() + Duration::from_millis(ctx.hold_ms)) } else { None };
+    let hold_deadline = if info.hold_ms > 0 { Some(tokio::time::Instant::now() + Duration::from_millis(info.hold_ms)) } else { None };
     let mut attempts = 0usize;
     let mut same_account_retries = 0usize;
     let mut last_exhausted: Option<(u64, String)> = None;
@@ -90,7 +92,7 @@ pub async fn forward(ctx: &Ctx, info: &ReqInfo, mut headers: HeaderMap, body: By
         if attempts > MAX_ATTEMPTS * 3 {
             return error_response(StatusCode::BAD_GATEWAY, "api_error", "No account could serve the request after repeated attempts");
         }
-        let sel = ctx.manager.select(&SelectRequest {
+        let sel = mgr.select(&SelectRequest {
             model,
             advisor_model: advisor,
             session_id: session,
@@ -117,7 +119,7 @@ pub async fn forward(ctx: &Ctx, info: &ReqInfo, mut headers: HeaderMap, body: By
                 if let Some(deadline) = hold_deadline {
                     if tokio::time::Instant::now() < deadline {
                         let wait = Duration::from_secs(retry_after_secs.clamp(2, 30));
-                        ctx.manager.log(format!("All accounts exhausted; holding request {} for {}s", info.id, wait.as_secs()));
+                        mgr.log(format!("All accounts exhausted; holding request {} for {}s", info.id, wait.as_secs()));
                         tokio::time::sleep(wait).await;
                         tried.clear();
                         continue;
@@ -134,16 +136,16 @@ pub async fn forward(ctx: &Ctx, info: &ReqInfo, mut headers: HeaderMap, body: By
         };
 
         ctx.notify_account(info, &account.name);
-        match attempt(ctx, info, &account, &headers, &body).await {
+        match attempt(ctx, mgr, info, &account, &headers, &body).await {
             Attempt::Done(r) => {
-                ctx.manager.record_session(session, &account.id, model);
+                mgr.record_session(session, &account.id, model);
                 return r;
             }
             Attempt::Abort(r) => return r,
             Attempt::Failover { reason, transient } => {
                 tried.insert(account.id.clone());
                 if transient {
-                    ctx.manager.record_failure(&account.id);
+                    mgr.record_failure(&account.id);
                 }
                 tracing::info!("failover off \"{}\": {reason}", account.name);
                 if info.pin.is_some() {
@@ -188,10 +190,10 @@ fn rl_headers(h: &reqwest::header::HeaderMap) -> BTreeMap<String, String> {
         .collect()
 }
 
-async fn attempt(ctx: &Ctx, info: &ReqInfo, account: &Selected, headers: &HeaderMap, body: &Bytes) -> Attempt {
+async fn attempt(ctx: &Ctx, mgr: &Manager, info: &ReqInfo, account: &Selected, headers: &HeaderMap, body: &Bytes) -> Attempt {
     // Freshen the OAuth token first (coalesced across callers).
     let credential = match account.kind {
-        AccountType::Oauth => match ctx.manager.ensure_token_fresh(&account.id, false).await {
+        AccountType::Oauth => match mgr.ensure_token_fresh(&account.id, false).await {
             Some(c) => c,
             None => return Attempt::Failover { reason: "no usable token".into(), transient: false },
         },
@@ -239,14 +241,14 @@ async fn attempt(ctx: &Ctx, info: &ReqInfo, account: &Selected, headers: &Header
         req = req.header("content-length", send.len().to_string()).body(send.clone());
     }
 
-    ctx.manager.admit(&account.id).await;
-    if info.pin.is_none() && ctx.manager.is_entitlement_denied(&account.id) {
-        ctx.manager.release(&account.id);
+    mgr.admit(&account.id).await;
+    if info.pin.is_none() && mgr.is_entitlement_denied(&account.id) {
+        mgr.release(&account.id);
         return Attempt::Failover { reason: "oauth not allowed for organization (cooldown)".into(), transient: false };
     }
     let started = std::time::Instant::now();
     let res = req.send().await;
-    ctx.manager.release(&account.id);
+    mgr.release(&account.id);
 
     let res = match res {
         Ok(r) => r,
@@ -262,9 +264,9 @@ async fn attempt(ctx: &Ctx, info: &ReqInfo, account: &Selected, headers: &Header
 
     let status = res.status();
     let rl = rl_headers(res.headers());
-    ctx.manager.update_quota(&account.id, &rl);
+    mgr.update_quota(&account.id, &rl);
     if status.as_u16() != 429 {
-        ctx.manager.clear_rate_limited(&account.id);
+        mgr.clear_rate_limited(&account.id);
     }
 
     match status.as_u16() {
@@ -276,24 +278,24 @@ async fn attempt(ctx: &Ctx, info: &ReqInfo, account: &Selected, headers: &Header
             let family_rejected = !general_rejected && rl.get("anthropic-ratelimit-unified-7d_oi-status").map(|s| s == "rejected").unwrap_or(false);
             if general_rejected || family_rejected {
                 if family_rejected {
-                    ctx.manager.log(format!("Family weekly quota exhausted on \"{}\"; switching account for this request", account.name));
+                    mgr.log(format!("Family weekly quota exhausted on \"{}\"; switching account for this request", account.name));
                 } else {
                     let hold = retry_after.clamp(1, 3600) as u64;
-                    ctx.manager.log(format!("Quota rejection (429) on \"{}\"; throttling {hold}s and switching account", account.name));
-                    ctx.manager.mark_rate_limited(&account.id, hold);
+                    mgr.log(format!("Quota rejection (429) on \"{}\"; throttling {hold}s and switching account", account.name));
+                    mgr.mark_rate_limited(&account.id, hold);
                 }
                 return Attempt::Failover { reason: "quota rejected".into(), transient: false };
             }
             // Per-minute rate limit: pause the account, retry the same one.
             let ra = retry_after.clamp(1, 300) as u64;
-            ctx.manager.mark_rate_limited(&account.id, ra);
-            if ra <= INLINE_RETRY_AFTER_MAX_SECONDS || (ra <= rate_limit_absorb_max() && ctx.hold_ms > 0) {
-                ctx.manager.log(format!("Rate-limit 429 on \"{}\"; waiting {ra}s and retrying the same account", account.name));
+            mgr.mark_rate_limited(&account.id, ra);
+            if ra <= INLINE_RETRY_AFTER_MAX_SECONDS || (ra <= rate_limit_absorb_max() && info.hold_ms > 0) {
+                mgr.log(format!("Rate-limit 429 on \"{}\"; waiting {ra}s and retrying the same account", account.name));
                 return Attempt::RetrySame { wait: Duration::from_secs(ra) };
             }
             if info.pin.is_none() {
                 // One failover hop onto an idle sibling; a second throttle is IP-scoped.
-                ctx.manager.log(format!("Rate-limit 429 on \"{}\" (retry-after {ra}s); one failover hop", account.name));
+                mgr.log(format!("Rate-limit 429 on \"{}\" (retry-after {ra}s); one failover hop", account.name));
                 return Attempt::Failover { reason: format!("rate limited {ra}s"), transient: false };
             }
             return Attempt::Abort(with_retry_after(error_response(StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", "Upstream rate limit"), ra));
@@ -301,24 +303,24 @@ async fn attempt(ctx: &Ctx, info: &ReqInfo, account: &Selected, headers: &Header
         401 => {
             let bytes = res.bytes().await.unwrap_or_default();
             if account.kind == AccountType::Oauth {
-                ctx.manager.log(format!("401 from upstream on \"{}\"; refreshing token", account.name));
+                mgr.log(format!("401 from upstream on \"{}\"; refreshing token", account.name));
                 let before = account.credential.clone();
-                let after = ctx.manager.ensure_token_fresh(&account.id, true).await;
+                let after = mgr.ensure_token_fresh(&account.id, true).await;
                 if after.is_some() && after.as_deref() != Some(before.as_str()) {
                     return Attempt::RetrySame { wait: Duration::ZERO };
                 }
-                ctx.manager.mark_error(&account.id, "upstream rejected the token (401)");
+                mgr.mark_error(&account.id, "upstream rejected the token (401)");
                 return Attempt::Failover { reason: "401 and refresh did not help".into(), transient: false };
             }
-            ctx.manager.mark_error(&account.id, "upstream rejected the API key (401)");
+            mgr.mark_error(&account.id, "upstream rejected the API key (401)");
             let _ = bytes;
             return Attempt::Failover { reason: "401".into(), transient: false };
         }
         403 => {
             let bytes = read_limited(res).await;
             if is_entitlement_denied(&bytes) {
-                ctx.manager.mark_entitlement_denied(&account.id);
-                ctx.manager.log(format!("Organization of \"{}\" does not allow OAuth; cooling it down 5 minutes", account.name));
+                mgr.mark_entitlement_denied(&account.id);
+                mgr.log(format!("Organization of \"{}\" does not allow OAuth; cooling it down 5 minutes", account.name));
                 return Attempt::Failover { reason: "oauth_not_allowed_for_organization".into(), transient: false };
             }
             if info.pin.is_none() {
@@ -356,7 +358,7 @@ async fn attempt(ctx: &Ctx, info: &ReqInfo, account: &Selected, headers: &Header
         }
     }
     let is_sse = res.headers().get("content-type").and_then(|v| v.to_str().ok()).map(|c| c.contains("text/event-stream")).unwrap_or(false);
-    let manager = ctx.manager.clone();
+    let manager = mgr.clone();
     let account_id = account.id.clone();
     let session = info.session_id.clone();
     let client_name = info.client.clone();
@@ -429,7 +431,7 @@ async fn attempt(ctx: &Ctx, info: &ReqInfo, account: &Selected, headers: &Header
     };
     if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
         if let Some(u) = v.get("usage") {
-            ctx.manager.record_token_usage_dims(&account.id, info.session_id.as_deref(), info.client.as_deref(), &info.dimensions, info.model.as_deref(), u);
+            mgr.record_token_usage_dims(&account.id, info.session_id.as_deref(), info.client.as_deref(), &info.dimensions, info.model.as_deref(), u);
         }
     }
     ctx.notify_end(info, &account.name, status.as_u16(), started.elapsed(), status.is_success());

@@ -291,6 +291,8 @@ pub struct SelectRequest<'a> {
 }
 
 pub struct Fleet {
+    /// The pool this fleet serves.
+    pub pool: String,
     pub accounts: Vec<Account>,
     pub current: Option<String>,
     pub threshold: Threshold,
@@ -298,6 +300,8 @@ pub struct Fleet {
     pub blocked_models: Vec<String>,
     pub storm: StormRamp,
     pub distribute_sessions: bool,
+    pub hold_seconds: u64,
+    pub probe_seconds: u64,
     pub default_upstream: String,
     pub route_pins: HashMap<String, String>,
     pub sessions: SessionTracker,
@@ -319,28 +323,56 @@ pub struct Manager {
 }
 
 impl Manager {
-    pub fn new(cfg: &Config) -> Manager {
+    /// Build the fleet for one pool with its own event bus. `pool` names the
+    /// entry in `cfg.pools`; an unknown name falls back to the default pool's
+    /// settings.
+    pub fn new(cfg: &Config, pool: &str) -> Manager {
         let (tx, _) = tokio::sync::broadcast::channel(256);
+        Manager::with_events(cfg, pool, tx)
+    }
+
+    /// Build the fleet for one pool on a shared event bus, so one subscriber
+    /// sees the log lines of every pool.
+    pub fn with_events(cfg: &Config, pool: &str, tx: tokio::sync::broadcast::Sender<String>) -> Manager {
+        let p = cfg.pool_or_default(Some(pool));
         let fleet = Fleet {
+            pool: pool.to_string(),
             accounts: Vec::new(),
             current: None,
-            threshold: cfg.switch_threshold.clone(),
-            routes: cfg.routes.clone(),
-            blocked_models: cfg.blocked_models.clone(),
-            storm: cfg.storm_ramp.clone(),
-            distribute_sessions: cfg.distribute_sessions,
+            threshold: p.switch_threshold.clone(),
+            routes: p.routes.clone(),
+            blocked_models: p.blocked_models.clone(),
+            storm: p.storm_ramp.clone(),
+            distribute_sessions: p.distribute_sessions,
+            hold_seconds: p.hold_seconds,
+            probe_seconds: p.quota_probe_seconds,
             default_upstream: cfg.upstream.clone(),
             route_pins: HashMap::new(),
             sessions: SessionTracker::new(),
             started_at: now_ms(),
             client_usage: BTreeMap::new(),
             dimension_usage: BTreeMap::new(),
-            expiry: cfg.expiry_routing.clone(),
+            expiry: p.expiry_routing.clone(),
             refresh_locks: HashMap::new(),
         };
         let m = Manager { inner: Arc::new(Mutex::new(fleet)), events: tx };
-        m.sync_config(cfg);
+        m.sync_config(cfg, pool);
         m
+    }
+
+    /// The pool this fleet serves.
+    pub fn pool(&self) -> String {
+        self.with(|f| f.pool.clone())
+    }
+
+    /// How long this pool holds a request when every account is exhausted.
+    pub fn hold_seconds(&self) -> u64 {
+        self.with(|f| f.hold_seconds)
+    }
+
+    /// This pool's background quota-probe interval in seconds (0 = off).
+    pub fn probe_seconds(&self) -> u64 {
+        self.with(|f| f.probe_seconds)
     }
 
     pub fn log(&self, msg: impl Into<String>) {
@@ -360,25 +392,29 @@ impl Manager {
         f(&mut g)
     }
 
-    /// Re-sync accounts and settings from a (re)loaded config. Returns the
-    /// number of accounts added.
-    pub fn sync_config(&self, cfg: &Config) -> usize {
+    /// Re-sync accounts and settings from a (re)loaded config for one pool.
+    /// Returns the number of accounts added.
+    pub fn sync_config(&self, cfg: &Config, pool: &str) -> usize {
+        let p = cfg.pool_or_default(Some(pool));
         let mut added = 0;
         self.with(|f| {
-            f.threshold = cfg.switch_threshold.clone();
-            f.routes = cfg.routes.clone();
-            f.blocked_models = cfg.blocked_models.clone();
-            f.storm = cfg.storm_ramp.clone();
-            f.distribute_sessions = cfg.distribute_sessions;
+            f.pool = pool.to_string();
+            f.threshold = p.switch_threshold.clone();
+            f.routes = p.routes.clone();
+            f.blocked_models = p.blocked_models.clone();
+            f.storm = p.storm_ramp.clone();
+            f.distribute_sessions = p.distribute_sessions;
+            f.hold_seconds = p.hold_seconds;
+            f.probe_seconds = p.quota_probe_seconds;
             f.default_upstream = cfg.upstream.clone();
-            if !cfg.expiry_routing.enabled || !cfg.expiry_routing.preempt {
+            if !p.expiry_routing.enabled || !p.expiry_routing.preempt {
                 for a in &mut f.accounts {
                     a.rollover_baseline.clear();
                 }
             }
-            f.expiry = cfg.expiry_routing.clone();
-            let mut next: Vec<Account> = Vec::with_capacity(cfg.accounts.len());
-            for c in &cfg.accounts {
+            f.expiry = p.expiry_routing.clone();
+            let mut next: Vec<Account> = Vec::with_capacity(p.accounts.len());
+            for c in &p.accounts {
                 let id = c.id.clone().unwrap_or_default();
                 if let Some(pos) = f.accounts.iter().position(|a| a.id == id) {
                     let mut a = f.accounts.remove(pos);
@@ -443,9 +479,10 @@ impl Manager {
 
     // ── state persistence ────────────────────────────────────
 
-    pub fn export_state(&self) -> crate::config::State {
+    /// This pool's slice of the state file.
+    pub fn export_pool_state(&self) -> crate::config::PoolState {
         self.with(|f| {
-            let mut st = crate::config::State { version: 2, saved_at: Some(chrono::Utc::now().to_rfc3339()), ..Default::default() };
+            let mut st = crate::config::PoolState::default();
             for a in &f.accounts {
                 st.accounts.insert(
                     a.id.clone(),
@@ -469,7 +506,7 @@ impl Manager {
         })
     }
 
-    pub fn restore_state(&self, st: &crate::config::State) {
+    pub fn restore_pool_state(&self, st: &crate::config::PoolState) {
         let now = now_ms();
         self.with(|f| {
             for a in &mut f.accounts {
@@ -639,9 +676,14 @@ impl Manager {
                 });
                 self.log(format!("Token refreshed for account \"{name}\""));
                 let id_owned = id.to_string();
+                // Scope the write to this fleet's own pool: the same account id
+                // cannot appear twice, but searching one pool keeps a
+                // refresh from ever touching another pool's entry.
+                let pool = self.pool();
                 let persist = tokio::task::spawn_blocking(move || {
                     Config::update(|c| {
-                        if let Some(entry) = c.accounts.iter_mut().find(|e| e.id.as_deref() == Some(id_owned.as_str())) {
+                        let entry = c.pool_mut(&pool).and_then(|p| p.accounts.iter_mut().find(|e| e.id.as_deref() == Some(id_owned.as_str())));
+                        if let Some(entry) = entry {
                             if entry.import_from.is_none() {
                                 entry.access_token = Some(access);
                                 entry.refresh_token = Some(refresh);
@@ -1596,10 +1638,13 @@ impl Fleet {
             .collect();
         let mut v = json!({
             "version": env!("CARGO_PKG_VERSION"),
+            "pool": self.pool,
             "uptimeSeconds": (now - self.started_at) / 1000,
             "current": current_name,
             "switchThreshold": self.threshold,
             "distributeSessions": self.distribute_sessions,
+            "holdSeconds": self.hold_seconds,
+            "quotaProbeSeconds": self.probe_seconds,
             "stormRamp": self.storm,
             "blockedModels": self.blocked_models,
             "expiryRouting": self.expiry,
@@ -1705,10 +1750,21 @@ pub fn iso(ms: i64) -> String {
 mod tests {
     use super::*;
 
+    /// A one-pool config: everything the tests exercise lives in the default
+    /// pool, which is where a pre-pools config lands after migration.
     fn cfg_with(accounts: Vec<AccountConfig>) -> Config {
-        let mut c = Config { accounts, ..Default::default() };
+        let mut c = Config::default();
+        pool_of(&mut c).accounts = accounts;
         c.ensure_account_ids();
         c
+    }
+
+    fn pool_of(c: &mut Config) -> &mut crate::config::PoolConfig {
+        c.pool_mut(crate::config::DEFAULT_POOL).expect("default pool always exists")
+    }
+
+    fn mgr(cfg: &Config) -> Manager {
+        Manager::new(cfg, crate::config::DEFAULT_POOL)
     }
 
     fn acct(name: &str, prio: i32) -> AccountConfig {
@@ -1733,7 +1789,7 @@ mod tests {
     #[test]
     fn priority_then_soonest_reset() {
         let cfg = cfg_with(vec![acct("a", 1), acct("b", 0), acct("c", 0)]);
-        let m = Manager::new(&cfg);
+        let m = mgr(&cfg);
         let ids = m.account_ids();
         // c resets sooner than b → c preferred among priority 0
         m.with(|f| {
@@ -1748,7 +1804,7 @@ mod tests {
     #[test]
     fn rotates_at_threshold_and_respects_family_bucket() {
         let cfg = cfg_with(vec![acct("a", 0), acct("b", 0)]);
-        let m = Manager::new(&cfg);
+        let m = mgr(&cfg);
         let ids = m.account_ids();
         assert_eq!(select_name(&m, Some("claude-opus-5")).as_deref(), Some("a"));
         // a's fable bucket spent: fable diverts to b, opus stays on a
@@ -1767,7 +1823,7 @@ mod tests {
     #[test]
     fn exhausted_then_probe() {
         let cfg = cfg_with(vec![acct("a", 0)]);
-        let m = Manager::new(&cfg);
+        let m = mgr(&cfg);
         let ids = m.account_ids();
         m.with(|f| {
             let a = f.account_mut(&ids[0].0).unwrap();
@@ -1787,7 +1843,7 @@ mod tests {
         let mut a = acct("a", 0);
         a.max_usage = Some(Threshold::Single(0.5));
         let cfg = cfg_with(vec![a, acct("b", 0)]);
-        let m = Manager::new(&cfg);
+        let m = mgr(&cfg);
         let ids = m.account_ids();
         m.with(|f| f.account_mut(&ids[0].0).unwrap().quota.unified7d.utilization = Some(0.6));
         match m.select(&SelectRequest { pin: Some("a"), ..Default::default() }) {
@@ -1800,8 +1856,8 @@ mod tests {
     #[test]
     fn routes_restrict_accounts() {
         let mut cfg = cfg_with(vec![acct("a", 0), acct("b", 5)]);
-        cfg.routes.push(RouteConfig { name: "fable".into(), patterns: vec!["*fable*".into()], accounts: vec!["b".into()], ..Default::default() });
-        let m = Manager::new(&cfg);
+        pool_of(&mut cfg).routes.push(RouteConfig { name: "fable".into(), patterns: vec!["*fable*".into()], accounts: vec!["b".into()], ..Default::default() });
+        let m = mgr(&cfg);
         assert_eq!(select_name(&m, Some("claude-fable-5-1")).as_deref(), Some("b"));
         assert_eq!(select_name(&m, Some("claude-opus-5")).as_deref(), Some("a"));
     }
@@ -1811,7 +1867,7 @@ mod tests {
         let mut a = acct("a", 0);
         a.upstream = Some("https://api.deepseek.com/anthropic".into());
         let cfg = cfg_with(vec![a]);
-        let m = Manager::new(&cfg);
+        let m = mgr(&cfg);
         assert!(select_name(&m, None).is_none());
     }
 }

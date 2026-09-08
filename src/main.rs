@@ -11,7 +11,7 @@ use parking_lot::RwLock;
 
 use cli::{Cli, Command, ServerArgs};
 use config::{Config, State};
-use manager::Manager;
+use pools::Pools;
 use proxy::server::{Ctx, CtxInner, Metrics};
 
 fn init_logging(json: bool, to_stderr_only: bool) {
@@ -54,26 +54,27 @@ async fn dispatch(cli: Cli) -> Result<()> {
             init_logging(json_logs, true);
             cli::import(a).await
         }
-        Command::Accounts { verbose } => cli::accounts(verbose),
+        Command::Accounts { verbose, pool } => cli::accounts(verbose, pool),
         Command::Status { json } => cli::status(json).await,
-        Command::Switch { name } => cli::switch(name).await,
-        Command::Remove { name } => cli::remove(name).await,
-        Command::Disable { name } => cli::set_disabled(name, true).await,
-        Command::Enable { name } => cli::set_disabled(name, false).await,
-        Command::Priority { name, value, first, last } => cli::priority(name, value, first, last).await,
-        Command::Threshold { value } => cli::threshold(value).await,
-        Command::Distribute { value } => cli::distribute(value).await,
-        Command::Probe { value } => cli::probe(value).await,
+        Command::Switch { name, pool } => cli::switch(name, pool).await,
+        Command::Remove { name, pool } => cli::remove(name, pool).await,
+        Command::Disable { name, pool } => cli::set_disabled(name, true, pool).await,
+        Command::Enable { name, pool } => cli::set_disabled(name, false, pool).await,
+        Command::Priority { name, value, first, last, pool } => cli::priority(name, value, first, last, pool).await,
+        Command::Threshold { value, pool } => cli::threshold(value, pool).await,
+        Command::Distribute { value, pool } => cli::distribute(value, pool).await,
+        Command::Probe { value, pool } => cli::probe(value, pool).await,
         Command::Warmup { value } => cli::warmup(value).await,
-        Command::Expiry { value, tolerance, preempt } => cli::expiry(value, tolerance, preempt).await,
+        Command::Expiry { value, tolerance, preempt, pool } => cli::expiry(value, tolerance, preempt, pool).await,
         Command::Titles { value } => cli::titles(value).await,
-        Command::Route { cmd } => cli::route(cmd).await,
+        Command::Route { cmd, pool } => cli::route(cmd, pool).await,
+        Command::Pool { cmd } => cli::pool(cmd).await,
         Command::Env(a) => cli::env(a),
         Command::Run(a) => cli::run(a).await,
         Command::CaPath => cli::ca_path(),
         Command::Config { cmd } => cli::config_cmd(cmd),
         Command::Service { cmd } => cli::service(cmd),
-        Command::Api { path, account } => cli::api(path, account).await,
+        Command::Api { path, account, pool } => cli::api(path, account, pool).await,
     }
 }
 
@@ -88,13 +89,13 @@ async fn server(args: ServerArgs, interactive: bool) -> Result<()> {
         tracing::warn!("binding {bind}: remote clients must present proxy.apiKey; put a TLS terminator in front on untrusted networks");
     }
 
-    let manager = Manager::new(&cfg);
+    let pools = Pools::new(&cfg);
     match State::load() {
-        Ok(Some(st)) => manager.restore_state(&st),
+        Ok(Some(st)) => pools.restore_state(&st),
         Ok(None) => {}
         Err(e) => tracing::warn!("state file ignored: {e}"),
     }
-    if manager.account_ids().is_empty() {
+    if pools.account_count() == 0 {
         tracing::warn!("no usable accounts configured; run `teamclaude login` (the server will serve them after a reload)");
     }
 
@@ -103,22 +104,21 @@ async fn server(args: ServerArgs, interactive: bool) -> Result<()> {
         l.sweep(cfg.log_retention_hours);
     }
     let (activity_tx, _) = tokio::sync::broadcast::channel(512);
-    let prober = prober::Prober::new(manager.clone(), cfg.quota_probe_seconds);
-    let warmer = warmer::Warmer::new(manager.clone(), cfg.proxy.port, &cfg.proxy.api_key, cfg.warmup_seconds);
+    let prober = prober::Prober::new(pools.clone());
+    let warmer = warmer::Warmer::new(pools.clone(), cfg.proxy.port, &cfg.proxy.api_key, cfg.warmup_seconds);
     let titles = titles::Titles::new(&cfg.session_titles);
-    let hold_ms = cfg.hold_seconds * 1000;
 
     let ctx_cell: Arc<parking_lot::Mutex<Option<Ctx>>> = Arc::new(parking_lot::Mutex::new(None));
     let reload: Box<dyn Fn() -> Result<usize> + Send + Sync> = {
-        let manager = manager.clone();
-        let prober = prober.clone();
+        let pools = pools.clone();
         let warmer = warmer.clone();
         let titles = titles.clone();
         let cell = ctx_cell.clone();
         Box::new(move || {
             let cfg = Config::load()?.context("config file disappeared")?;
-            let added = manager.sync_config(&cfg);
-            prober.set_interval(cfg.quota_probe_seconds);
+            // Per-pool probe intervals ride along on each manager, so the
+            // prober needs no separate notification.
+            let added = pools.sync_config(&cfg);
             warmer.set_interval(cfg.warmup_seconds);
             warmer.set_api_key(&cfg.proxy.api_key);
             titles.configure(&cfg.session_titles);
@@ -130,10 +130,9 @@ async fn server(args: ServerArgs, interactive: bool) -> Result<()> {
         })
     };
     let ctx = Ctx(Arc::new(CtxInner {
-        manager: manager.clone(),
+        pools: pools.clone(),
         config: RwLock::new(Arc::new(cfg.clone())),
         logger: logger.clone(),
-        hold_ms,
         activity: activity_tx.clone(),
         reload: Some(reload),
         metrics: Metrics::default(),
@@ -156,14 +155,14 @@ async fn server(args: ServerArgs, interactive: bool) -> Result<()> {
     tokio::spawn(prober.clone().run());
     tokio::spawn(warmer.clone().run());
     {
-        let manager = manager.clone();
+        let pools = pools.clone();
         let mut rx = shutdown_rx.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(30));
             loop {
                 tokio::select! {
                     _ = tick.tick() => {
-                        if let Err(e) = manager.export_state().save() { tracing::warn!("state save failed: {e}"); }
+                        if let Err(e) = pools.export_state().save() { tracing::warn!("state save failed: {e}"); }
                     }
                     _ = rx.changed() => break,
                 }
@@ -196,9 +195,9 @@ async fn server(args: ServerArgs, interactive: bool) -> Result<()> {
             let _ = tx.send(true);
         });
     }
-    // Forward manager log lines into the activity stream for headless logging.
+    // Forward every pool's log lines into the activity stream.
     {
-        let mut ev = manager.events.subscribe();
+        let mut ev = pools.events.subscribe();
         let tx = activity_tx.clone();
         tokio::spawn(async move {
             while let Ok(m) = ev.recv().await {
@@ -218,14 +217,18 @@ async fn server(args: ServerArgs, interactive: bool) -> Result<()> {
         .transpose()
         .context("opening --activity-log")?;
 
+    let pool_note = match pools.names().len() {
+        0 | 1 => String::new(),
+        n => format!(", {n} pools"),
+    };
     tracing::info!(
-        "TeamClaude v{} listening on http://{bind} ({} accounts){}",
+        "TeamClaude v{} listening on http://{bind} ({} accounts{pool_note}){}",
         env!("CARGO_PKG_VERSION"),
-        manager.account_ids().len(),
+        pools.account_count(),
         if interactive { "" } else { " [headless]" }
     );
     if interactive {
-        let t = tui::Tui::new(ctx.clone(), manager.clone(), prober.clone(), activity_file);
+        let t = tui::Tui::new(ctx.clone(), prober.clone(), activity_file);
         let mut tx = shutdown_tx.clone();
         t.run(std::mem::replace(&mut tx, shutdown_tx.clone())).await?;
     } else {
@@ -256,7 +259,7 @@ async fn server(args: ServerArgs, interactive: bool) -> Result<()> {
 
     // Shutdown: persist state.
     let _ = shutdown_tx.send(true);
-    if let Err(e) = manager.export_state().save() {
+    if let Err(e) = pools.export_state().save() {
         tracing::warn!("final state save failed: {e}");
     }
     let _ = tokio::time::timeout(Duration::from_secs(2), srv).await;
