@@ -349,7 +349,7 @@ pub enum ServiceCmd {
 // ── helpers ───────────────────────────────────────────────────
 
 pub fn proxy_base(cfg: &Config) -> String {
-    format!("http://127.0.0.1:{}", cfg.proxy.port)
+    format!("http://{}", cfg.dial_authority())
 }
 
 async fn control_get(cfg: &Config, path: &str) -> Result<Value> {
@@ -1486,7 +1486,9 @@ fn pin_component(s: &str) -> String {
 /// default pool is never named in either form: an install with one pool emits
 /// byte-for-byte the lines it emitted before pools existed.
 pub fn env_lines(cfg: &Config, use_mitm: bool, pin: Option<&str>, pool: Option<&str>) -> Vec<String> {
-    let port = cfg.proxy.port;
+    // What a client on this machine dials, which is not always what the
+    // listener binds: a wildcard bind is reached over loopback.
+    let authority = cfg.dial_authority();
     let mut lines = Vec::new();
     let loopback = crate::security::is_loopback_host(&cfg.bind_host());
     let key = if loopback && !cfg.proxy.require_key_on_loopback { "" } else { cfg.proxy.api_key.as_str() };
@@ -1499,7 +1501,7 @@ pub fn env_lines(cfg: &Config, use_mitm: bool, pin: Option<&str>, pool: Option<&
             (None, None) => String::new(),
         };
         let userinfo = if user.is_empty() && key.is_empty() { String::new() } else { format!("{}:{}@", pin_component(&user), pin_component(key)) };
-        let url = format!("http://{userinfo}127.0.0.1:{port}");
+        let url = format!("http://{userinfo}{authority}");
         for v in ["HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"] {
             lines.push(format!("export {v}={}", shell_quote(&url)));
         }
@@ -1512,7 +1514,7 @@ pub fn env_lines(cfg: &Config, use_mitm: bool, pin: Option<&str>, pool: Option<&
         // the pool keyword comes first.
         let pool_prefix = named.map(|p| format!("{}{p}", crate::pools::POOL_PREFIX)).unwrap_or_default();
         let pin_prefix = pin.map(|p| format!("/tc-acct/{}", pin_component(p))).unwrap_or_default();
-        lines.push(format!("export ANTHROPIC_BASE_URL=http://127.0.0.1:{port}{pool_prefix}{pin_prefix}"));
+        lines.push(format!("export ANTHROPIC_BASE_URL=http://{authority}{pool_prefix}{pin_prefix}"));
         if !key.is_empty() {
             lines.push("unset ANTHROPIC_AUTH_TOKEN".into());
             lines.push(format!("export ANTHROPIC_API_KEY={}", shell_quote(key)));
@@ -1753,6 +1755,34 @@ mod tests {
         cfg.proxy.host = Some("0.0.0.0".into());
         let lines = env_lines(&cfg, false, None, None).join("\n");
         assert!(lines.contains("ANTHROPIC_API_KEY='tc-secret-0123456789abcdef'"));
+    }
+
+    /// `env` configures a client on this machine, so it emits an address that
+    /// client can actually dial: loopback for a bind nothing can connect to,
+    /// and the bound host itself when that is the only address answering.
+    #[test]
+    fn a_local_client_is_pointed_at_an_address_it_can_dial() {
+        let mut cfg = Config::default();
+        cfg.proxy.api_key = "tc-secret-0123456789abcdef".into();
+        for host in ["0.0.0.0", "::", "[::]", "127.0.0.1", "localhost"] {
+            cfg.proxy.host = Some(host.into());
+            let lines = env_lines(&cfg, false, None, None);
+            assert!(lines.contains(&"export ANTHROPIC_BASE_URL=http://127.0.0.1:3456".to_string()), "{host}: {lines:?}");
+            assert_eq!(proxy_base(&cfg), "http://127.0.0.1:3456");
+        }
+        // A specific host is kept: loopback is nowhere to dial when the
+        // listener only answers there.
+        cfg.proxy.host = Some("192.168.1.10".into());
+        assert!(env_lines(&cfg, false, None, None).join("\n").contains("ANTHROPIC_BASE_URL=http://192.168.1.10:3456"));
+        assert!(env_lines(&cfg, true, None, None).join("\n").contains("@192.168.1.10:3456'"));
+        assert_eq!(proxy_base(&cfg), "http://192.168.1.10:3456");
+        // A bare IPv6 literal has to come back bracketed to carry a port, and
+        // a specific loopback address is specific too — a listener on `::1`
+        // does not answer on `127.0.0.1`.
+        cfg.proxy.host = Some("fd00::1".into());
+        assert_eq!(proxy_base(&cfg), "http://[fd00::1]:3456");
+        cfg.proxy.host = Some("[::1]".into());
+        assert_eq!(proxy_base(&cfg), "http://[::1]:3456");
     }
 
     /// Naming the default pool must not change a single byte: an existing

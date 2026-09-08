@@ -111,7 +111,7 @@ async fn server(args: ServerArgs, interactive: bool) -> Result<()> {
     }
     let (activity_tx, _) = tokio::sync::broadcast::channel(512);
     let prober = prober::Prober::new(pools.clone());
-    let warmer = warmer::Warmer::new(pools.clone(), cfg.proxy.port, &cfg.proxy.api_key, cfg.warmup_seconds);
+    let warmer = warmer::Warmer::new(pools.clone(), cfg.dial_authority(), &cfg.proxy.api_key, cfg.warmup_seconds);
     let titles = titles::Titles::new(&cfg.session_titles);
 
     let ctx_cell: Arc<parking_lot::Mutex<Option<Ctx>>> = Arc::new(parking_lot::Mutex::new(None));
