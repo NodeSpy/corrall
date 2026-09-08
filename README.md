@@ -50,6 +50,9 @@ Already logged into Claude Code? `teamclaude import` copies its credentials.
 `teamclaude import --link` keeps reading them from Claude Code's own store on
 every reload instead, so a `/login` there is picked up automatically.
 
+Coming from [claudeacrobat](#coming-from-claudeacrobat)? `teamclaude
+import-claudeacrobat` brings its accounts and pools across.
+
 ## What it does
 
 - Named pools: several independent fleets on one port, each with its own
@@ -111,6 +114,7 @@ teamclaude expiry on            # expiry-pressure routing (--tolerance 1.5 --pre
 teamclaude titles on            # name activity rows after the Claude Code session
 teamclaude login --codex        # add an OpenAI Codex subscription
 teamclaude import --codex       # or import the Codex CLI's login
+teamclaude import-claudeacrobat --dry-run   # accounts from a claudeacrobat install
 teamclaude route add fable --match '*fable*' --accounts personal-max
 teamclaude pool list            # pools with their accounts and settings
 teamclaude pool add work        # a second fleet, empty
@@ -123,6 +127,7 @@ teamclaude env --pool work      # export lines pointing at that pool
 teamclaude env                  # export lines for eval "$(teamclaude env)"
 teamclaude ca-path              # where the MITM CA certificate lives
 teamclaude config check         # validate and print a redacted config
+teamclaude server --listen 127.0.0.1:3457   # bind elsewhere for one run
 teamclaude update --check       # is there a newer release?
 teamclaude update               # install it and restart the service
 teamclaude service install      # systemd --user unit (Linux)
@@ -220,6 +225,25 @@ upgrade needs no manual work.
   }
 }
 ```
+
+## Coming from claudeacrobat
+
+[claudeacrobat](https://github.com/EdnitionCode/claudeacrobat) is the sibling Go
+proxy; the two share this design and can run side by side on different ports.
+`teamclaude import-claudeacrobat` brings its accounts across:
+
+```bash
+teamclaude import-claudeacrobat --dry-run   # what would land where
+teamclaude import-claudeacrobat             # keep its pool layout
+teamclaude import-claudeacrobat --pool work # or put everything in one pool
+```
+
+An account claudeacrobat owns arrives with its tokens; one it reads live from
+Claude Code arrives as an `importFrom` pointing at the same file. Its pool
+layout carries over unless `--pool` overrides it, re-running refreshes rather
+than duplicates, and anything that cannot map is listed with the reason.
+claudeacrobat's own files are only read, so it keeps working afterwards. Details
+in [docs/configuration.md](docs/configuration.md#importing-from-claudeacrobat).
 
 ## Security
 

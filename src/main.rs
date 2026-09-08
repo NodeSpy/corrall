@@ -54,6 +54,10 @@ async fn dispatch(cli: Cli) -> Result<()> {
             init_logging(json_logs, true);
             cli::import(a).await
         }
+        Command::ImportClaudeacrobat(a) => {
+            init_logging(json_logs, true);
+            cli::import_claudeacrobat(a).await
+        }
         Command::Accounts { verbose, pool } => cli::accounts(verbose, pool),
         Command::Status { json } => cli::status(json).await,
         Command::Switch { name, pool } => cli::switch(name, pool).await,
@@ -84,6 +88,7 @@ async fn server(args: ServerArgs, interactive: bool) -> Result<()> {
     if let Some(dir) = &args.log_to {
         cfg.log_dir = Some(dir.clone());
     }
+    cli::apply_listen_override(&mut cfg, args.listen.as_deref(), args.port)?;
     upstream::init(&cfg)?;
     let bind = proxy::server::parse_bind(&cfg.bind_host(), cfg.proxy.port)?;
     if !security::is_loopback_ip(bind.ip()) {
@@ -115,8 +120,12 @@ async fn server(args: ServerArgs, interactive: bool) -> Result<()> {
         let warmer = warmer.clone();
         let titles = titles.clone();
         let cell = ctx_cell.clone();
+        let (listen, port) = (args.listen.clone(), args.port);
         Box::new(move || {
-            let cfg = Config::load()?.context("config file disappeared")?;
+            let mut cfg = Config::load()?.context("config file disappeared")?;
+            // The listener is already bound; re-applying the override keeps the
+            // config everything else reads agreeing with the address in use.
+            cli::apply_listen_override(&mut cfg, listen.as_deref(), port)?;
             // Per-pool probe intervals ride along on each manager, so the
             // prober needs no separate notification.
             let added = pools.sync_config(&cfg);
