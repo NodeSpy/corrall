@@ -480,7 +480,8 @@ fn format_money(spend: &Value) -> String {
         })
     };
     let used = unit(f(spend, "usedMinor"));
-    let limit = unit(f(spend, "limitMinor"));
+    // A zero limit means "no cap", not a cap of nothing.
+    let limit = unit(f(spend, "limitMinor").filter(|l| *l > 0.0));
     match (used, limit) {
         (None, None) => "unknown".into(),
         (None, Some(l)) => format!("cap {l}"),
@@ -711,6 +712,16 @@ mod tests {
         assert_eq!(format_percent(Some(0.995)), "99.5%");
         assert_eq!(format_number(1234), "1.2k");
         assert_eq!(format_number(2_500_000), "2.5m");
+    }
+
+    #[test]
+    fn money() {
+        let sp = json!({ "enabled": true, "usedMinor": 2426.0, "limitMinor": 0.0, "currency": "USD", "exponent": 2 });
+        assert_eq!(format_money(&sp), "$24.26");
+        let sp = json!({ "usedMinor": 123456.0, "limitMinor": 500000.0, "currency": "EUR", "exponent": 2 });
+        assert_eq!(format_money(&sp), "€1,234.56 of €5,000.00");
+        let sp = json!({ "usedMinor": null, "limitMinor": null });
+        assert_eq!(format_money(&sp), "unknown");
     }
 
     #[test]

@@ -97,6 +97,10 @@ async fn server(args: ServerArgs, interactive: bool) -> Result<()> {
     }
     if manager.account_ids().is_empty() {
         tracing::warn!("no usable accounts configured; run `teamclaude login` (the server will serve them after a reload)");
+    } else {
+        // Pick the active account at boot, as the original does, so status
+        // shows it before the first request arrives.
+        let _ = manager.select(&manager::SelectRequest { allow_probe: false, ..Default::default() });
     }
 
     let logger = cfg.log_dir.as_deref().and_then(|d| proxy::log::RequestLogger::new(d, cfg.log_level, cfg.log_max_body_bytes));

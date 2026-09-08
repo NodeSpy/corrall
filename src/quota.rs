@@ -288,10 +288,13 @@ pub struct UsagePayload {
 
 fn normalize_bucket(v: Option<&Value>) -> Option<Bucket> {
     let v = v?.as_object()?;
+    // The endpoint has used `used_percentage`, `utilization` and, in `limits[]`,
+    // `percent`; all are 0-100.
     let pct = v
         .get("used_percentage")
         .or_else(|| v.get("utilization"))
         .or_else(|| v.get("usedPercentage"))
+        .or_else(|| v.get("percent"))
         .and_then(|p| p.as_f64().or_else(|| p.as_str().and_then(|s| s.parse().ok())));
     let reset = v.get("resets_at").or_else(|| v.get("resetsAt")).or_else(|| v.get("reset_at")).or_else(|| v.get("resetAt")).and_then(|r| {
         if let Some(n) = r.as_f64() {
@@ -362,7 +365,7 @@ mod tests {
             "five_hour": {"used_percentage": 12.5, "resets_at": "2026-09-07T12:00:00Z"},
             "seven_day": {"used_percentage": 50, "resets_at": 1800000000},
             "limits": [
-                {"group":"weekly","scope":{"model":{"display_name":"Fable"}},"used_percentage": 90, "resets_at": 1800000000}
+                {"kind":"weekly_scoped","group":"weekly","scope":{"model":{"display_name":"Fable"}},"percent": 90, "resets_at": 1800000000}
             ]
         });
         let u = normalize_usage(&v);
