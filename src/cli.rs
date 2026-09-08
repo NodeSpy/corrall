@@ -203,9 +203,12 @@ pub struct EnvArgs {
     /// Base-URL routing only (no forward proxy / CA)
     #[arg(long)]
     pub no_mitm: bool,
-    /// Route through this pool (default: the configured default pool)
+    /// Route through this pool (default: match the launch context, else the default pool)
     #[arg(long)]
     pub pool: Option<String>,
+    /// Match pool rules against this directory instead of the current one
+    #[arg(long, value_name = "DIR")]
+    pub cwd: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -215,7 +218,7 @@ pub struct RunArgs {
     /// Launch claude directly if the proxy is down
     #[arg(long)]
     pub auto_fallback: bool,
-    /// Route through this pool (default: the configured default pool)
+    /// Route through this pool (default: match the launch context, else the default pool)
     #[arg(long)]
     pub pool: Option<String>,
     /// Arguments passed to claude
@@ -265,6 +268,18 @@ pub struct PoolSetArgs {
     /// Serve requests that carry no /pool/ prefix from this pool
     #[arg(long)]
     pub make_default: bool,
+    /// Auto-select this pool when the launch directory is DIR or below it (repeatable)
+    #[arg(long, value_name = "DIR")]
+    pub match_path: Vec<String>,
+    /// Auto-select this pool when the git remote matches REGEX (repeatable)
+    #[arg(long, value_name = "REGEX")]
+    pub match_remote: Vec<String>,
+    /// Auto-select this pool when VAR matches REGEX, or is merely set if REGEX is omitted (repeatable)
+    #[arg(long, value_name = "VAR[=REGEX]")]
+    pub match_env: Vec<String>,
+    /// Drop this pool's auto-selection rules
+    #[arg(long, conflicts_with_all = ["match_path", "match_remote", "match_env"])]
+    pub no_match: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1089,6 +1104,11 @@ pub async fn pool(cmd: Option<PoolCmd>) -> Result<()> {
                     },
                     p.hold_seconds,
                 );
+                // Auto-selection rules are what makes a wrapper land here on
+                // its own, so they are worth showing next to the pool.
+                for rule in match_summary(p) {
+                    println!("{:<18} {rule}", "");
+                }
             }
             eprintln!("* serves requests with no /pool/<name> prefix");
             Ok(())
@@ -1137,6 +1157,27 @@ pub async fn pool(cmd: Option<PoolCmd>) -> Result<()> {
     }
 }
 
+/// One `match:` line per rule group a pool carries, for `pool list`. Empty when
+/// the pool has no auto-selection rules, which is every pool by default.
+fn match_summary(p: &crate::config::PoolConfig) -> Vec<String> {
+    let Some(m) = &p.match_rules else { return Vec::new() };
+    let mut out = Vec::new();
+    for path in &m.paths {
+        out.push(format!("match: path {}", crate::security::safe_text(path, 60)));
+    }
+    for r in &m.remotes {
+        out.push(format!("match: remote ~ {}", crate::security::safe_text(r, 60)));
+    }
+    for (k, pat) in &m.env {
+        let k = crate::security::safe_text(k, 30);
+        out.push(match pat.is_empty() {
+            true => format!("match: env {k} set"),
+            false => format!("match: env {k} ~ {}", crate::security::safe_text(pat, 40)),
+        });
+    }
+    out
+}
+
 /// Apply `pool add`/`pool set` flags to an existing pool. Accounts are moved in
 /// before the knobs are written so a single command can both populate a pool and
 /// configure it.
@@ -1164,6 +1205,40 @@ fn apply_pool_set(c: &mut Config, name: &str, set: &PoolSetArgs) -> Result<()> {
     }
     if let Some(h) = set.hold {
         p.hold_seconds = h;
+    }
+    // Each --match-* group replaces its own list rather than appending, so
+    // rewriting a rule is one command and not a clear-then-add pair.
+    if set.no_match {
+        p.match_rules = None;
+        eprintln!("auto-selection rules cleared");
+    } else if !(set.match_path.is_empty() && set.match_remote.is_empty() && set.match_env.is_empty()) {
+        let m = p.match_rules.get_or_insert_with(Default::default);
+        if !set.match_path.is_empty() {
+            m.paths = set.match_path.clone();
+        }
+        if !set.match_remote.is_empty() {
+            m.remotes = set.match_remote.clone();
+        }
+        if !set.match_env.is_empty() {
+            m.env = set
+                .match_env
+                .iter()
+                .map(|v| match v.split_once('=') {
+                    Some((k, pat)) => (k.trim().to_string(), pat.to_string()),
+                    // Bare VAR means "matches when set".
+                    None => (v.trim().to_string(), String::new()),
+                })
+                .collect();
+            if m.env.contains_key("") {
+                bail!("--match-env: expected VAR or VAR=REGEX");
+            }
+        }
+        // Rules land in a file the daemon re-reads with no chance to complain,
+        // so an uncompilable pattern is refused here, at the source.
+        m.validate(name)?;
+        if m.is_empty() {
+            p.match_rules = None;
+        }
     }
     if set.make_default {
         c.default_pool = name.to_string();
@@ -1238,15 +1313,36 @@ pub fn env_lines(cfg: &Config, use_mitm: bool, pin: Option<&str>, pool: Option<&
 }
 
 /// The pin and pool a launch-context command should use: the flag if given,
-/// then the environment. `TC_POOL` lets a shell wrapper choose a pool the same
-/// way `TC_ACCT` already chooses an account.
-fn launch_target(cfg: &Config, pool_flag: Option<&str>) -> Result<(Option<String>, Option<String>)> {
+/// then the environment, then the per-pool `match` rules applied to the launch
+/// context. `TC_POOL` lets a shell wrapper choose a pool the same way `TC_ACCT`
+/// already chooses an account.
+///
+/// A returned pool of `None` means "the default pool, unnamed" — the case that
+/// has to keep emitting exactly the pre-pools environment, so it is kept
+/// distinct from an explicit choice that happens to name the default pool.
+fn launch_target(cfg: &Config, pool_flag: Option<&str>, cwd: Option<&str>) -> Result<(Option<String>, Option<String>)> {
     let pin = std::env::var("TC_ACCT").ok().filter(|s| !s.trim().is_empty());
     let pool = match pool_flag {
         Some(p) => Some(pool_name(cfg, Some(p))?),
         None => match std::env::var("TC_POOL").ok().filter(|s| !s.trim().is_empty()) {
             Some(p) => Some(pool_name(cfg, Some(&p)).context("TC_POOL")?),
-            None => None,
+            // Nothing named a pool, so let the launch context choose one.
+            None => {
+                let env = match cwd {
+                    Some(d) => crate::pool_match::LaunchEnv::at(d),
+                    None => crate::pool_match::LaunchEnv::live(),
+                };
+                let choice = crate::pool_match::resolve(cfg, &env);
+                // Silent when no rule fired: an install with no `match` rules —
+                // which is every install that has not opted in — must not start
+                // writing to a wrapper's stderr on every launch.
+                if choice.matched {
+                    eprintln!("[TeamClaude] pool \"{}\" ({})", choice.pool, choice.reason);
+                    Some(choice.pool)
+                } else {
+                    None
+                }
+            }
         },
     };
     if let Some(p) = &pin {
@@ -1261,7 +1357,7 @@ fn launch_target(cfg: &Config, pool_flag: Option<&str>) -> Result<(Option<String
 
 pub fn env(args: EnvArgs) -> Result<()> {
     let cfg = Config::load()?.ok_or_else(|| anyhow!("no config yet"))?;
-    let (pin, pool) = launch_target(&cfg, args.pool.as_deref())?;
+    let (pin, pool) = launch_target(&cfg, args.pool.as_deref(), args.cwd.as_deref())?;
     if !args.no_mitm {
         crate::proxy::mitm::ensure_certs(&["api.anthropic.com".to_string()])?;
     }
@@ -1286,7 +1382,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
             bail!("proxy is not running on port {}; start `teamclaude server` or pass --auto-fallback", cfg.proxy.port);
         }
     } else {
-        let (pin, pool) = launch_target(&cfg, args.pool.as_deref())?;
+        let (pin, pool) = launch_target(&cfg, args.pool.as_deref(), None)?;
         if !args.no_mitm {
             crate::proxy::mitm::ensure_certs(&["api.anthropic.com".to_string()])?;
         }
@@ -1478,5 +1574,69 @@ mod tests {
         cfg.pool_mut("work").unwrap().hold_seconds = 120;
         assert!(!env_lines(&cfg, false, None, None).iter().any(|l| l.contains("API_TIMEOUT_MS")));
         assert!(env_lines(&cfg, false, None, Some("work")).contains(&"export API_TIMEOUT_MS=180000".to_string()));
+    }
+
+    /// A matched pool becomes the `/pool/<name>` prefix, and — the part that
+    /// matters for every install that never writes a rule — a resolution that
+    /// matches nothing produces the same lines as no pools at all.
+    #[test]
+    fn a_matched_pool_reaches_the_env_lines() {
+        use crate::config::PoolMatch;
+        use crate::pool_match::{resolve, LaunchEnv};
+
+        let mut cfg = Config::default();
+        cfg.ensure_pool("work").unwrap();
+        cfg.pool_mut("work").unwrap().match_rules = Some(PoolMatch { paths: vec!["/srv/work".into()], ..Default::default() });
+        let at = |cwd: &str| LaunchEnv { cwd: cwd.into(), getenv: Box::new(|_| None), remote: Box::new(|_| None) };
+
+        let hit = resolve(&cfg, &at("/srv/work/api"));
+        assert!(hit.matched);
+        let lines = env_lines(&cfg, false, None, Some(&hit.pool)).join("\n");
+        assert!(lines.contains("ANTHROPIC_BASE_URL=http://127.0.0.1:3456/pool/work"), "{lines}");
+
+        // Nothing matched: `launch_target` keeps the pool unnamed, so the lines
+        // are the pre-pools ones byte-for-byte.
+        let miss = resolve(&cfg, &at("/elsewhere"));
+        assert!(!miss.matched);
+        assert_eq!(env_lines(&cfg, false, None, None), env_lines(&Config::default(), false, None, None));
+    }
+
+    /// `--match-*` groups replace their own list, `--no-match` drops the block,
+    /// and an uncompilable pattern is refused before it is written.
+    #[test]
+    fn match_flags_write_and_clear_rules() {
+        let mut cfg = Config::default();
+        cfg.ensure_pool("work").unwrap();
+        let set = |path: &[&str], remote: &[&str], env: &[&str], clear: bool| PoolSetArgs {
+            threshold: None,
+            distribute: None,
+            probe: None,
+            hold: None,
+            account: vec![],
+            make_default: false,
+            match_path: path.iter().map(|s| s.to_string()).collect(),
+            match_remote: remote.iter().map(|s| s.to_string()).collect(),
+            match_env: env.iter().map(|s| s.to_string()).collect(),
+            no_match: clear,
+        };
+
+        apply_pool_set(&mut cfg, "work", &set(&["/srv/a", "/srv/b"], &["acme/"], &["TC_CTX=^a", "TC_FLAG"], false)).unwrap();
+        let m = cfg.pool("work").unwrap().match_rules.clone().unwrap();
+        assert_eq!(m.paths, ["/srv/a", "/srv/b"]);
+        assert_eq!(m.remotes, ["acme/"]);
+        // A bare VAR is the "matches when set" form: an empty pattern.
+        assert_eq!(m.env.get("TC_CTX").map(String::as_str), Some("^a"));
+        assert_eq!(m.env.get("TC_FLAG").map(String::as_str), Some(""));
+
+        // One group is rewritten; the others are left alone.
+        apply_pool_set(&mut cfg, "work", &set(&["/srv/c"], &[], &[], false)).unwrap();
+        let m = cfg.pool("work").unwrap().match_rules.clone().unwrap();
+        assert_eq!(m.paths, ["/srv/c"]);
+        assert_eq!(m.remotes, ["acme/"], "an untouched group survives");
+
+        assert!(apply_pool_set(&mut cfg, "work", &set(&[], &["("], &[], false)).is_err(), "a bad regex must be refused");
+
+        apply_pool_set(&mut cfg, "work", &set(&[], &[], &[], true)).unwrap();
+        assert_eq!(cfg.pool("work").unwrap().match_rules, None);
     }
 }
