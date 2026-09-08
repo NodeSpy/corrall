@@ -123,6 +123,8 @@ teamclaude env --pool work      # export lines pointing at that pool
 teamclaude env                  # export lines for eval "$(teamclaude env)"
 teamclaude ca-path              # where the MITM CA certificate lives
 teamclaude config check         # validate and print a redacted config
+teamclaude update --check       # is there a newer release?
+teamclaude update               # install it and restart the service
 teamclaude service install      # systemd --user unit (Linux)
 teamclaude --help
 ```
@@ -276,9 +278,11 @@ auto-selection, Prometheus metrics, health endpoint, JSON logs
 (`--log-format json`),
 `config check`, `import --link`, `requireKeyOnLoopback`, `maxBodyBytes`,
 tunnel allow-lists, graceful shutdown with state persistence, signed release
-builds with provenance attestations, and the security changes above.
+builds with provenance attestations, a verifying `update` subcommand, and the
+security changes above.
 
-Not ported (by choice): the self-updater, the sx.org residential egress
+Not ported (by choice): the unattended daily self-update (`update` is manual
+and verifying), the sx.org residential egress
 integration, the egress-IP guard, the remote TUI (`attach`), shell alias
 installation, the launchd service file, warm-up wall-clock schedules (interval
 mode only), and the Nix packaging.
