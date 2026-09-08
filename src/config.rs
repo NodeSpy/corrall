@@ -19,6 +19,9 @@ pub const DEFAULT_PORT: u16 = 3456;
 pub const DEFAULT_UPSTREAM: &str = "https://api.anthropic.com";
 pub const DEFAULT_SWITCH_THRESHOLD: f64 = 0.98;
 pub const DEFAULT_MAX_BODY_BYTES: u64 = 64 * 1024 * 1024;
+/// The pool that serves requests arriving without a `/pool/<name>` prefix.
+pub const DEFAULT_POOL: &str = "default";
+pub const MAX_POOL_NAME_LEN: usize = 32;
 
 pub fn config_path() -> PathBuf {
     if let Ok(p) = std::env::var("TEAMCLAUDE_CONFIG") {
@@ -321,16 +324,19 @@ pub enum LogLevel {
     Off,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// One pool: its own accounts, its own rotation settings.
+///
+/// Everything here used to live at the top level of the config, when there was
+/// exactly one implicit fleet. A pre-pools file is lifted into `pools.default`
+/// on load (see [`migrate_pools`]), so the on-disk shape below is what every
+/// install converges to.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "camelCase", default)]
-pub struct Config {
-    pub proxy: ProxyConfig,
-    pub upstream: String,
+pub struct PoolConfig {
     pub switch_threshold: Threshold,
     pub hold_seconds: u64,
     pub distribute_sessions: bool,
     pub quota_probe_seconds: u64,
-    pub event_logging: EventLogging,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub blocked_models: Vec<String>,
     pub accounts: Vec<AccountConfig>,
@@ -338,6 +344,78 @@ pub struct Config {
     pub routes: Vec<RouteConfig>,
     pub storm_ramp: StormRamp,
     pub expiry_routing: ExpiryRouting,
+    /// Unknown keys are preserved so a hand-edited pool is never stripped.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+/// Pool names are routed under the fixed `/pool/` URL keyword, which no real
+/// API path can start with, so **no name is reserved** — a pool may be called
+/// `v1` or `api`. Only the charset is fixed: 1–32 characters of lowercase
+/// ASCII letters, digits and hyphens, not starting or ending with a hyphen.
+///
+/// Uppercase is rejected rather than folded to lowercase: the router compares
+/// names byte-for-byte, and folding would let a case-insensitive filesystem
+/// disagree with the router about which pool is which.
+pub fn validate_pool_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        bail!("pool name is empty");
+    }
+    if name.len() > MAX_POOL_NAME_LEN {
+        bail!("pool name {name:?} is longer than {MAX_POOL_NAME_LEN} characters");
+    }
+    if !name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') {
+        bail!("pool name {name:?} may only contain lowercase letters, digits and hyphens");
+    }
+    if name.starts_with('-') || name.ends_with('-') {
+        bail!("pool name {name:?} may not start or end with a hyphen");
+    }
+    Ok(())
+}
+
+/// Keys that lived at the top level before pools existed and now belong to a
+/// pool.
+const LEGACY_POOL_KEYS: &[&str] =
+    &["switchThreshold", "holdSeconds", "distributeSessions", "quotaProbeSeconds", "blockedModels", "accounts", "routes", "stormRamp", "expiryRouting"];
+
+/// Upgrade a pre-pools document in place. Returns whether anything moved, which
+/// makes [`Config::load`] rewrite the file so the migration happens once.
+///
+/// The absence of a `pools` key is the signal: a file that already has one is
+/// left alone, so a hand-written config that also keeps stale top-level keys
+/// keeps them (inert, preserved through `Config::extra`) instead of having them
+/// silently merged into a pool.
+fn migrate_pools(doc: &mut Value) -> bool {
+    let Some(obj) = doc.as_object_mut() else { return false };
+    let mut changed = false;
+    if !obj.contains_key("pools") {
+        let mut pool = serde_json::Map::new();
+        for k in LEGACY_POOL_KEYS {
+            if let Some(v) = obj.remove(*k) {
+                pool.insert((*k).to_string(), v);
+            }
+        }
+        let mut pools = serde_json::Map::new();
+        pools.insert(DEFAULT_POOL.to_string(), Value::Object(pool));
+        obj.insert("pools".to_string(), Value::Object(pools));
+        changed = true;
+    }
+    if !obj.get("defaultPool").and_then(Value::as_str).is_some_and(|s| !s.trim().is_empty()) {
+        obj.insert("defaultPool".to_string(), Value::String(DEFAULT_POOL.to_string()));
+        changed = true;
+    }
+    changed
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Config {
+    pub proxy: ProxyConfig,
+    pub upstream: String,
+    /// Pool serving requests with no `/pool/<name>` prefix.
+    pub default_pool: String,
+    pub pools: BTreeMap<String, PoolConfig>,
+    pub event_logging: EventLogging,
     pub session_titles: SessionTitles,
     /// Keep-warm interval in seconds (0 = off). Spends a little quota.
     pub warmup_seconds: u64,
@@ -366,16 +444,9 @@ impl Default for Config {
         Self {
             proxy: ProxyConfig::default(),
             upstream: DEFAULT_UPSTREAM.to_string(),
-            switch_threshold: Threshold::default(),
-            hold_seconds: 0,
-            distribute_sessions: false,
-            quota_probe_seconds: 0,
+            default_pool: DEFAULT_POOL.to_string(),
+            pools: BTreeMap::from([(DEFAULT_POOL.to_string(), PoolConfig::default())]),
             event_logging: EventLogging::Hide,
-            blocked_models: Vec::new(),
-            accounts: Vec::new(),
-            routes: Vec::new(),
-            storm_ramp: StormRamp::default(),
-            expiry_routing: ExpiryRouting::default(),
             session_titles: SessionTitles::default(),
             warmup_seconds: 0,
             update_check: true,
@@ -399,10 +470,21 @@ impl Config {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
         };
-        let mut cfg: Config = serde_json::from_slice(&raw).with_context(|| format!("parsing {}", path.display()))?;
+        let mut doc: Value = serde_json::from_slice(&raw).with_context(|| format!("parsing {}", path.display()))?;
+        let migrated = migrate_pools(&mut doc);
+        let mut cfg: Config = serde_json::from_value(doc).with_context(|| format!("parsing {}", path.display()))?;
+        cfg.ensure_pools();
         cfg.ensure_account_ids();
         cfg.validate()?;
         warn_if_permissive(&path);
+        if migrated {
+            // Rewrite once so a pre-pools install lands on the new shape without
+            // any manual migration. Failure is not fatal: we already hold a
+            // usable config in memory.
+            if let Err(e) = cfg.save() {
+                tracing::warn!("could not rewrite {} after pool migration: {e:#}", path.display());
+            }
+        }
         Ok(Some(cfg))
     }
 
@@ -436,14 +518,76 @@ impl Config {
     }
 
     pub fn ensure_account_ids(&mut self) {
+        // Ids must be unique across the whole file, not just within a pool:
+        // state, session affinity and pins are all keyed by id alone.
         let mut seen = std::collections::HashSet::new();
-        for a in &mut self.accounts {
-            let fresh = !matches!(&a.id, Some(id) if !id.is_empty() && !seen.contains(id));
-            if fresh {
-                a.id = Some(uuid::Uuid::new_v4().to_string());
+        for p in self.pools.values_mut() {
+            for a in &mut p.accounts {
+                let fresh = !matches!(&a.id, Some(id) if !id.is_empty() && !seen.contains(id));
+                if fresh {
+                    a.id = Some(uuid::Uuid::new_v4().to_string());
+                }
+                seen.insert(a.id.clone().unwrap());
             }
-            seen.insert(a.id.clone().unwrap());
         }
+    }
+
+    /// Guarantee the invariant the router depends on: at least one pool exists
+    /// and `default_pool` names one of them.
+    pub fn ensure_pools(&mut self) {
+        if self.default_pool.trim().is_empty() {
+            self.default_pool = DEFAULT_POOL.to_string();
+        }
+        if self.pools.is_empty() {
+            self.pools.insert(self.default_pool.clone(), PoolConfig::default());
+        } else if !self.pools.contains_key(&self.default_pool) {
+            // A `defaultPool` naming a pool that is not there would leave every
+            // unprefixed request unroutable; adopt the first pool instead.
+            if let Some(first) = self.pools.keys().next().cloned() {
+                tracing::warn!("defaultPool \"{}\" is not configured; using \"{first}\"", self.default_pool);
+                self.default_pool = first;
+            }
+        }
+    }
+
+    pub fn pool(&self, name: &str) -> Option<&PoolConfig> {
+        self.pools.get(name)
+    }
+
+    pub fn pool_mut(&mut self, name: &str) -> Option<&mut PoolConfig> {
+        self.pools.get_mut(name)
+    }
+
+    /// The pool serving `name`, falling back to the default pool when `name` is
+    /// absent or unknown. Never fails: an unroutable request would be worse
+    /// than one served by the default fleet.
+    pub fn pool_or_default(&self, name: Option<&str>) -> &PoolConfig {
+        name.and_then(|n| self.pools.get(n)).or_else(|| self.pools.get(&self.default_pool)).or_else(|| self.pools.values().next()).unwrap_or_else(|| {
+            static EMPTY: std::sync::OnceLock<PoolConfig> = std::sync::OnceLock::new();
+            EMPTY.get_or_init(PoolConfig::default)
+        })
+    }
+
+    /// Pool names with the default pool first, the rest sorted. This is the
+    /// display and resolution order everywhere: status, TUI, `pool list`.
+    pub fn pool_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.pools.keys().filter(|k| *k != &self.default_pool).cloned().collect();
+        names.sort();
+        if self.pools.contains_key(&self.default_pool) {
+            names.insert(0, self.default_pool.clone());
+        }
+        names
+    }
+
+    /// Create the pool if it is missing, after checking the name.
+    pub fn ensure_pool(&mut self, name: &str) -> Result<&mut PoolConfig> {
+        validate_pool_name(name)?;
+        Ok(self.pools.entry(name.to_string()).or_default())
+    }
+
+    /// Every account in the file with the pool that owns it.
+    pub fn all_accounts(&self) -> impl Iterator<Item = (&str, &AccountConfig)> {
+        self.pools.iter().flat_map(|(name, p)| p.accounts.iter().map(move |a| (name.as_str(), a)))
     }
 
     pub fn bind_host(&self) -> String {
@@ -461,12 +605,29 @@ impl Config {
             );
         }
         validate_upstream(&self.upstream, "upstream")?;
-        for a in &self.accounts {
-            if let Some(u) = &a.upstream {
-                validate_upstream(u, &format!("accounts[{}].upstream", a.name))?;
-            }
-            if a.name.trim().is_empty() {
-                bail!("an account has an empty name");
+        if self.pools.is_empty() {
+            bail!("no pools are configured; there must be at least one");
+        }
+        if !self.pools.contains_key(&self.default_pool) {
+            bail!("defaultPool \"{}\" is not one of the configured pools", self.default_pool);
+        }
+        let mut seen_names: BTreeMap<&str, &str> = BTreeMap::new();
+        for (pool, p) in &self.pools {
+            validate_pool_name(pool).with_context(|| "pools".to_string())?;
+            for a in &p.accounts {
+                if let Some(u) = &a.upstream {
+                    validate_upstream(u, &format!("pools.{pool}.accounts[{}].upstream", a.name))?;
+                }
+                if a.name.trim().is_empty() {
+                    bail!("an account in pool \"{pool}\" has an empty name");
+                }
+                // Names address accounts in `switch`, `/tc-acct/<pin>` and route
+                // config, none of which is pool-qualified. A duplicate is only
+                // ambiguous, not unusable, so warn rather than reject a config
+                // that was legal before pools existed.
+                if let Some(other) = seen_names.insert(a.name.as_str(), pool.as_str()) {
+                    tracing::warn!("account name \"{}\" is used in both pool \"{other}\" and pool \"{pool}\"; lookups by name will pick one of them", a.name);
+                }
             }
         }
         for k in &self.proxy.client_keys {
@@ -483,18 +644,20 @@ impl Config {
         Ok(())
     }
 
-    pub fn find_account_idx(&self, needle: &str) -> Option<usize> {
+    /// Locate an account by name, id, email or uuid within one pool.
+    pub fn find_account_idx_in(&self, pool: &str, needle: &str) -> Option<usize> {
+        let accounts = &self.pools.get(pool)?.accounts;
         let n = needle.trim();
         if n.is_empty() {
             return None;
         }
         // accountUuid/orgUuid
         if let Some((au, ou)) = n.split_once('/') {
-            if let Some(i) = self.accounts.iter().position(|a| a.account_uuid.as_deref() == Some(au) && a.org_uuid.as_deref() == Some(ou)) {
+            if let Some(i) = accounts.iter().position(|a| a.account_uuid.as_deref() == Some(au) && a.org_uuid.as_deref() == Some(ou)) {
                 return Some(i);
             }
         }
-        self.accounts.iter().position(|a| {
+        accounts.iter().position(|a| {
             a.account_uuid.as_deref() == Some(n)
                 || a.org_uuid.as_deref() == Some(n)
                 || a.id.as_deref() == Some(n)
@@ -502,6 +665,13 @@ impl Config {
                 || a.email.as_deref() == Some(n)
                 || a.name.split(" (").next() == Some(n)
         })
+    }
+
+    /// Locate an account anywhere in the file. The default pool is searched
+    /// first so that a name duplicated across pools resolves the way it did
+    /// before pools existed.
+    pub fn find_account(&self, needle: &str) -> Option<(String, usize)> {
+        self.pool_names().into_iter().find_map(|p| self.find_account_idx_in(&p, needle).map(|i| (p, i)))
     }
 }
 
@@ -550,18 +720,48 @@ fn warn_if_permissive(path: &Path) {
 #[cfg(not(unix))]
 fn warn_if_permissive(_path: &Path) {}
 
-/// Persisted runtime state: observed quota per account id.
+/// One pool's persisted runtime state: observed quota per account id.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]
-pub struct State {
-    pub version: u32,
-    pub saved_at: Option<String>,
+pub struct PoolState {
     pub accounts: BTreeMap<String, Value>,
     pub client_usage: BTreeMap<String, Value>,
     pub dimension_usage: Value,
 }
 
+/// Persisted runtime state.
+///
+/// The default pool's state stays flattened at the top level, byte-for-byte
+/// where a pre-pools state file put it, so an existing file restores with no
+/// migration and no lost quota. Named pools nest under `pools`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct State {
+    pub version: u32,
+    pub saved_at: Option<String>,
+    #[serde(flatten)]
+    pub default: PoolState,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub pools: BTreeMap<String, PoolState>,
+}
+
 impl State {
+    pub fn pool(&self, name: &str, default_pool: &str) -> Option<&PoolState> {
+        if name == default_pool {
+            Some(&self.default)
+        } else {
+            self.pools.get(name)
+        }
+    }
+
+    pub fn set_pool(&mut self, name: &str, default_pool: &str, st: PoolState) {
+        if name == default_pool {
+            self.default = st;
+        } else {
+            self.pools.insert(name.to_string(), st);
+        }
+    }
+
     pub fn load() -> Result<Option<State>> {
         let path = state_path();
         match std::fs::read(&path) {
@@ -582,6 +782,7 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn threshold_table_falls_back_to_default() {
@@ -618,10 +819,169 @@ mod tests {
     #[test]
     fn unknown_keys_survive_roundtrip() {
         let raw = r#"{"proxy":{"port":1,"apiKey":"tc-0123456789abcdef0123"},"custom":{"a":1},"accounts":[{"name":"x","type":"oauth"}]}"#;
-        let mut c: Config = serde_json::from_str(raw).unwrap();
+        let mut c = parse_migrating(raw);
         c.ensure_account_ids();
-        assert!(c.accounts[0].id.is_some());
+        assert!(c.pools[DEFAULT_POOL].accounts[0].id.is_some());
         let out = serde_json::to_string(&c).unwrap();
         assert!(out.contains("\"custom\""));
+    }
+
+    /// The `load()` path minus the filesystem: migrate the raw document, then
+    /// deserialize.
+    fn parse_migrating(raw: &str) -> Config {
+        let mut doc: Value = serde_json::from_str(raw).unwrap();
+        migrate_pools(&mut doc);
+        let mut c: Config = serde_json::from_value(doc).unwrap();
+        c.ensure_pools();
+        c
+    }
+
+    #[test]
+    fn legacy_config_migrates_into_default_pool() {
+        let raw = r#"{
+            "proxy": {"port": 3456, "apiKey": "tc-0123456789abcdef0123"},
+            "upstream": "https://api.anthropic.com",
+            "switchThreshold": 0.75,
+            "holdSeconds": 30,
+            "distributeSessions": true,
+            "quotaProbeSeconds": 600,
+            "blockedModels": ["*opus*"],
+            "accounts": [{"name": "work", "type": "oauth", "priority": 5}],
+            "routes": [{"name": "cheap", "match": ["*haiku*"]}],
+            "expiryRouting": {"enabled": true},
+            "warmupSeconds": 90
+        }"#;
+        let c = parse_migrating(raw);
+
+        assert_eq!(c.default_pool, DEFAULT_POOL);
+        assert_eq!(c.pools.len(), 1);
+        let p = &c.pools[DEFAULT_POOL];
+        assert_eq!(p.switch_threshold, Threshold::Single(0.75));
+        assert_eq!(p.hold_seconds, 30);
+        assert!(p.distribute_sessions);
+        assert_eq!(p.quota_probe_seconds, 600);
+        assert_eq!(p.blocked_models, vec!["*opus*"]);
+        assert_eq!(p.accounts.len(), 1);
+        assert_eq!(p.accounts[0].name, "work");
+        assert_eq!(p.accounts[0].priority, 5);
+        assert_eq!(p.routes.len(), 1);
+        assert!(p.expiry_routing.enabled);
+        // Daemon-global keys stay at the top level.
+        assert_eq!(c.warmup_seconds, 90);
+        assert_eq!(c.proxy.port, 3456);
+
+        // The migrated keys are gone from the top level, not duplicated into
+        // `extra` where they would be written back out.
+        let out = serde_json::to_string(&c).unwrap();
+        let back: Value = serde_json::from_str(&out).unwrap();
+        assert!(back.get("accounts").is_none());
+        assert!(back.get("switchThreshold").is_none());
+        assert_eq!(back.pointer("/pools/default/holdSeconds").and_then(Value::as_u64), Some(30));
+    }
+
+    #[test]
+    fn migration_is_idempotent_and_preserves_named_pools() {
+        let legacy = r#"{"proxy":{"apiKey":"tc-0123456789abcdef0123"},"accounts":[{"name":"a","type":"oauth"}]}"#;
+        let once = parse_migrating(legacy);
+        let json = serde_json::to_string(&once).unwrap();
+
+        // Second pass: the file already has `pools`, so nothing moves.
+        let mut doc: Value = serde_json::from_str(&json).unwrap();
+        assert!(!migrate_pools(&mut doc), "a migrated file must not migrate again");
+        let twice: Config = serde_json::from_value(doc).unwrap();
+        assert_eq!(once, twice);
+
+        // A file that already declares pools is left alone entirely.
+        let modern = r#"{"proxy":{"apiKey":"tc-0123456789abcdef0123"},"defaultPool":"main",
+            "pools":{"main":{"accounts":[]},"work":{"switchThreshold":0.5}}}"#;
+        let c = parse_migrating(modern);
+        assert_eq!(c.default_pool, "main");
+        assert_eq!(c.pool_names(), vec!["main", "work"]);
+        assert_eq!(c.pools["work"].switch_threshold, Threshold::Single(0.5));
+    }
+
+    #[test]
+    fn missing_default_pool_backfills() {
+        // `pools` present but no `defaultPool`: the name is filled in.
+        let c = parse_migrating(r#"{"proxy":{"apiKey":"tc-0123456789abcdef0123"},"pools":{"default":{}}}"#);
+        assert_eq!(c.default_pool, DEFAULT_POOL);
+        assert!(c.validate().is_ok());
+
+        // `defaultPool` naming a pool that is not there: adopt a real one so no
+        // request is left unroutable.
+        let c = parse_migrating(r#"{"proxy":{"apiKey":"tc-0123456789abcdef0123"},"defaultPool":"gone","pools":{"work":{}}}"#);
+        assert_eq!(c.default_pool, "work");
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn pool_names_are_charset_checked_but_never_reserved() {
+        // No name is reserved: routing lives under the /pool/ keyword.
+        for ok in ["default", "work", "v1", "api", "teamclaude", "a", "a-b-c", "pool", "x9", &"a".repeat(MAX_POOL_NAME_LEN)] {
+            assert!(validate_pool_name(ok).is_ok(), "{ok} should be a legal pool name");
+        }
+        for bad in ["", "Work", "WORK", "-work", "work-", "wo rk", "work/other", "work.io", "work_id", "wörk", &"a".repeat(MAX_POOL_NAME_LEN + 1)] {
+            assert!(validate_pool_name(bad).is_err(), "{bad:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_unknown_default_pool_and_empty_pools() {
+        let mut c = Config { default_pool: "nope".into(), ..Default::default() };
+        assert!(c.validate().is_err());
+        c.pools.clear();
+        assert!(c.validate().is_err());
+        // An illegally named pool is rejected even if everything else is fine.
+        let mut c = Config::default();
+        c.pools.insert("Bad Name".into(), PoolConfig::default());
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn pool_lookup_falls_back_to_default() {
+        let mut c = Config::default();
+        c.pools.insert("work".into(), PoolConfig { hold_seconds: 7, ..Default::default() });
+        assert_eq!(c.pool_or_default(Some("work")).hold_seconds, 7);
+        assert_eq!(c.pool_or_default(Some("nonexistent")).hold_seconds, 0);
+        assert_eq!(c.pool_or_default(None).hold_seconds, 0);
+        // Default first, then sorted.
+        c.pools.insert("alpha".into(), PoolConfig::default());
+        assert_eq!(c.pool_names(), vec!["default", "alpha", "work"]);
+    }
+
+    #[test]
+    fn account_ids_are_unique_across_pools() {
+        let mut c = Config::default();
+        c.pools.get_mut(DEFAULT_POOL).unwrap().accounts.push(AccountConfig { name: "a".into(), id: Some("dup".into()), ..Default::default() });
+        c.pools.insert(
+            "work".into(),
+            PoolConfig { accounts: vec![AccountConfig { name: "b".into(), id: Some("dup".into()), ..Default::default() }], ..Default::default() },
+        );
+        c.ensure_account_ids();
+        let ids: Vec<&str> = c.all_accounts().filter_map(|(_, a)| a.id.as_deref()).collect();
+        assert_eq!(ids.len(), 2);
+        assert_ne!(ids[0], ids[1]);
+        assert_eq!(c.find_account("a"), Some((DEFAULT_POOL.to_string(), 0)));
+        assert_eq!(c.find_account("b"), Some(("work".to_string(), 0)));
+        assert_eq!(c.find_account("missing"), None);
+    }
+
+    #[test]
+    fn legacy_state_file_restores_as_default_pool() {
+        let raw = r#"{"version":2,"savedAt":"now","accounts":{"id-1":{"name":"work"}},"clientUsage":{"cli":{"totalRequests":3}}}"#;
+        let st: State = serde_json::from_str(raw).unwrap();
+        assert_eq!(st.version, 2);
+        assert!(st.default.accounts.contains_key("id-1"));
+        assert!(st.default.client_usage.contains_key("cli"));
+        assert!(st.pools.is_empty());
+        assert!(st.pool("default", "default").is_some());
+        assert!(st.pool("work", "default").is_none());
+
+        // Named pools nest; the default pool keeps writing to the top level.
+        let mut st = st;
+        st.set_pool("work", "default", PoolState { accounts: BTreeMap::from([("id-2".into(), json!({}))]), ..Default::default() });
+        let out = serde_json::to_value(&st).unwrap();
+        assert!(out.pointer("/accounts/id-1").is_some(), "default pool stays flattened");
+        assert!(out.pointer("/pools/work/accounts/id-2").is_some());
     }
 }

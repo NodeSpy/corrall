@@ -613,13 +613,55 @@ fn render_usage_entries(lines: &mut Vec<String>, entries: &serde_json::Map<Strin
     }
 }
 
+/// The rows that describe the daemon rather than any one pool.
+fn daemon_lines(st: &Value, paint: Paint) -> Vec<String> {
+    let empty = Value::Object(Default::default());
+    let warm = st.get("warm").unwrap_or(&empty);
+    let mut lines: Vec<String> = Vec::new();
+    if b(warm, "enabled") {
+        lines.push(format!("{} on every {}", paint.dim(&pad("Keep-warm", 12)), format_duration(i(warm, "intervalSeconds") * 1000)));
+    }
+    if let Some(up) = st.pointer("/server/uptimeSeconds").and_then(Value::as_i64).or_else(|| st.get("uptimeSeconds").and_then(Value::as_i64)) {
+        lines.push(format!("{} up {}", paint.dim(&pad("Server", 12)), format_duration(up * 1000)));
+    }
+    if let Some(tag) = s(st, "updateAvailable") {
+        lines.push(format!("{} {}", paint.dim(&pad("Update", 12)), paint.yellow(&format!("{} available — run: teamclaude update", safe_text(tag, 30)))));
+    }
+    lines
+}
+
 /// Render the status payload. `color` enables ANSI (truecolor bars).
+///
+/// The payload flattens the default pool onto the top level and repeats every
+/// pool under `pools`, so a one-pool install renders exactly what it did
+/// before pools existed. With several, the daemon-wide rows are printed once
+/// and each pool gets its own section.
 pub fn render(st: &Value, color: bool, now: i64) -> String {
     let paint = Paint { on: color };
+    let Some(pools) = st.get("pools").and_then(Value::as_array).filter(|p| p.len() > 1) else {
+        return render_pool(st, "TeamClaude status", paint, now, true);
+    };
+    let mut out = vec![
+        paint.bold(&format!("TeamClaude status — {} pools", pools.len())),
+        format!("{} {}", paint.dim(&pad("Default", 12)), paint.cyan(s(st, "defaultPool").unwrap_or("-"))),
+    ];
+    out.extend(daemon_lines(st, paint));
+    for p in pools {
+        let star = if b(p, "default") { " *" } else { "" };
+        out.push(String::new());
+        out.push(render_pool(p, &format!("pool {}{star}", safe_text(s(p, "pool").unwrap_or("?"), 24)), paint, now, false));
+    }
+    out.push(String::new());
+    out.push(paint.dim("* serves requests with no /pool/<name> prefix"));
+    out.join("\n")
+}
+
+/// One pool's section, under `heading`. `daemon` adds the daemon-wide rows,
+/// which a multi-pool render has already printed once at the top.
+fn render_pool(st: &Value, heading: &str, paint: Paint, now: i64, daemon: bool) -> String {
     let mut lines: Vec<String> = Vec::new();
     let empty = Value::Object(Default::default());
     let probe = st.get("probe").unwrap_or(&empty);
-    let warm = st.get("warm").unwrap_or(&empty);
     let accounts: Vec<Value> = st.get("accounts").and_then(Value::as_array).cloned().unwrap_or_default();
     let blocked: Vec<String> = st
         .get("blockedModels")
@@ -629,7 +671,7 @@ pub fn render(st: &Value, color: bool, now: i64) -> String {
     let current = s(st, "currentAccount").or_else(|| s(st, "current"));
     let threshold = st.get("switchThreshold").cloned().unwrap_or(Value::Null);
 
-    lines.push(paint.bold("TeamClaude status"));
+    lines.push(paint.bold(heading));
     lines.push(format!("{} {}", paint.dim(&pad("Active", 12)), paint.cyan(current.unwrap_or("none"))));
     lines.push(format!("{} {}", paint.dim(&pad("Switch at", 12)), format_threshold(&threshold, paint)));
     if !blocked.is_empty() {
@@ -639,14 +681,8 @@ pub fn render(st: &Value, color: bool, now: i64) -> String {
         lines.push(format!("{} {}", paint.dim(&pad("Sessions", 12)), format_sessions(sessions, paint)));
     }
     lines.push(format!("{} {}", paint.dim(&pad("Probe", 12)), format_probe_summary(probe, now, paint)));
-    if b(warm, "enabled") {
-        lines.push(format!("{} on every {}", paint.dim(&pad("Keep-warm", 12)), format_duration(i(warm, "intervalSeconds") * 1000)));
-    }
-    if let Some(up) = st.pointer("/server/uptimeSeconds").and_then(Value::as_i64).or_else(|| st.get("uptimeSeconds").and_then(Value::as_i64)) {
-        lines.push(format!("{} up {}", paint.dim(&pad("Server", 12)), format_duration(up * 1000)));
-    }
-    if let Some(tag) = s(st, "updateAvailable") {
-        lines.push(format!("{} {}", paint.dim(&pad("Update", 12)), paint.yellow(&format!("{} available — run: teamclaude update", safe_text(tag, 30)))));
+    if daemon {
+        lines.extend(daemon_lines(st, paint));
     }
     lines.push(String::new());
 
@@ -782,5 +818,45 @@ Routing
 Clients
   alice                2 req, 10 in / 5 out";
         assert_eq!(out, expected);
+    }
+
+    /// One pool renders as it always did; several put the daemon rows once at
+    /// the top and give every pool its own headed section.
+    #[test]
+    fn several_pools_each_get_a_section() {
+        let now = 1_000_000_000_000;
+        let pool = |name: &str, default: bool, current: &str| {
+            json!({
+                "pool": name, "default": default, "currentAccount": current,
+                "switchThreshold": 0.98, "probe": { "enabled": false }, "accounts": [], "routes": [],
+            })
+        };
+        let mut st = pool("default", true, "a@x.com");
+        st["defaultPool"] = json!("default");
+        st["server"] = json!({ "uptimeSeconds": 125 });
+        st["pools"] = json!([pool("default", true, "a@x.com"), pool("work", false, "b@y.com")]);
+
+        let out = render(&st, false, now);
+        let expected = "\
+TeamClaude status — 2 pools
+Default      default
+Server       up 3m
+
+pool default *
+Active       a@x.com
+Switch at    98%
+Probe        off (passive only)
+
+pool work
+Active       b@y.com
+Switch at    98%
+Probe        off (passive only)
+
+* serves requests with no /pool/<name> prefix";
+        assert_eq!(out, expected);
+
+        // A single pool is the pre-pools render, daemon rows inline and all.
+        st["pools"] = json!([pool("default", true, "a@x.com")]);
+        assert!(render(&st, false, now).starts_with("TeamClaude status\nActive       a@x.com"));
     }
 }

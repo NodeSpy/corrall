@@ -6,6 +6,65 @@ Path: `$TEAMCLAUDE_CONFIG`, else `$XDG_CONFIG_HOME/teamclaude.json`, else
 Runtime state (observed quota, usage counters) goes to `teamclaude.state.json`
 beside it. Safe to delete; quota is re-learned from traffic.
 
+## Pools
+
+Accounts live in named pools, each with its own rotation, thresholds and
+sessions. An account belongs to exactly one pool. Requests reach a pool through
+a `/pool/<name>` prefix on the base URL; anything without one goes to
+`defaultPool`.
+
+A config written before pools is migrated on first load: every account and
+rotation setting moves into `pools.default`, and the file is re-saved. Nothing
+to do by hand, and a one-pool install behaves exactly as before.
+
+```json
+{
+  "defaultPool": "default",
+  "pools": {
+    "default": { "accounts": [ … ] },
+    "work": { "switchThreshold": 0.9, "holdSeconds": 120, "accounts": [ … ] }
+  }
+}
+```
+
+Pool names are 1–32 characters of `a-z`, `0-9` and `-`, not starting or ending
+with `-`. No name is reserved: routing lives under the fixed `/pool/` keyword,
+which no real API path uses, so a pool may be called `v1` or `api`.
+
+| Field | Default | Description |
+| --- | --- | --- |
+| `defaultPool` | `default` | Pool serving requests that carry no `/pool/<name>` prefix |
+| `pools` | one `default` pool | Name → pool. Each pool holds `accounts`, `routes` and its own rotation settings |
+
+Per-pool fields: `accounts`, `routes`, `switchThreshold`, `holdSeconds`,
+`distributeSessions`, `quotaProbeSeconds`, `blockedModels`, `stormRamp`,
+`expiryRouting`. Everything else in the table below is daemon-global.
+
+### Reaching a pool
+
+In base-URL mode the pool is a path prefix, ahead of any `/tc-acct/<pin>`:
+
+```
+ANTHROPIC_BASE_URL=http://127.0.0.1:3456/pool/work
+ANTHROPIC_BASE_URL=http://127.0.0.1:3456/pool/work/tc-acct/alice
+```
+
+The server strips both prefixes before forwarding, so the upstream sees the
+path the client asked for. An unknown pool falls back to `defaultPool` rather
+than failing the request — a stale base URL should not take a client down.
+
+MITM mode has no local URL to hang a prefix on, so the pool travels in the
+proxy username beside the optional pin, as `[<pin>]~<pool>`:
+
+```
+HTTPS_PROXY=http://alice~work:@127.0.0.1:3456
+HTTPS_PROXY=http://~work:@127.0.0.1:3456
+```
+
+`teamclaude env --pool work` emits the right form for whichever mode is
+configured. The default pool is never named in either form, so a one-pool
+install emits byte-for-byte what it emitted before pools existed.
+
 ## Top level
 
 | Field | Default | Description |
@@ -68,6 +127,7 @@ Bucket keys: `unified5h`, `unified7d`, `unified7dFable`, `unified7dSonnet`,
 | Variable | Effect |
 | --- | --- |
 | `TC_ACCT` | Pin `teamclaude run` / `env` to one account (uuid, org uuid, `uuid/org`, name or email). Removed from the child environment |
+| `TC_POOL` | Send `teamclaude run` / `env` to one pool, the same way `TC_ACCT` chooses an account. `--pool` wins over it. Removed from the child environment |
 | `TEAMCLAUDE_CONFIG` | Config path |
 | `TEAMCLAUDE_HOST` | Override `proxy.host` |
 | `TEAMCLAUDE_LOG` | `tracing` filter, e.g. `debug` |
@@ -88,12 +148,15 @@ refused.
 | --- | --- |
 | `GET health` | `{ ok, version }` |
 | `GET dashboard` | Static HTML page; asks for the key and polls `status` |
-| `GET status` | Full account, quota, route, session and client-usage view |
-| `GET quota` | Tier-weighted fleet quota for status lines |
-| `GET metrics` | Prometheus text format |
+| `GET status` | Full account, quota, route, session and client-usage view. One entry per pool under `pools`; the default pool's view is also flattened onto the top level |
+| `GET quota` | Tier-weighted fleet quota for status lines, for the addressed pool |
+| `GET metrics` | Prometheus text format. Per-account series carry a `pool="…"` label |
 | `POST reload` | Re-read the config |
-| `POST switch` `{ "account": "…" }` | Prefer one account |
-| `POST route-pin` `{ "route": "…", "account": "…" }` | Pin a route (omit `account` to clear) |
+| `POST switch` `{ "account": "…", "pool"? }` | Prefer one account. Without a pool, every pool is searched |
+| `POST route-pin` `{ "route": "…", "account": "…", "pool"? }` | Pin a route (omit `account` to clear) |
+
+A `/pool/<name>` prefix on the control path selects the pool too, so
+`/pool/work/teamclaude/quota` reads the `work` fleet.
 
 ## Passthrough paths
 

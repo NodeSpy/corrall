@@ -27,6 +27,7 @@ use super::log::RequestLogger;
 use super::mitm::{self, HostMode};
 use crate::config::{Config, EventLogging};
 use crate::manager::{Manager, Provider};
+use crate::pools::Pools;
 
 pub type BoxBody = http_body_util::combinators::BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -43,6 +44,11 @@ pub struct ReqInfo {
     pub session_id: Option<String>,
     pub client: Option<String>,
     pub pin: Option<String>,
+    /// The pool serving this request — always a live pool name, never the
+    /// unknown name a client may have asked for.
+    pub pool: String,
+    /// The serving pool's `holdSeconds`, in milliseconds.
+    pub hold_ms: u64,
     #[allow(dead_code)]
     pub started: std::time::Instant,
     pub provider: Provider,
@@ -62,10 +68,9 @@ pub enum Activity {
 }
 
 pub struct CtxInner {
-    pub manager: Manager,
+    pub pools: Arc<Pools>,
     pub config: RwLock<Arc<Config>>,
     pub logger: Option<RequestLogger>,
-    pub hold_ms: u64,
     pub activity: tokio::sync::broadcast::Sender<Activity>,
     pub reload: Option<Box<dyn Fn() -> Result<usize> + Send + Sync>>,
     pub metrics: Metrics,
@@ -100,6 +105,18 @@ impl Ctx {
         *self.config.write() = Arc::new(c);
     }
 
+    /// The pool serving requests that name no pool. Most callers that used to
+    /// reach for "the" manager want this one.
+    pub fn manager(&self) -> Manager {
+        self.pools.default()
+    }
+
+    /// The manager for a request's pool. `info.pool` is always a live name, so
+    /// this is a lookup rather than a fallback.
+    pub fn manager_for(&self, pool: &str) -> Manager {
+        self.pools.resolve(Some(pool)).1
+    }
+
     pub fn dimension_headers(&self) -> HashSet<String> {
         self.config().proxy.usage_dimensions.iter().map(|d| d.header.to_ascii_lowercase()).collect()
     }
@@ -128,7 +145,7 @@ impl Ctx {
         if !hosts.iter().any(|h| h == "api.anthropic.com") {
             hosts.push("api.anthropic.com".to_string());
         }
-        if cfg.accounts.iter().any(|a| a.is_codex()) {
+        if cfg.all_accounts().any(|(_, a)| a.is_codex()) {
             hosts.push(crate::codex::HOST.to_string());
         }
         hosts
@@ -198,6 +215,8 @@ where
 pub struct TunnelCtx {
     pub auth: Auth,
     pub pin: Option<String>,
+    /// Pool chosen at CONNECT time, from the proxy username's `~<pool>` suffix.
+    pub pool: Option<String>,
     #[allow(dead_code)]
     pub host: String,
 }
@@ -220,6 +239,20 @@ async fn handle(ctx: Ctx, req: Request<Incoming>, peer: IpAddr, tunnel: Option<&
     let cfg = ctx.config();
     let path = req.uri().path().to_string();
     let path_and_query = req.uri().path_and_query().map(|p| p.to_string()).unwrap_or_else(|| "/".into());
+
+    // Pool keyword. `/pool/<name>` is stripped here, before anything else looks
+    // at the path, so it composes with the control plane, the passthrough list
+    // and the deprecated `/tc-acct/` pin alike.
+    let (asked_pool, path, path_and_query) = match crate::pools::parse_pool_path(&path_and_query) {
+        Some((name, rest)) => {
+            let path = rest.split(['?', '#']).next().unwrap_or("/").to_string();
+            (Some(name.to_string()), path, rest)
+        }
+        None => (None, path, path_and_query),
+    };
+    // In MITM mode there is no local URL to carry the keyword, so the pool
+    // comes from the CONNECT username instead. An explicit keyword still wins.
+    let asked_pool = asked_pool.or_else(|| tunnel.and_then(|t| t.pool.clone()));
 
     // The dashboard page is a static asset with no data in it; everything it
     // shows is fetched with the key. Serving it unauthenticated lets a browser
@@ -250,8 +283,10 @@ async fn handle(ctx: Ctx, req: Request<Incoming>, peer: IpAddr, tunnel: Option<&
 
     // Control plane.
     if path.starts_with("/teamclaude/") && tunnel.is_none() {
-        return control(&ctx, req, &auth).await;
+        return control(&ctx, req, &auth, asked_pool.as_deref()).await;
     }
+
+    let (pool, manager) = ctx.pools.resolve_request(asked_pool.as_deref());
 
     // Passthrough paths carry the client's own upstream session (its token
     // refresh, Remote Control): no account is selected and no credential
@@ -341,7 +376,7 @@ async fn handle(ctx: Ctx, req: Request<Incoming>, peer: IpAddr, tunnel: Option<&
         })
         .collect();
     if let Some(m) = &model {
-        if ctx.manager.is_model_blocked(m) {
+        if manager.is_model_blocked(m) {
             return error_response(StatusCode::BAD_REQUEST, "invalid_request_error", "This model is blocked by the proxy configuration (blockedModels)");
         }
     }
@@ -357,6 +392,8 @@ async fn handle(ctx: Ctx, req: Request<Incoming>, peer: IpAddr, tunnel: Option<&
         session_id,
         client,
         pin,
+        hold_ms: manager.hold_seconds().saturating_mul(1000),
+        pool,
         started: std::time::Instant::now(),
         provider,
         parsed,
@@ -374,9 +411,9 @@ async fn handle(ctx: Ctx, req: Request<Incoming>, peer: IpAddr, tunnel: Option<&
             client: info.client.clone(),
         });
     }
-    ctx.manager.begin_session_request(info.session_id.as_deref(), info.client.as_deref());
-    let resp = super::forward::forward(&ctx, &info, parts.headers, body).await;
-    ctx.manager.end_session_request(info.session_id.as_deref());
+    manager.begin_session_request(info.session_id.as_deref(), info.client.as_deref());
+    let resp = super::forward::forward(&ctx, &manager, &info, parts.headers, body).await;
+    manager.end_session_request(info.session_id.as_deref());
     resp
 }
 
@@ -401,25 +438,29 @@ fn short_id() -> String {
 
 // ── control plane ─────────────────────────────────────────────
 
-async fn control(ctx: &Ctx, req: Request<Incoming>, auth: &Auth) -> Response<BoxBody> {
+async fn control(ctx: &Ctx, req: Request<Incoming>, auth: &Auth, asked_pool: Option<&str>) -> Response<BoxBody> {
     let cfg = ctx.config();
     let path = req.uri().path().to_string();
     match (req.method().clone(), path.as_str()) {
         (Method::GET, "/teamclaude/health") => json_response(StatusCode::OK, json!({ "ok": true, "version": env!("CARGO_PKG_VERSION") })),
         (Method::GET, "/teamclaude/status") => {
-            let detail = cfg.proxy.session_detail;
-            let mut st = ctx.manager.status(detail);
+            let mut st = ctx.pools.status(cfg.proxy.session_detail);
             st["upstream"] = json!(cfg.upstream);
             st["upstreamProxy"] = json!(crate::upstream::describe_proxy(&cfg));
-            st["holdSeconds"] = json!(cfg.hold_seconds);
-            st["quotaProbeSeconds"] = json!(cfg.quota_probe_seconds);
             st["mitm"] = json!({ "caPath": mitm::ca_cert_path(), "http1Only": cfg.mitm.http1_only, "allowTunnel": cfg.mitm.allow_tunnel });
             st["client"] = json!(auth.client_name());
             st["sessionTitles"] = json!(cfg.session_titles);
             st["warmupSeconds"] = json!(cfg.warmup_seconds);
             json_response(StatusCode::OK, st)
         }
-        (Method::GET, "/teamclaude/quota") => json_response(StatusCode::OK, ctx.manager.quota_summary()),
+        (Method::GET, "/teamclaude/quota") => {
+            let (name, m) = ctx.pools.resolve_request(asked_pool);
+            let mut q = m.quota_summary();
+            if let Some(o) = q.as_object_mut() {
+                o.insert("pool".to_string(), json!(name));
+            }
+            json_response(StatusCode::OK, q)
+        }
         (Method::GET, "/teamclaude/metrics") => {
             let mut r = Response::new(Full::new(Bytes::from(render_metrics(ctx))).map_err(|e| match e {}).boxed());
             r.headers_mut().insert("content-type", HeaderValue::from_static("text/plain; version=0.0.4"));
@@ -442,17 +483,28 @@ async fn control(ctx: &Ctx, req: Request<Incoming>, auth: &Auth) -> Response<Box
                 Err(false) => return json_response(StatusCode::BAD_REQUEST, json!({ "ok": false, "error": "invalid request body" })),
             };
             let v: Value = serde_json::from_slice(&body).unwrap_or(json!({}));
-            let names: Vec<String> = ctx.manager.account_ids().into_iter().map(|(_, n)| n).collect();
+            // A pool from the body, the URL keyword, or — with neither — search
+            // every pool so `teamclaude switch <name>` keeps working unqualified.
+            let asked = v.get("pool").and_then(Value::as_str).or(asked_pool);
+            let scoped = asked.map(|p| ctx.pools.resolve_request(Some(p)));
+            let names: Vec<String> = match &scoped {
+                Some((_, m)) => m.account_ids().into_iter().map(|(_, n)| n).collect(),
+                None => ctx.pools.each().into_iter().flat_map(|(_, m)| m.account_ids().into_iter().map(|(_, n)| n)).collect(),
+            };
             let Some(target) = v.get("account").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) else {
                 return json_response(StatusCode::BAD_REQUEST, json!({ "ok": false, "error": "missing \"account\"", "accounts": names }));
             };
-            let Some(id) = ctx.manager.resolve_pin(target) else {
+            let found = match &scoped {
+                Some((pool, m)) => m.resolve_pin(target).map(|id| (pool.clone(), m.clone(), id)),
+                None => ctx.pools.find_account(target),
+            };
+            let Some((pool, mgr, id)) = found else {
                 return json_response(StatusCode::NOT_FOUND, json!({ "ok": false, "error": "unknown account", "accounts": names }));
             };
-            match ctx.manager.switch_to(&id) {
+            match mgr.switch_to(&id) {
                 Some((name, reason)) => {
-                    ctx.manager.log(format!("Switched to account \"{name}\" by request"));
-                    json_response(StatusCode::OK, json!({ "ok": true, "account": name, "effective": reason.is_none(), "blocked": reason }))
+                    mgr.log(format!("Switched to account \"{name}\" by request"));
+                    json_response(StatusCode::OK, json!({ "ok": true, "pool": pool, "account": name, "effective": reason.is_none(), "blocked": reason }))
                 }
                 None => json_response(StatusCode::NOT_FOUND, json!({ "ok": false, "error": "unknown account" })),
             }
@@ -466,15 +518,19 @@ async fn control(ctx: &Ctx, req: Request<Incoming>, auth: &Auth) -> Response<Box
             let Some(route) = v.get("route").and_then(Value::as_str) else {
                 return json_response(StatusCode::BAD_REQUEST, json!({ "ok": false, "error": "missing \"route\"" }));
             };
+            // Routes are per-pool, so an account name resolves within the
+            // pool that owns the route.
+            let asked = v.get("pool").and_then(Value::as_str).or(asked_pool);
+            let (pool, mgr) = ctx.pools.resolve_request(asked);
             let id = match v.get("account").and_then(Value::as_str) {
-                Some(a) => match ctx.manager.resolve_pin(a) {
+                Some(a) => match mgr.resolve_pin(a) {
                     Some(id) => Some(id),
                     None => return json_response(StatusCode::NOT_FOUND, json!({ "ok": false, "error": "unknown account" })),
                 },
                 None => None,
             };
-            ctx.manager.set_route_pin(route, id.as_deref());
-            json_response(StatusCode::OK, json!({ "ok": true }))
+            mgr.set_route_pin(route, id.as_deref());
+            json_response(StatusCode::OK, json!({ "ok": true, "pool": pool }))
         }
         _ => json_response(StatusCode::NOT_FOUND, json!({ "ok": false, "error": "not found" })),
     }
@@ -482,7 +538,6 @@ async fn control(ctx: &Ctx, req: Request<Incoming>, auth: &Auth) -> Response<Box
 
 fn render_metrics(ctx: &Ctx) -> String {
     use std::sync::atomic::Ordering;
-    let st = ctx.manager.status(false);
     let mut out = String::new();
     out.push_str("# TYPE teamclaude_requests_total counter\n");
     out.push_str(&format!("teamclaude_requests_total {}\n", ctx.metrics.requests_total.load(Ordering::Relaxed)));
@@ -495,22 +550,30 @@ fn render_metrics(ctx: &Ctx) -> String {
     out.push_str("# TYPE teamclaude_account_quota_utilization gauge\n");
     out.push_str("# TYPE teamclaude_account_available gauge\n");
     out.push_str("# TYPE teamclaude_account_requests_total counter\n");
-    if let Some(accts) = st.get("accounts").and_then(Value::as_array) {
-        for a in accts {
-            let name = a.get("name").and_then(Value::as_str).unwrap_or("").replace(['"', '\\', '\n'], "_");
-            for b in ["unified5h", "unified7d", "unified7dFable", "unified7dSonnet"] {
-                if let Some(u) = a.pointer(&format!("/quota/{b}/utilization")).and_then(Value::as_f64) {
-                    out.push_str(&format!("teamclaude_account_quota_utilization{{account=\"{name}\",bucket=\"{b}\"}} {u}\n"));
+    let esc = |s: &str| s.replace(['"', '\\', '\n'], "_");
+    let mut sessions = String::new();
+    for (pool, m) in ctx.pools.each() {
+        let st = m.status(false);
+        let pool = esc(&pool);
+        if let Some(accts) = st.get("accounts").and_then(Value::as_array) {
+            for a in accts {
+                let name = esc(a.get("name").and_then(Value::as_str).unwrap_or(""));
+                for b in ["unified5h", "unified7d", "unified7dFable", "unified7dSonnet"] {
+                    if let Some(u) = a.pointer(&format!("/quota/{b}/utilization")).and_then(Value::as_f64) {
+                        out.push_str(&format!("teamclaude_account_quota_utilization{{pool=\"{pool}\",account=\"{name}\",bucket=\"{b}\"}} {u}\n"));
+                    }
                 }
+                let avail = if a.get("blocked").map(Value::is_null).unwrap_or(false) { 1 } else { 0 };
+                out.push_str(&format!("teamclaude_account_available{{pool=\"{pool}\",account=\"{name}\"}} {avail}\n"));
+                let n = a.pointer("/usage/totalRequests").and_then(Value::as_u64).unwrap_or(0);
+                out.push_str(&format!("teamclaude_account_requests_total{{pool=\"{pool}\",account=\"{name}\"}} {n}\n"));
             }
-            let avail = if a.get("blocked").map(Value::is_null).unwrap_or(false) { 1 } else { 0 };
-            out.push_str(&format!("teamclaude_account_available{{account=\"{name}\"}} {avail}\n"));
-            let n = a.pointer("/usage/totalRequests").and_then(Value::as_u64).unwrap_or(0);
-            out.push_str(&format!("teamclaude_account_requests_total{{account=\"{name}\"}} {n}\n"));
         }
+        let active = st.pointer("/sessions/active").and_then(Value::as_u64).unwrap_or(0);
+        sessions.push_str(&format!("teamclaude_sessions_active{{pool=\"{pool}\"}} {active}\n"));
     }
     out.push_str("# TYPE teamclaude_sessions_active gauge\n");
-    out.push_str(&format!("teamclaude_sessions_active {}\n", st.pointer("/sessions/active").and_then(Value::as_u64).unwrap_or(0)));
+    out.push_str(&sessions);
     out
 }
 
@@ -519,7 +582,13 @@ fn render_metrics(ctx: &Ctx) -> String {
 async fn handle_connect(ctx: Ctx, req: Request<Incoming>, peer: IpAddr) -> Response<BoxBody> {
     ctx.metrics.connects_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let cfg = ctx.config();
-    let (auth, pin) = authenticate_connect(&cfg.proxy, peer, req.headers());
+    let (auth, user) = authenticate_connect(&cfg.proxy, peer, req.headers());
+    // The proxy username carries `[<pin>][~<pool>]`; MITM mode has no URL for
+    // the `/pool/` keyword to ride on.
+    let (pin, asked_pool) = match &user {
+        Some(u) => crate::pools::split_pin_pool(u),
+        None => (None, None),
+    };
     if let Auth::Denied(why) = &auth {
         ctx.metrics.auth_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         tracing::warn!("CONNECT denied from {peer}: {why}");
@@ -542,19 +611,22 @@ async fn handle_connect(ctx: Ctx, req: Request<Incoming>, peer: IpAddr) -> Respo
         mitm::host_mode(&host, port, &ctx.intercept_hosts(), &cfg.mitm)
     };
 
-    // Pins only matter for intercepted hosts; validate them there so a typo
-    // meant for Anthropic cannot take down unrelated tunnels.
-    let pin = match (&mode, pin) {
-        (HostMode::Intercept, Some(p)) => {
-            if ctx.manager.resolve_pin(&p).is_none() {
-                tracing::warn!("CONNECT {host}: unknown account pin");
-                let mut r = error_response(StatusCode::PROXY_AUTHENTICATION_REQUIRED, "authentication_error", "unknown account pin");
-                r.headers_mut().insert("proxy-authenticate", HeaderValue::from_static("Basic realm=\"teamclaude\""));
-                return r;
+    // Pins and pools only matter for intercepted hosts; validate them there so
+    // a typo meant for Anthropic cannot take down unrelated tunnels.
+    let (pin, tunnel_pool) = match (&mode, pin) {
+        (HostMode::Intercept, p) => {
+            let (name, mgr) = ctx.pools.resolve_request(asked_pool.as_deref());
+            if let Some(p) = &p {
+                if mgr.resolve_pin(p).is_none() {
+                    tracing::warn!("CONNECT {host}: unknown account pin");
+                    let mut r = error_response(StatusCode::PROXY_AUTHENTICATION_REQUIRED, "authentication_error", "unknown account pin");
+                    r.headers_mut().insert("proxy-authenticate", HeaderValue::from_static("Basic realm=\"teamclaude\""));
+                    return r;
+                }
             }
-            Some(p)
+            (p, Some(name))
         }
-        _ => None,
+        _ => (None, None),
     };
 
     match mode {
@@ -589,7 +661,7 @@ async fn handle_connect(ctx: Ctx, req: Request<Incoming>, peer: IpAddr) -> Respo
                 }
             };
             let is_test = mode == HostMode::Test;
-            let tunnel = TunnelCtx { auth: auth.clone(), pin, host: host.clone() };
+            let tunnel = TunnelCtx { auth: auth.clone(), pin, pool: tunnel_pool, host: host.clone() };
             tokio::spawn(async move {
                 let upgraded = match hyper::upgrade::on(req).await {
                     Ok(u) => u,

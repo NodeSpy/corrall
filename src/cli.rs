@@ -6,7 +6,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use serde_json::{json, Value};
 
-use crate::config::{AccountConfig, AccountType, Config, RouteConfig, Threshold};
+use crate::config::{AccountConfig, AccountType, Config, PoolConfig, RouteConfig, Threshold};
 use crate::oauth;
 
 #[derive(Parser, Debug)]
@@ -31,6 +31,9 @@ pub enum Command {
     Accounts {
         #[arg(short, long)]
         verbose: bool,
+        /// Only accounts in this pool
+        #[arg(long)]
+        pool: Option<String>,
     },
     /// Show live proxy status (needs a running server)
     Status {
@@ -41,13 +44,29 @@ pub enum Command {
         color: String,
     },
     /// Make the running server prefer one account
-    Switch { name: Option<String> },
+    Switch {
+        name: Option<String>,
+        #[arg(long)]
+        pool: Option<String>,
+    },
     /// Remove an account
-    Remove { name: String },
+    Remove {
+        name: String,
+        #[arg(long)]
+        pool: Option<String>,
+    },
     /// Exclude an account from rotation
-    Disable { name: String },
+    Disable {
+        name: String,
+        #[arg(long)]
+        pool: Option<String>,
+    },
     /// Re-enable an account (also clears a stuck error state)
-    Enable { name: String },
+    Enable {
+        name: String,
+        #[arg(long)]
+        pool: Option<String>,
+    },
     /// Set rotation priority (lower = preferred)
     Priority {
         name: String,
@@ -56,13 +75,27 @@ pub enum Command {
         first: bool,
         #[arg(long)]
         last: bool,
+        #[arg(long)]
+        pool: Option<String>,
     },
     /// Show or set the switch threshold (percent, or bucket=percent)
-    Threshold { value: Option<String> },
+    Threshold {
+        value: Option<String>,
+        #[arg(long)]
+        pool: Option<String>,
+    },
     /// Spread new sessions across equal-priority accounts (on|off)
-    Distribute { value: Option<String> },
+    Distribute {
+        value: Option<String>,
+        #[arg(long)]
+        pool: Option<String>,
+    },
     /// Background quota probe interval in seconds (off|N)
-    Probe { value: Option<String> },
+    Probe {
+        value: Option<String>,
+        #[arg(long)]
+        pool: Option<String>,
+    },
     /// Keep idle accounts' 5h windows running (off|N seconds, min 60; spends quota)
     Warmup { value: Option<String> },
     /// Expiry-pressure routing (on|off), with --tolerance and --preempt
@@ -72,6 +105,8 @@ pub enum Command {
         tolerance: Option<f64>,
         #[arg(long)]
         preempt: Option<String>,
+        #[arg(long)]
+        pool: Option<String>,
     },
     /// Session titles in the activity log (on|off)
     Titles { value: Option<String> },
@@ -79,6 +114,13 @@ pub enum Command {
     Route {
         #[command(subcommand)]
         cmd: Option<RouteCmd>,
+        #[arg(long)]
+        pool: Option<String>,
+    },
+    /// Named account pools, each with its own rotation
+    Pool {
+        #[command(subcommand)]
+        cmd: Option<PoolCmd>,
     },
     /// Print shell export lines that point Claude Code at the proxy
     Env(EnvArgs),
@@ -103,6 +145,8 @@ pub enum Command {
         path: String,
         #[arg(long)]
         account: Option<String>,
+        #[arg(long)]
+        pool: Option<String>,
     },
 }
 
@@ -136,6 +180,9 @@ pub struct LoginArgs {
     /// Account name (default: email from the profile)
     #[arg(long)]
     pub name: Option<String>,
+    /// Pool to put the account in (created if new; moves an existing account)
+    #[arg(long)]
+    pub pool: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -151,6 +198,9 @@ pub struct ImportArgs {
     pub codex: bool,
     #[arg(long)]
     pub name: Option<String>,
+    /// Pool to put the account in (created if new; moves an existing account)
+    #[arg(long)]
+    pub pool: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -158,6 +208,9 @@ pub struct EnvArgs {
     /// Base-URL routing only (no forward proxy / CA)
     #[arg(long)]
     pub no_mitm: bool,
+    /// Route through this pool (default: the configured default pool)
+    #[arg(long)]
+    pub pool: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -167,6 +220,9 @@ pub struct RunArgs {
     /// Launch claude directly if the proxy is down
     #[arg(long)]
     pub auto_fallback: bool,
+    /// Route through this pool (default: the configured default pool)
+    #[arg(long)]
+    pub pool: Option<String>,
     /// Arguments passed to claude
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub args: Vec<String>,
@@ -188,6 +244,56 @@ pub enum RouteCmd {
     },
     Rm {
         name: String,
+    },
+}
+
+/// Settings shared by `pool add` and `pool set`. Every field is optional: an
+/// omitted flag leaves that setting alone, so `set` can change one knob without
+/// restating the rest.
+#[derive(Args, Debug, Default)]
+pub struct PoolSetArgs {
+    /// Switch threshold: a percent, or bucket=percent (bucket=default to clear)
+    #[arg(long)]
+    pub threshold: Option<String>,
+    /// Spread new sessions across equal-priority accounts (on|off)
+    #[arg(long)]
+    pub distribute: Option<String>,
+    /// Background quota probe interval in seconds (off|N)
+    #[arg(long)]
+    pub probe: Option<String>,
+    /// Seconds to hold a request while waiting for quota (0 = off)
+    #[arg(long)]
+    pub hold: Option<u64>,
+    /// Move these accounts into the pool
+    #[arg(long, value_delimiter = ',')]
+    pub account: Vec<String>,
+    /// Serve requests that carry no /pool/ prefix from this pool
+    #[arg(long)]
+    pub make_default: bool,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum PoolCmd {
+    /// List pools, their accounts and their settings
+    List,
+    /// Create a pool (or change one that exists)
+    Add {
+        name: String,
+        #[command(flatten)]
+        set: PoolSetArgs,
+    },
+    /// Change a pool's settings
+    Set {
+        name: String,
+        #[command(flatten)]
+        set: PoolSetArgs,
+    },
+    /// Delete a pool. It must be empty unless --force.
+    Rm {
+        name: String,
+        /// Delete the pool's accounts along with it
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -241,27 +347,109 @@ pub async fn notify_reload(cfg: &Config) {
     let _ = control_post(cfg, "/teamclaude/reload", json!({})).await;
 }
 
-fn find_account_mut<'a>(cfg: &'a mut Config, name: &str) -> Result<&'a mut AccountConfig> {
-    let idx = cfg.find_account_idx(name).ok_or_else(|| anyhow!("no account matches \"{name}\""))?;
-    Ok(&mut cfg.accounts[idx])
+/// Resolve a `--pool` flag to a configured pool name, defaulting to the pool
+/// that serves unprefixed requests. An unknown name is an error rather than a
+/// silent fallback: on the CLI a typo should not quietly retarget the command.
+fn pool_name(cfg: &Config, pool: Option<&str>) -> Result<String> {
+    match pool {
+        None => Ok(cfg.default_pool.clone()),
+        Some(p) if cfg.pools.contains_key(p) => Ok(p.to_string()),
+        Some(p) => bail!("no pool named \"{p}\"; `teamclaude pool list` shows the configured pools"),
+    }
 }
 
-fn upsert_oauth(cfg: &mut Config, name: &str, tokens: &oauth::Tokens, profile: Option<&oauth::Profile>) -> bool {
-    let existing = profile
+/// The pool an account-adding command should write to. Unlike [`pool_name`],
+/// `--pool` may name a pool that does not exist yet: `login --pool work` is how
+/// you create one.
+fn target_pool(cfg: &mut Config, pool: Option<&str>) -> Result<String> {
+    let Some(p) = pool else { return Ok(cfg.default_pool.clone()) };
+    let fresh = !cfg.pools.contains_key(p);
+    cfg.ensure_pool(p)?;
+    if fresh {
+        eprintln!("Created pool \"{p}\"");
+    }
+    Ok(p.to_string())
+}
+
+/// `" in pool \"x\""`, or nothing when the command did not name a pool.
+fn pool_note(pool: Option<&str>) -> String {
+    pool.map(|p| format!(" in pool \"{p}\"")).unwrap_or_default()
+}
+
+fn pool_of<'a>(cfg: &'a Config, pool: Option<&str>) -> Result<&'a PoolConfig> {
+    let name = pool_name(cfg, pool)?;
+    Ok(cfg.pool(&name).expect("pool_name only returns configured pools"))
+}
+
+fn pool_mut_of<'a>(cfg: &'a mut Config, pool: Option<&str>) -> Result<&'a mut PoolConfig> {
+    let name = pool_name(cfg, pool)?;
+    Ok(cfg.pool_mut(&name).expect("pool_name only returns configured pools"))
+}
+
+/// Locate an account for a command: inside `--pool` when one was given, and
+/// anywhere in the file otherwise. Searching every pool by default keeps
+/// `teamclaude disable <name>` working exactly as it did before pools existed.
+fn locate(cfg: &Config, pool: Option<&str>, needle: &str) -> Result<(String, usize)> {
+    let found = match pool {
+        Some(p) => {
+            let p = pool_name(cfg, Some(p))?;
+            cfg.find_account_idx_in(&p, needle).map(|i| (p, i))
+        }
+        None => cfg.find_account(needle),
+    };
+    found.ok_or_else(|| match pool {
+        Some(p) => anyhow!("no account in pool \"{p}\" matches \"{needle}\""),
+        None => anyhow!("no account matches \"{needle}\""),
+    })
+}
+
+fn find_account_mut<'a>(cfg: &'a mut Config, pool: Option<&str>, name: &str) -> Result<&'a mut AccountConfig> {
+    let (p, i) = locate(cfg, pool, name)?;
+    Ok(&mut cfg.pool_mut(&p).expect("locate returns a configured pool").accounts[i])
+}
+
+/// The first account in the file matching `pred`, with the pool holding it.
+/// Pools are searched in display order, so the default pool wins a tie.
+fn locate_by(cfg: &Config, mut pred: impl FnMut(&AccountConfig) -> bool) -> Option<(String, usize)> {
+    cfg.pool_names().into_iter().find_map(|p| cfg.pool(&p).and_then(|pc| pc.accounts.iter().position(&mut pred)).map(|i| (p, i)))
+}
+
+/// The account at `found`, guaranteed to live in `pool` — moved there if it was
+/// somewhere else, created from `new` if `found` is `None`. Moving rather than
+/// copying matters: two pools rotating the same credential would double-spend
+/// one account's quota without either fleet knowing.
+///
+/// `pool` must already be a valid name — callers go through
+/// [`Config::ensure_pool`], which is what checks the charset.
+fn entry_at<'a>(cfg: &'a mut Config, pool: &str, found: Option<(String, usize)>, new: impl FnOnce() -> AccountConfig) -> (&'a mut AccountConfig, bool) {
+    match found {
+        Some((from, i)) if from == pool => (&mut cfg.pool_mut(&from).expect("located pool exists").accounts[i], true),
+        Some((from, i)) => {
+            let a = cfg.pool_mut(&from).expect("located pool exists").accounts.remove(i);
+            let dst = cfg.pools.entry(pool.to_string()).or_default();
+            dst.accounts.push(a);
+            (dst.accounts.last_mut().unwrap(), true)
+        }
+        None => {
+            let dst = cfg.pools.entry(pool.to_string()).or_default();
+            dst.accounts.push(new());
+            (dst.accounts.last_mut().unwrap(), false)
+        }
+    }
+}
+
+fn upsert_oauth(cfg: &mut Config, pool: &str, name: &str, tokens: &oauth::Tokens, profile: Option<&oauth::Profile>) -> bool {
+    // Identify by uuid when the profile gave us one, and only fall back to the
+    // display name — an account first added with `--name` (no profile) has no
+    // uuid to match on yet.
+    let found = profile
         .and_then(|p| p.account_uuid.as_deref())
         .and_then(|au| {
             let ou = profile.and_then(|p| p.org_uuid.as_deref());
-            cfg.accounts.iter().position(|a| a.account_uuid.as_deref() == Some(au) && (ou.is_none() || a.org_uuid.as_deref() == ou))
+            locate_by(cfg, |a| a.account_uuid.as_deref() == Some(au) && (ou.is_none() || a.org_uuid.as_deref() == ou))
         })
-        .or_else(|| cfg.accounts.iter().position(|a| a.name == name));
-    let entry = match existing {
-        Some(i) => &mut cfg.accounts[i],
-        None => {
-            cfg.accounts.push(AccountConfig { name: name.to_string(), kind: AccountType::Oauth, ..Default::default() });
-            cfg.accounts.last_mut().unwrap()
-        }
-    };
-    let updated = existing.is_some();
+        .or_else(|| locate_by(cfg, |a| a.name == name));
+    let (entry, updated) = entry_at(cfg, pool, found, || AccountConfig { name: name.to_string(), kind: AccountType::Oauth, ..Default::default() });
     entry.name = name.to_string();
     entry.kind = AccountType::Oauth;
     entry.import_from = None;
@@ -282,7 +470,7 @@ fn upsert_oauth(cfg: &mut Config, name: &str, tokens: &oauth::Tokens, profile: O
 fn display_name(profile: &oauth::Profile, cfg: &Config) -> String {
     let email = profile.email.clone().or(profile.display_name.clone()).unwrap_or_else(|| "account".into());
     let same_email_other_org =
-        cfg.accounts.iter().any(|a| a.email.as_deref() == Some(email.as_str()) && a.org_uuid.is_some() && a.org_uuid != profile.org_uuid);
+        cfg.all_accounts().any(|(_, a)| a.email.as_deref() == Some(email.as_str()) && a.org_uuid.is_some() && a.org_uuid != profile.org_uuid);
     match (&profile.org_name, same_email_other_org) {
         (Some(org), true) => format!("{email} ({org})"),
         _ => email,
@@ -294,6 +482,7 @@ fn display_name(profile: &oauth::Profile, cfg: &Config) -> String {
 pub async fn login(args: LoginArgs) -> Result<()> {
     let mut cfg = Config::load_or_create()?;
     crate::upstream::init(&cfg)?;
+    let want_pool = args.pool.clone();
     if args.api {
         eprint!("Anthropic API key: ");
         let key = read_secret()?;
@@ -302,21 +491,14 @@ pub async fn login(args: LoginArgs) -> Result<()> {
         }
         let name = args.name.unwrap_or_else(|| format!("api-{}", &key[key.len().saturating_sub(6)..]));
         Config::update(|c| {
-            if let Some(a) = c.accounts.iter_mut().find(|a| a.name == name) {
-                a.api_key = Some(key.clone());
-                a.kind = AccountType::Apikey;
-            } else {
-                c.accounts.push(AccountConfig {
-                    name: name.clone(),
-                    kind: AccountType::Apikey,
-                    api_key: Some(key.clone()),
-                    priority: 10,
-                    ..Default::default()
-                });
-            }
+            let pool = target_pool(c, want_pool.as_deref())?;
+            let found = locate_by(c, |a| a.name == name);
+            let (entry, _) = entry_at(c, &pool, found, || AccountConfig { name: name.clone(), kind: AccountType::Apikey, priority: 10, ..Default::default() });
+            entry.kind = AccountType::Apikey;
+            entry.api_key = Some(key.clone());
             Ok(())
         })?;
-        eprintln!("Added API key account \"{name}\"");
+        eprintln!("Added API key account \"{name}\"{}", pool_note(want_pool.as_deref()));
         notify_reload(&cfg).await;
         return Ok(());
     }
@@ -325,13 +507,14 @@ pub async fn login(args: LoginArgs) -> Result<()> {
         let access = c.access_token.clone().ok_or_else(|| anyhow!("OpenAI returned no access token"))?;
         let name = args.name.clone().or(c.email.clone()).unwrap_or_else(|| "codex".into());
         let cfg = Config::update(|cfg| {
-            let entry = match cfg.accounts.iter().position(|a| a.is_codex() && (a.account_id == c.account_id && c.account_id.is_some() || a.name == name)) {
-                Some(i) => &mut cfg.accounts[i],
-                None => {
-                    cfg.accounts.push(AccountConfig { name: name.clone(), kind: AccountType::Oauth, provider: Some("codex".into()), ..Default::default() });
-                    cfg.accounts.last_mut().unwrap()
-                }
-            };
+            let pool = target_pool(cfg, want_pool.as_deref())?;
+            let found = locate_by(cfg, |a| a.is_codex() && (a.account_id == c.account_id && c.account_id.is_some() || a.name == name));
+            let (entry, _) = entry_at(cfg, &pool, found, || AccountConfig {
+                name: name.clone(),
+                kind: AccountType::Oauth,
+                provider: Some("codex".into()),
+                ..Default::default()
+            });
             entry.name = name.clone();
             entry.import_from = None;
             entry.access_token = Some(access.clone());
@@ -342,7 +525,11 @@ pub async fn login(args: LoginArgs) -> Result<()> {
             entry.plan_type = c.plan_type.clone().or(entry.plan_type.take());
             Ok(())
         })?;
-        eprintln!("Added Codex account \"{name}\"{}", c.plan_type.as_ref().map(|p| format!(" (plan {p})")).unwrap_or_default());
+        eprintln!(
+            "Added Codex account \"{name}\"{}{}",
+            c.plan_type.as_ref().map(|p| format!(" (plan {p})")).unwrap_or_default(),
+            pool_note(want_pool.as_deref())
+        );
         notify_reload(&cfg).await;
         return Ok(());
     }
@@ -357,7 +544,8 @@ pub async fn login(args: LoginArgs) -> Result<()> {
     };
     let name = args.name.clone().unwrap_or_else(|| display_name(profile.as_ref().unwrap(), &cfg));
     let updated = Config::update(|c| {
-        upsert_oauth(c, &name, &tokens, profile.as_ref());
+        let pool = target_pool(c, want_pool.as_deref())?;
+        upsert_oauth(c, &pool, &name, &tokens, profile.as_ref());
         Ok(())
     })
     .map(|c| {
@@ -367,13 +555,14 @@ pub async fn login(args: LoginArgs) -> Result<()> {
     let _ = updated;
     if let Some(p) = &profile {
         eprintln!(
-            "Logged in as {} ({}){}",
+            "Logged in as {} ({}){}{}",
             name,
             p.org_name.clone().unwrap_or_else(|| "personal".into()),
-            p.rate_limit_tier.as_ref().map(|t| format!(", tier {t}")).unwrap_or_default()
+            p.rate_limit_tier.as_ref().map(|t| format!(", tier {t}")).unwrap_or_default(),
+            pool_note(want_pool.as_deref())
         );
     } else {
-        eprintln!("Added account \"{name}\"");
+        eprintln!("Added account \"{name}\"{}", pool_note(want_pool.as_deref()));
     }
     notify_reload(&cfg).await;
     Ok(())
@@ -395,13 +584,14 @@ pub async fn import(args: ImportArgs) -> Result<()> {
         let access = c.access_token.clone().filter(|t| !t.is_empty()).ok_or_else(|| anyhow!("{from} carries no access token"))?;
         let name = args.name.clone().or(c.email.clone()).unwrap_or_else(|| "codex".into());
         let cfg = Config::update(|cfg| {
-            let entry = match cfg.accounts.iter().position(|a| a.is_codex() && (a.account_id == c.account_id && c.account_id.is_some() || a.name == name)) {
-                Some(i) => &mut cfg.accounts[i],
-                None => {
-                    cfg.accounts.push(AccountConfig { name: name.clone(), kind: AccountType::Oauth, provider: Some("codex".into()), ..Default::default() });
-                    cfg.accounts.last_mut().unwrap()
-                }
-            };
+            let pool = target_pool(cfg, args.pool.as_deref())?;
+            let found = locate_by(cfg, |a| a.is_codex() && (a.account_id == c.account_id && c.account_id.is_some() || a.name == name));
+            let (entry, _) = entry_at(cfg, &pool, found, || AccountConfig {
+                name: name.clone(),
+                kind: AccountType::Oauth,
+                provider: Some("codex".into()),
+                ..Default::default()
+            });
             entry.name = name.clone();
             if args.link {
                 entry.import_from = Some(from.clone());
@@ -419,7 +609,7 @@ pub async fn import(args: ImportArgs) -> Result<()> {
             entry.plan_type = c.plan_type.clone().or(entry.plan_type.take());
             Ok(())
         })?;
-        eprintln!("Imported Codex account \"{name}\"{}", if args.link { " (linked)" } else { "" });
+        eprintln!("Imported Codex account \"{name}\"{}{}", if args.link { " (linked)" } else { "" }, pool_note(args.pool.as_deref()));
         notify_reload(&cfg).await;
         return Ok(());
     }
@@ -436,34 +626,57 @@ pub async fn import(args: ImportArgs) -> Result<()> {
     let name = args.name.clone().unwrap_or_else(|| display_name(profile.as_ref().unwrap(), &cfg));
     let tokens = oauth::Tokens { access_token: access, refresh_token: creds.refresh_token.clone(), expires_at: creds.expires_at.unwrap_or(0) };
     let cfg = Config::update(|c| {
-        upsert_oauth(c, &name, &tokens, profile.as_ref());
+        let pool = target_pool(c, args.pool.as_deref())?;
+        upsert_oauth(c, &pool, &name, &tokens, profile.as_ref());
+        // `upsert_oauth` just put the account in `pool`, so look it up there
+        // rather than anywhere in the file.
+        let i = c.find_account_idx_in(&pool, &name).expect("the account upsert_oauth just wrote");
+        let a = &mut c.pool_mut(&pool).expect("target_pool created it").accounts[i];
         if args.link {
-            let a = c.accounts.iter_mut().find(|a| a.name == name).unwrap();
             a.import_from = Some(args.from.clone());
             a.access_token = None;
             a.refresh_token = None;
             a.expires_at = None;
         }
-        if let Some(a) = c.accounts.iter_mut().find(|a| a.name == name) {
-            if a.subscription_type.is_none() {
-                a.subscription_type = creds.subscription_type.clone();
-            }
+        if a.subscription_type.is_none() {
+            a.subscription_type = creds.subscription_type.clone();
         }
         Ok(())
     })?;
-    eprintln!("Imported \"{name}\"{}", if args.link { " (linked to the credential file)" } else { "" });
+    eprintln!("Imported \"{name}\"{}{}", if args.link { " (linked to the credential file)" } else { "" }, pool_note(args.pool.as_deref()));
     notify_reload(&cfg).await;
     Ok(())
 }
 
-pub fn accounts(verbose: bool) -> Result<()> {
+pub fn accounts(verbose: bool, pool: Option<String>) -> Result<()> {
     let cfg = Config::load()?.ok_or_else(|| anyhow!("no config yet; run `teamclaude login`"))?;
-    if cfg.accounts.is_empty() {
-        println!("No accounts. Run `teamclaude login` or `teamclaude import`.");
+    if let Some(p) = &pool {
+        pool_name(&cfg, Some(p))?;
+    }
+    // The pool column only appears once there is more than one pool, so a
+    // single-pool install sees exactly the table it saw before.
+    let show_pool = pool.is_none() && cfg.pools.len() > 1;
+    let mut listed: Vec<(String, &AccountConfig)> = Vec::new();
+    for p in cfg.pool_names() {
+        if pool.as_deref().is_some_and(|want| want != p) {
+            continue;
+        }
+        for a in &cfg.pool(&p).expect("pool_names lists configured pools").accounts {
+            listed.push((p.clone(), a));
+        }
+    }
+    if listed.is_empty() {
+        match &pool {
+            Some(p) => println!("No accounts in pool \"{p}\"."),
+            None => println!("No accounts. Run `teamclaude login` or `teamclaude import`."),
+        }
         return Ok(());
     }
+    if show_pool {
+        print!("{:<16} ", "POOL");
+    }
     println!("{:<30} {:<7} {:>4} {:<9} {}", "NAME", "TYPE", "PRI", "STATE", if verbose { "DETAILS" } else { "" });
-    for a in &cfg.accounts {
+    for (pool, a) in &listed {
         let kind = match (a.is_codex(), &a.kind) {
             (true, _) => "codex",
             (false, AccountType::Oauth) => "oauth",
@@ -493,6 +706,9 @@ pub fn accounts(verbose: bool) -> Result<()> {
                 details.push_str(&format!("from={i} "));
             }
         }
+        if show_pool {
+            print!("{:<16} ", crate::security::safe_text(pool, 16));
+        }
         println!("{:<30} {:<7} {:>4} {:<9} {}", crate::security::safe_text(&a.name, 30), kind, a.priority, state, details);
     }
     Ok(())
@@ -515,23 +731,43 @@ pub async fn status(json_out: bool, color: &str) -> Result<()> {
     Ok(())
 }
 
-pub async fn switch(name: Option<String>) -> Result<()> {
+pub async fn switch(name: Option<String>, pool: Option<String>) -> Result<()> {
     let cfg = Config::load()?.ok_or_else(|| anyhow!("no config yet"))?;
     crate::upstream::init(&cfg)?;
     match name {
         None => {
             let st = control_get(&cfg, "/teamclaude/status").await?;
-            for a in st.get("accounts").and_then(Value::as_array).unwrap_or(&vec![]) {
-                let cur = a.get("current").and_then(Value::as_bool).unwrap_or(false);
-                println!("{} {}", if cur { "►" } else { " " }, a.get("name").and_then(Value::as_str).unwrap_or("?"));
+            // Every pool's accounts, so `switch` with no argument still shows
+            // the whole set you could switch to.
+            let empty = vec![];
+            let pools = st.get("pools").and_then(Value::as_array).unwrap_or(&empty);
+            let multi = pools.len() > 1;
+            for p in pools {
+                let this = p.get("pool").and_then(Value::as_str).unwrap_or("?");
+                if pool.as_deref().is_some_and(|want| want != this) {
+                    continue;
+                }
+                for a in p.get("accounts").and_then(Value::as_array).unwrap_or(&empty) {
+                    let cur = a.get("current").and_then(Value::as_bool).unwrap_or(false);
+                    let name = a.get("name").and_then(Value::as_str).unwrap_or("?");
+                    let where_ = if multi { format!("{this}/") } else { String::new() };
+                    println!("{} {where_}{name}", if cur { "►" } else { " " });
+                }
             }
         }
         Some(n) => {
-            let r = control_post(&cfg, "/teamclaude/switch", json!({ "account": n })).await?;
+            // The server scopes the search to `pool` when we send one and
+            // searches every pool when we do not.
+            let mut body = json!({ "account": n });
+            if let Some(p) = &pool {
+                body["pool"] = json!(p);
+            }
+            let r = control_post(&cfg, "/teamclaude/switch", body).await?;
             if r.get("ok").and_then(Value::as_bool).unwrap_or(false) {
                 println!(
-                    "Switched to {}{}",
+                    "Switched to {}{}{}",
                     r.get("account").and_then(Value::as_str).unwrap_or("?"),
+                    r.get("pool").and_then(Value::as_str).map(|p| format!(" in pool \"{p}\"")).unwrap_or_default(),
                     r.get("blocked").and_then(Value::as_str).map(|b| format!(" (note: {b})")).unwrap_or_default()
                 );
             } else {
@@ -542,20 +778,20 @@ pub async fn switch(name: Option<String>) -> Result<()> {
     Ok(())
 }
 
-pub async fn remove(name: String) -> Result<()> {
+pub async fn remove(name: String, pool: Option<String>) -> Result<()> {
     let cfg = Config::update(|c| {
-        let idx = c.find_account_idx(&name).ok_or_else(|| anyhow!("no account matches \"{name}\""))?;
-        let removed = c.accounts.remove(idx);
-        eprintln!("Removed \"{}\"", removed.name);
+        let (p, i) = locate(c, pool.as_deref(), &name)?;
+        let removed = c.pool_mut(&p).expect("locate returns a configured pool").accounts.remove(i);
+        eprintln!("Removed \"{}\" from pool \"{p}\"", removed.name);
         Ok(())
     })?;
     notify_reload(&cfg).await;
     Ok(())
 }
 
-pub async fn set_disabled(name: String, disabled: bool) -> Result<()> {
+pub async fn set_disabled(name: String, disabled: bool, pool: Option<String>) -> Result<()> {
     let cfg = Config::update(|c| {
-        let a = find_account_mut(c, &name)?;
+        let a = find_account_mut(c, pool.as_deref(), &name)?;
         a.disabled = disabled;
         eprintln!("{} \"{}\"", if disabled { "Disabled" } else { "Enabled" }, a.name);
         Ok(())
@@ -564,16 +800,20 @@ pub async fn set_disabled(name: String, disabled: bool) -> Result<()> {
     Ok(())
 }
 
-pub async fn priority(name: String, value: Option<i32>, first: bool, last: bool) -> Result<()> {
+pub async fn priority(name: String, value: Option<i32>, first: bool, last: bool, pool: Option<String>) -> Result<()> {
     let cfg = Config::update(|c| {
+        // Priority orders one pool's rotation, so --first/--last are relative
+        // to the accounts the account in question actually competes with.
+        let (owner, _) = locate(c, pool.as_deref(), &name)?;
+        let peers = &c.pool(&owner).expect("locate returns a configured pool").accounts;
         let v = if first {
-            c.accounts.iter().map(|a| a.priority).min().unwrap_or(0) - 1
+            peers.iter().map(|a| a.priority).min().unwrap_or(0) - 1
         } else if last {
-            c.accounts.iter().map(|a| a.priority).max().unwrap_or(0) + 1
+            peers.iter().map(|a| a.priority).max().unwrap_or(0) + 1
         } else {
             value.ok_or_else(|| anyhow!("give a number, --first or --last"))?
         };
-        let a = find_account_mut(c, &name)?;
+        let a = find_account_mut(c, pool.as_deref(), &name)?;
         a.priority = v;
         eprintln!("Priority of \"{}\" is now {v}", a.name);
         Ok(())
@@ -582,37 +822,53 @@ pub async fn priority(name: String, value: Option<i32>, first: bool, last: bool)
     Ok(())
 }
 
-pub async fn threshold(value: Option<String>) -> Result<()> {
+/// Apply a `PCT` or `bucket=PCT` threshold spec to `t` in place.
+fn set_threshold(t: &mut Threshold, v: &str) -> Result<()> {
+    if let Some((bucket, pct)) = v.split_once('=') {
+        let mut table = match t {
+            Threshold::Single(x) => std::collections::BTreeMap::from([("default".to_string(), *x)]),
+            Threshold::Table(t) => t.clone(),
+        };
+        if pct == "default" {
+            table.remove(bucket);
+        } else {
+            let p: f64 = pct.parse().context("percent must be a number")?;
+            if !(1.0..=100.0).contains(&p) {
+                bail!("percent must be 1-100");
+            }
+            table.insert(bucket.to_string(), p / 100.0);
+        }
+        *t = Threshold::Table(table);
+    } else {
+        let p: f64 = v.parse().context("percent must be a number")?;
+        if !(1.0..=100.0).contains(&p) {
+            bail!("percent must be 1-100");
+        }
+        *t = Threshold::Single(p / 100.0);
+    }
+    Ok(())
+}
+
+/// Seconds from an `off|N` argument.
+fn parse_secs(v: &str, min: u64, what: &str) -> Result<u64> {
+    let secs: u64 = if v.eq_ignore_ascii_case("off") { 0 } else { v.parse().context("seconds must be a number or off")? };
+    if secs != 0 && secs < min {
+        bail!("minimum {what} is {min} seconds");
+    }
+    Ok(secs)
+}
+
+pub async fn threshold(value: Option<String>, pool: Option<String>) -> Result<()> {
     let cfg = match value {
         None => {
             let c = Config::load()?.unwrap_or_default();
-            println!("{}", serde_json::to_string_pretty(&c.switch_threshold)?);
+            println!("{}", serde_json::to_string_pretty(&pool_of(&c, pool.as_deref())?.switch_threshold)?);
             return Ok(());
         }
         Some(v) => Config::update(|c| {
-            if let Some((bucket, pct)) = v.split_once('=') {
-                let mut table = match &c.switch_threshold {
-                    Threshold::Single(x) => std::collections::BTreeMap::from([("default".to_string(), *x)]),
-                    Threshold::Table(t) => t.clone(),
-                };
-                if pct == "default" {
-                    table.remove(bucket);
-                } else {
-                    let p: f64 = pct.parse().context("percent must be a number")?;
-                    if !(1.0..=100.0).contains(&p) {
-                        bail!("percent must be 1-100");
-                    }
-                    table.insert(bucket.to_string(), p / 100.0);
-                }
-                c.switch_threshold = Threshold::Table(table);
-            } else {
-                let p: f64 = v.parse().context("percent must be a number")?;
-                if !(1.0..=100.0).contains(&p) {
-                    bail!("percent must be 1-100");
-                }
-                c.switch_threshold = Threshold::Single(p / 100.0);
-            }
-            eprintln!("switchThreshold = {}", serde_json::to_string(&c.switch_threshold)?);
+            let p = pool_mut_of(c, pool.as_deref())?;
+            set_threshold(&mut p.switch_threshold, &v)?;
+            eprintln!("switchThreshold = {}", serde_json::to_string(&p.switch_threshold)?);
             Ok(())
         })?,
     };
@@ -628,17 +884,17 @@ fn parse_on_off(v: &str) -> Result<bool> {
     }
 }
 
-pub async fn distribute(value: Option<String>) -> Result<()> {
+pub async fn distribute(value: Option<String>, pool: Option<String>) -> Result<()> {
     let cfg = match value {
         None => {
             let c = Config::load()?.unwrap_or_default();
-            println!("distributeSessions: {}", if c.distribute_sessions { "on" } else { "off" });
+            println!("distributeSessions: {}", if pool_of(&c, pool.as_deref())?.distribute_sessions { "on" } else { "off" });
             return Ok(());
         }
         Some(v) => {
             let on = parse_on_off(&v)?;
             Config::update(|c| {
-                c.distribute_sessions = on;
+                pool_mut_of(c, pool.as_deref())?.distribute_sessions = on;
                 eprintln!("distributeSessions: {}", if on { "on" } else { "off" });
                 Ok(())
             })?
@@ -648,20 +904,17 @@ pub async fn distribute(value: Option<String>) -> Result<()> {
     Ok(())
 }
 
-pub async fn probe(value: Option<String>) -> Result<()> {
+pub async fn probe(value: Option<String>, pool: Option<String>) -> Result<()> {
     let cfg = match value {
         None => {
             let c = Config::load()?.unwrap_or_default();
-            println!("quotaProbeSeconds: {}", c.quota_probe_seconds);
+            println!("quotaProbeSeconds: {}", pool_of(&c, pool.as_deref())?.quota_probe_seconds);
             return Ok(());
         }
         Some(v) => {
-            let secs: u64 = if v.eq_ignore_ascii_case("off") { 0 } else { v.parse().context("seconds must be a number or off")? };
-            if secs != 0 && secs < 30 {
-                bail!("minimum probe interval is 30 seconds");
-            }
+            let secs = parse_secs(&v, 30, "probe interval")?;
             Config::update(|c| {
-                c.quota_probe_seconds = secs;
+                pool_mut_of(c, pool.as_deref())?.quota_probe_seconds = secs;
                 eprintln!("quotaProbeSeconds: {secs}");
                 Ok(())
             })?
@@ -679,10 +932,7 @@ pub async fn warmup(value: Option<String>) -> Result<()> {
             return Ok(());
         }
         Some(v) => {
-            let secs: u64 = if v.eq_ignore_ascii_case("off") { 0 } else { v.parse().context("seconds must be a number or off")? };
-            if secs != 0 && secs < 60 {
-                bail!("minimum keep-warm interval is 60 seconds");
-            }
+            let secs = parse_secs(&v, 60, "keep-warm interval")?;
             Config::update(|c| {
                 c.warmup_seconds = secs;
                 eprintln!("warmupSeconds: {secs}{}", if secs > 0 { " (spends a little quota per idle account per window)" } else { "" });
@@ -694,26 +944,27 @@ pub async fn warmup(value: Option<String>) -> Result<()> {
     Ok(())
 }
 
-pub async fn expiry(value: Option<String>, tolerance: Option<f64>, preempt: Option<String>) -> Result<()> {
+pub async fn expiry(value: Option<String>, tolerance: Option<f64>, preempt: Option<String>, pool: Option<String>) -> Result<()> {
     if value.is_none() && tolerance.is_none() && preempt.is_none() {
         let c = Config::load()?.unwrap_or_default();
-        println!("{}", serde_json::to_string_pretty(&c.expiry_routing)?);
+        println!("{}", serde_json::to_string_pretty(&pool_of(&c, pool.as_deref())?.expiry_routing)?);
         return Ok(());
     }
     let cfg = Config::update(|c| {
+        let p = pool_mut_of(c, pool.as_deref())?;
         if let Some(v) = &value {
-            c.expiry_routing.enabled = parse_on_off(v)?;
+            p.expiry_routing.enabled = parse_on_off(v)?;
         }
         if let Some(t) = tolerance {
             if t.is_nan() || t < 1.0 {
                 bail!("tolerance must be >= 1.0");
             }
-            c.expiry_routing.tolerance = t;
+            p.expiry_routing.tolerance = t;
         }
-        if let Some(p) = &preempt {
-            c.expiry_routing.preempt = parse_on_off(p)?;
+        if let Some(x) = &preempt {
+            p.expiry_routing.preempt = parse_on_off(x)?;
         }
-        eprintln!("expiryRouting = {}", serde_json::to_string(&c.expiry_routing)?);
+        eprintln!("expiryRouting = {}", serde_json::to_string(&p.expiry_routing)?);
         Ok(())
     })?;
     notify_reload(&cfg).await;
@@ -740,21 +991,33 @@ pub async fn titles(value: Option<String>) -> Result<()> {
     Ok(())
 }
 
-pub async fn route(cmd: Option<RouteCmd>) -> Result<()> {
+pub async fn route(cmd: Option<RouteCmd>, pool: Option<String>) -> Result<()> {
     match cmd.unwrap_or(RouteCmd::List) {
         RouteCmd::List => {
             let c = Config::load()?.unwrap_or_default();
-            if c.routes.is_empty() {
-                println!("no routes");
+            // Routes belong to a pool. Without --pool, list every pool's, since
+            // that is the whole routing picture.
+            let names = match &pool {
+                Some(p) => vec![pool_name(&c, Some(p))?],
+                None => c.pool_names(),
+            };
+            let multi = names.len() > 1;
+            let mut any = false;
+            for p in &names {
+                for r in &c.pool(p).expect("pool_names lists configured pools").routes {
+                    any = true;
+                    let where_ = if multi { format!("{p}/") } else { String::new() };
+                    println!(
+                        "{:<12} match={:?} accounts={:?}{}",
+                        format!("{where_}{}", r.name),
+                        r.patterns,
+                        r.accounts,
+                        r.bucket.as_ref().map(|b| format!(" bucket={b}")).unwrap_or_default()
+                    );
+                }
             }
-            for r in &c.routes {
-                println!(
-                    "{:<12} match={:?} accounts={:?}{}",
-                    r.name,
-                    r.patterns,
-                    r.accounts,
-                    r.bucket.as_ref().map(|b| format!(" bucket={b}")).unwrap_or_default()
-                );
+            if !any {
+                println!("no routes");
             }
             Ok(())
         }
@@ -768,20 +1031,23 @@ pub async fn route(cmd: Option<RouteCmd>) -> Result<()> {
                 }
             }
             let cfg = Config::update(|c| {
+                // A route can only steer traffic to accounts in its own pool.
+                let owner = pool_name(c, pool.as_deref())?;
                 for a in &accounts {
-                    if c.find_account_idx(a).is_none() {
-                        bail!("no account matches \"{a}\"");
+                    if c.find_account_idx_in(&owner, a).is_none() {
+                        bail!("no account in pool \"{owner}\" matches \"{a}\"");
                     }
                 }
-                c.routes.retain(|r| r.name != name);
-                c.routes.push(RouteConfig {
+                let p = c.pool_mut(&owner).expect("pool_name only returns configured pools");
+                p.routes.retain(|r| r.name != name);
+                p.routes.push(RouteConfig {
                     name: name.clone(),
                     patterns: r#match.clone(),
                     accounts: accounts.clone(),
                     bucket: bucket.clone(),
                     color: color.clone(),
                 });
-                eprintln!("route \"{name}\" saved");
+                eprintln!("route \"{name}\" saved in pool \"{owner}\"");
                 Ok(())
             })?;
             notify_reload(&cfg).await;
@@ -789,18 +1055,131 @@ pub async fn route(cmd: Option<RouteCmd>) -> Result<()> {
         }
         RouteCmd::Rm { name } => {
             let cfg = Config::update(|c| {
-                let n = c.routes.len();
-                c.routes.retain(|r| r.name != name);
-                if c.routes.len() == n {
-                    bail!("no route named \"{name}\"");
+                // Without --pool, remove the route wherever it lives.
+                let owner = match &pool {
+                    Some(p) => pool_name(c, Some(p))?,
+                    None => c
+                        .pool_names()
+                        .into_iter()
+                        .find(|p| c.pool(p).is_some_and(|pc| pc.routes.iter().any(|r| r.name == name)))
+                        .ok_or_else(|| anyhow!("no route named \"{name}\""))?,
+                };
+                let p = c.pool_mut(&owner).expect("pool_name only returns configured pools");
+                let n = p.routes.len();
+                p.routes.retain(|r| r.name != name);
+                if p.routes.len() == n {
+                    bail!("no route named \"{name}\" in pool \"{owner}\"");
                 }
-                eprintln!("route \"{name}\" removed");
+                eprintln!("route \"{name}\" removed from pool \"{owner}\"");
                 Ok(())
             })?;
             notify_reload(&cfg).await;
             Ok(())
         }
     }
+}
+
+pub async fn pool(cmd: Option<PoolCmd>) -> Result<()> {
+    match cmd.unwrap_or(PoolCmd::List) {
+        PoolCmd::List => {
+            let c = Config::load()?.unwrap_or_default();
+            println!("{:<18} {:>8} {:>10} {:>10} {:>7} {:>5}", "NAME", "ACCOUNTS", "THRESHOLD", "DISTRIBUTE", "PROBE", "HOLD");
+            for name in c.pool_names() {
+                let p = c.pool(&name).expect("pool_names lists configured pools");
+                let star = if name == c.default_pool { "*" } else { "" };
+                println!(
+                    "{:<18} {:>8} {:>10} {:>10} {:>7} {:>5}",
+                    crate::security::safe_text(&format!("{name}{star}"), 18),
+                    p.accounts.len(),
+                    serde_json::to_string(&p.switch_threshold)?,
+                    if p.distribute_sessions { "on" } else { "off" },
+                    match p.quota_probe_seconds {
+                        0 => "off".to_string(),
+                        n => format!("{n}s"),
+                    },
+                    p.hold_seconds,
+                );
+            }
+            eprintln!("* serves requests with no /pool/<name> prefix");
+            Ok(())
+        }
+        PoolCmd::Add { name, set } => {
+            let cfg = Config::update(|c| {
+                let fresh = !c.pools.contains_key(&name);
+                c.ensure_pool(&name)?;
+                apply_pool_set(c, &name, &set)?;
+                eprintln!("pool \"{name}\" {}", if fresh { "created" } else { "updated" });
+                Ok(())
+            })?;
+            notify_reload(&cfg).await;
+            Ok(())
+        }
+        PoolCmd::Set { name, set } => {
+            let cfg = Config::update(|c| {
+                let name = pool_name(c, Some(&name))?;
+                apply_pool_set(c, &name, &set)?;
+                eprintln!("pool \"{name}\" updated");
+                Ok(())
+            })?;
+            notify_reload(&cfg).await;
+            Ok(())
+        }
+        PoolCmd::Rm { name, force } => {
+            let cfg = Config::update(|c| {
+                let name = pool_name(c, Some(&name))?;
+                if name == c.default_pool {
+                    bail!("\"{name}\" is the default pool; point defaultPool elsewhere first (`teamclaude pool set <other> --make-default`)");
+                }
+                let held = c.pool(&name).map(|p| p.accounts.len()).unwrap_or(0);
+                if held > 0 && !force {
+                    bail!(
+                        "pool \"{name}\" still holds {held} account(s); move them with \
+                         `teamclaude pool set <other> --account <name>`, or pass --force to delete them with the pool"
+                    );
+                }
+                c.pools.remove(&name);
+                eprintln!("pool \"{name}\" removed{}", if held > 0 { format!(" with {held} account(s)") } else { String::new() });
+                Ok(())
+            })?;
+            notify_reload(&cfg).await;
+            Ok(())
+        }
+    }
+}
+
+/// Apply `pool add`/`pool set` flags to an existing pool. Accounts are moved in
+/// before the knobs are written so a single command can both populate a pool and
+/// configure it.
+fn apply_pool_set(c: &mut Config, name: &str, set: &PoolSetArgs) -> Result<()> {
+    for want in &set.account {
+        let (from, i) = locate(c, None, want)?;
+        if from == name {
+            continue;
+        }
+        let a = c.pool_mut(&from).expect("locate returns a configured pool").accounts.remove(i);
+        eprintln!("moved \"{}\" from pool \"{from}\" to \"{name}\"", a.name);
+        c.pool_mut(name).expect("caller created the pool").accounts.push(a);
+    }
+    let probe = set.probe.as_deref().map(|v| parse_secs(v, 30, "probe interval")).transpose()?;
+    let distribute = set.distribute.as_deref().map(parse_on_off).transpose()?;
+    let p = c.pool_mut(name).expect("caller created the pool");
+    if let Some(t) = &set.threshold {
+        set_threshold(&mut p.switch_threshold, t)?;
+    }
+    if let Some(on) = distribute {
+        p.distribute_sessions = on;
+    }
+    if let Some(secs) = probe {
+        p.quota_probe_seconds = secs;
+    }
+    if let Some(h) = set.hold {
+        p.hold_seconds = h;
+    }
+    if set.make_default {
+        c.default_pool = name.to_string();
+        eprintln!("defaultPool = \"{name}\"");
+    }
+    Ok(())
 }
 
 fn shell_quote(v: &str) -> String {
@@ -816,17 +1195,26 @@ fn pin_component(s: &str) -> String {
 /// in the environment when the proxy is bound off-loopback (a remote client
 /// needs it); on loopback the exemption applies and no secret leaks into the
 /// process tree of every tool claude spawns.
-pub fn env_lines(cfg: &Config, use_mitm: bool, pin: Option<&str>) -> Vec<String> {
+///
+/// `pool` selects a fleet. In base-URL mode it becomes a `/pool/<name>` path
+/// prefix; in MITM mode there is no local URL to carry it, so it rides in the
+/// proxy username next to the optional account pin as `[<pin>]~<pool>`. The
+/// default pool is never named in either form: an install with one pool emits
+/// byte-for-byte the lines it emitted before pools existed.
+pub fn env_lines(cfg: &Config, use_mitm: bool, pin: Option<&str>, pool: Option<&str>) -> Vec<String> {
     let port = cfg.proxy.port;
     let mut lines = Vec::new();
     let loopback = crate::security::is_loopback_host(&cfg.bind_host());
     let key = if loopback && !cfg.proxy.require_key_on_loopback { "" } else { cfg.proxy.api_key.as_str() };
+    let named = pool.filter(|p| *p != cfg.default_pool);
     if use_mitm {
-        let userinfo = match (pin, key.is_empty()) {
-            (Some(p), _) => format!("{}:{}@", pin_component(p), pin_component(key)),
-            (None, false) => format!(":{}@", pin_component(key)),
-            (None, true) => String::new(),
+        let user = match (pin, named) {
+            (Some(p), Some(pool)) => format!("{p}{}{pool}", crate::pools::MITM_POOL_SEP),
+            (Some(p), None) => p.to_string(),
+            (None, Some(pool)) => format!("{}{pool}", crate::pools::MITM_POOL_SEP),
+            (None, None) => String::new(),
         };
+        let userinfo = if user.is_empty() && key.is_empty() { String::new() } else { format!("{}:{}@", pin_component(&user), pin_component(key)) };
         let url = format!("http://{userinfo}127.0.0.1:{port}");
         for v in ["HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"] {
             lines.push(format!("export {v}={}", shell_quote(&url)));
@@ -836,8 +1224,11 @@ pub fn env_lines(cfg: &Config, use_mitm: bool, pin: Option<&str>) -> Vec<String>
         lines.push(format!("export NODE_EXTRA_CA_CERTS={}", shell_quote(&crate::proxy::mitm::ca_cert_path().to_string_lossy())));
         lines.push("unset ANTHROPIC_BASE_URL".into());
     } else {
-        let prefix = pin.map(|p| format!("/tc-acct/{}", pin_component(p))).unwrap_or_default();
-        lines.push(format!("export ANTHROPIC_BASE_URL=http://127.0.0.1:{port}{prefix}"));
+        // The server strips `/pool/<name>` before it looks for `/tc-acct/`, so
+        // the pool keyword comes first.
+        let pool_prefix = named.map(|p| format!("{}{p}", crate::pools::POOL_PREFIX)).unwrap_or_default();
+        let pin_prefix = pin.map(|p| format!("/tc-acct/{}", pin_component(p))).unwrap_or_default();
+        lines.push(format!("export ANTHROPIC_BASE_URL=http://127.0.0.1:{port}{pool_prefix}{pin_prefix}"));
         if !key.is_empty() {
             lines.push("unset ANTHROPIC_AUTH_TOKEN".into());
             lines.push(format!("export ANTHROPIC_API_KEY={}", shell_quote(key)));
@@ -846,24 +1237,45 @@ pub fn env_lines(cfg: &Config, use_mitm: bool, pin: Option<&str>) -> Vec<String>
     if pin.is_some() {
         lines.push("unset TC_ACCT".into());
     }
-    if cfg.hold_seconds > 0 {
-        lines.push(format!("export API_TIMEOUT_MS={}", cfg.hold_seconds * 1000 + 60_000));
+    if named.is_some() {
+        lines.push("unset TC_POOL".into());
+    }
+    let hold = pool_of(cfg, pool).map(|p| p.hold_seconds).unwrap_or(0);
+    if hold > 0 {
+        lines.push(format!("export API_TIMEOUT_MS={}", hold * 1000 + 60_000));
     }
     lines
 }
 
-pub fn env(args: EnvArgs) -> Result<()> {
-    let cfg = Config::load()?.ok_or_else(|| anyhow!("no config yet"))?;
+/// The pin and pool a launch-context command should use: the flag if given,
+/// then the environment. `TC_POOL` lets a shell wrapper choose a pool the same
+/// way `TC_ACCT` already chooses an account.
+fn launch_target(cfg: &Config, pool_flag: Option<&str>) -> Result<(Option<String>, Option<String>)> {
     let pin = std::env::var("TC_ACCT").ok().filter(|s| !s.trim().is_empty());
+    let pool = match pool_flag {
+        Some(p) => Some(pool_name(cfg, Some(p))?),
+        None => match std::env::var("TC_POOL").ok().filter(|s| !s.trim().is_empty()) {
+            Some(p) => Some(pool_name(cfg, Some(&p)).context("TC_POOL")?),
+            None => None,
+        },
+    };
     if let Some(p) = &pin {
-        if cfg.find_account_idx(p).is_none() {
-            bail!("TC_ACCT={p} matches no configured account");
+        // A pin only resolves inside the pool serving the request.
+        let scope = pool.clone().unwrap_or_else(|| cfg.default_pool.clone());
+        if cfg.find_account_idx_in(&scope, p).is_none() {
+            bail!("TC_ACCT={p} matches no account in pool \"{scope}\"");
         }
     }
+    Ok((pin, pool))
+}
+
+pub fn env(args: EnvArgs) -> Result<()> {
+    let cfg = Config::load()?.ok_or_else(|| anyhow!("no config yet"))?;
+    let (pin, pool) = launch_target(&cfg, args.pool.as_deref())?;
     if !args.no_mitm {
         crate::proxy::mitm::ensure_certs(&["api.anthropic.com".to_string()])?;
     }
-    for l in env_lines(&cfg, !args.no_mitm, pin.as_deref()) {
+    for l in env_lines(&cfg, !args.no_mitm, pin.as_deref(), pool.as_deref()) {
         println!("{l}");
     }
     Ok(())
@@ -873,10 +1285,10 @@ pub async fn run(args: RunArgs) -> Result<()> {
     let cfg = Config::load()?.ok_or_else(|| anyhow!("no config yet; run `teamclaude login` first"))?;
     crate::upstream::init(&cfg)?;
     let up = control_get(&cfg, "/teamclaude/health").await.is_ok();
-    let pin = std::env::var("TC_ACCT").ok().filter(|s| !s.trim().is_empty());
     let mut cmd = std::process::Command::new("claude");
     cmd.args(&args.args);
     cmd.env_remove("TC_ACCT");
+    cmd.env_remove("TC_POOL");
     if !up {
         if args.auto_fallback {
             eprintln!("[TeamClaude] proxy is not running; launching claude directly (no rotation)");
@@ -884,15 +1296,11 @@ pub async fn run(args: RunArgs) -> Result<()> {
             bail!("proxy is not running on port {}; start `teamclaude server` or pass --auto-fallback", cfg.proxy.port);
         }
     } else {
-        if let Some(p) = &pin {
-            if cfg.find_account_idx(p).is_none() {
-                bail!("TC_ACCT={p} matches no configured account");
-            }
-        }
+        let (pin, pool) = launch_target(&cfg, args.pool.as_deref())?;
         if !args.no_mitm {
             crate::proxy::mitm::ensure_certs(&["api.anthropic.com".to_string()])?;
         }
-        for line in env_lines(&cfg, !args.no_mitm, pin.as_deref()) {
+        for line in env_lines(&cfg, !args.no_mitm, pin.as_deref(), pool.as_deref()) {
             if let Some(rest) = line.strip_prefix("export ") {
                 if let Some((k, v)) = rest.split_once('=') {
                     let v = v.trim_matches('\'').replace("'\"'\"'", "'");
@@ -926,13 +1334,19 @@ pub fn config_cmd(cmd: Option<ConfigCmd>) -> Result<()> {
             for k in &mut red.proxy.client_keys {
                 k.key = crate::security::redact(&k.key);
             }
-            for a in &mut red.accounts {
-                a.access_token = a.access_token.as_deref().map(crate::security::redact);
-                a.refresh_token = a.refresh_token.as_deref().map(crate::security::redact);
-                a.api_key = a.api_key.as_deref().map(crate::security::redact);
+            for p in red.pools.values_mut() {
+                for a in &mut p.accounts {
+                    a.access_token = a.access_token.as_deref().map(crate::security::redact);
+                    a.refresh_token = a.refresh_token.as_deref().map(crate::security::redact);
+                    a.api_key = a.api_key.as_deref().map(crate::security::redact);
+                }
             }
             println!("{}", serde_json::to_string_pretty(&red)?);
-            eprintln!("config OK: {} account(s), bind {}:{}", cfg.accounts.len(), cfg.bind_host(), cfg.proxy.port);
+            let pools = match cfg.pools.len() {
+                0 | 1 => String::new(),
+                n => format!(" in {n} pools"),
+            };
+            eprintln!("config OK: {} account(s){pools}, bind {}:{}", cfg.all_accounts().count(), cfg.bind_host(), cfg.proxy.port);
             Ok(())
         }
     }
@@ -981,18 +1395,26 @@ pub fn service(cmd: ServiceCmd) -> Result<()> {
     }
 }
 
-pub async fn api(path: String, account: Option<String>) -> Result<()> {
+pub async fn api(path: String, account: Option<String>, pool: Option<String>) -> Result<()> {
     let cfg = Config::load()?.ok_or_else(|| anyhow!("no config yet"))?;
     crate::upstream::init(&cfg)?;
     if !path.starts_with('/') {
         bail!("path must start with /");
     }
-    let idx = match account {
-        Some(n) => cfg.find_account_idx(&n).ok_or_else(|| anyhow!("no account matches \"{n}\""))?,
-        None => cfg.accounts.iter().position(|a| !a.disabled).ok_or_else(|| anyhow!("no enabled account"))?,
+    let (owner, idx) = match account {
+        Some(n) => locate(&cfg, pool.as_deref(), &n)?,
+        None => {
+            let owner = pool_name(&cfg, pool.as_deref())?;
+            let idx = pool_of(&cfg, pool.as_deref())?
+                .accounts
+                .iter()
+                .position(|a| !a.disabled)
+                .ok_or_else(|| anyhow!("no enabled account{}", pool_note(pool.as_deref())))?;
+            (owner, idx)
+        }
     };
-    let a = &cfg.accounts[idx];
-    let m = crate::manager::Manager::new(&cfg);
+    let a = &cfg.pool(&owner).expect("located pool exists").accounts[idx];
+    let m = crate::manager::Manager::new(&cfg, &owner);
     let id = a.id.clone().unwrap_or_default();
     let cred = m.ensure_token_fresh(&id, false).await.or_else(|| a.api_key.clone()).ok_or_else(|| anyhow!("no credential for {}", a.name))?;
     let mut req = crate::upstream::client().get(format!("https://api.anthropic.com{path}"));
@@ -1018,13 +1440,53 @@ mod tests {
     fn env_lines_keep_key_out_on_loopback() {
         let mut cfg = Config::default();
         cfg.proxy.api_key = "tc-secret-0123456789abcdef".into();
-        let lines = env_lines(&cfg, true, None).join("\n");
+        let lines = env_lines(&cfg, true, None, None).join("\n");
         assert!(!lines.contains("tc-secret"));
         assert!(lines.contains("HTTPS_PROXY='http://127.0.0.1:3456'"));
-        let lines = env_lines(&cfg, true, Some("me@example.com (Acme)")).join("\n");
+        let lines = env_lines(&cfg, true, Some("me@example.com (Acme)"), None).join("\n");
         assert!(lines.contains("me%40example%2Ecom%20%28Acme%29:@127.0.0.1"));
         cfg.proxy.host = Some("0.0.0.0".into());
-        let lines = env_lines(&cfg, false, None).join("\n");
+        let lines = env_lines(&cfg, false, None, None).join("\n");
         assert!(lines.contains("ANTHROPIC_API_KEY='tc-secret-0123456789abcdef'"));
+    }
+
+    /// Naming the default pool must not change a single byte: an existing
+    /// wrapper doing `eval "$(teamclaude env)"` keeps working untouched.
+    #[test]
+    fn default_pool_is_never_named() {
+        let cfg = Config::default();
+        for mitm in [true, false] {
+            let plain = env_lines(&cfg, mitm, None, None);
+            assert_eq!(plain, env_lines(&cfg, mitm, None, Some(&cfg.default_pool)));
+        }
+    }
+
+    #[test]
+    fn named_pool_rides_the_url_then_the_username() {
+        let mut cfg = Config::default();
+        cfg.ensure_pool("work").unwrap();
+
+        let lines = env_lines(&cfg, false, None, Some("work")).join("\n");
+        assert!(lines.contains("ANTHROPIC_BASE_URL=http://127.0.0.1:3456/pool/work"), "{lines}");
+        // Pool keyword first, then the account pin — the order the server strips them in.
+        let lines = env_lines(&cfg, false, Some("acct1"), Some("work")).join("\n");
+        assert!(lines.contains("ANTHROPIC_BASE_URL=http://127.0.0.1:3456/pool/work/tc-acct/acct1"), "{lines}");
+
+        // MITM has no local URL to hang a path on, so the pool rides the
+        // proxy username; `~` percent-encodes but decodes back before Basic auth.
+        let lines = env_lines(&cfg, true, None, Some("work")).join("\n");
+        assert!(lines.contains("http://%7Ework:@127.0.0.1:3456"), "{lines}");
+        let lines = env_lines(&cfg, true, Some("acct1"), Some("work")).join("\n");
+        assert!(lines.contains("http://acct1%7Ework:@127.0.0.1:3456"), "{lines}");
+    }
+
+    /// A pool's own hold floor is what the client timeout has to clear.
+    #[test]
+    fn hold_seconds_come_from_the_chosen_pool() {
+        let mut cfg = Config::default();
+        cfg.ensure_pool("work").unwrap();
+        cfg.pool_mut("work").unwrap().hold_seconds = 120;
+        assert!(!env_lines(&cfg, false, None, None).iter().any(|l| l.contains("API_TIMEOUT_MS")));
+        assert!(env_lines(&cfg, false, None, Some("work")).contains(&"export API_TIMEOUT_MS=180000".to_string()));
     }
 }

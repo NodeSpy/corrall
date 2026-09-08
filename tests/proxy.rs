@@ -20,8 +20,9 @@ use hyper_util::rt::TokioIo;
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
 
-use teamclaude::config::{AccountConfig, AccountType, Config, ProxyConfig};
+use teamclaude::config::{AccountConfig, AccountType, Config, PoolConfig, ProxyConfig, DEFAULT_POOL};
 use teamclaude::manager::Manager;
+use teamclaude::pools::Pools;
 use teamclaude::proxy::server::{run, Ctx, CtxInner, Metrics};
 
 const KEY: &str = "tc-test-key-0123456789abcdef";
@@ -242,13 +243,15 @@ async fn spawn_proxy(mut cfg: Config) -> Proxy {
     let port = listener.local_addr().unwrap().port();
     drop(listener);
     cfg.proxy.port = port;
-    let manager = Manager::new(&cfg);
+    // These tests drive one pool; `Pools` hands back the default fleet for any
+    // request that arrives without a /pool/<name> prefix.
+    let pools = Pools::new(&cfg);
+    let manager = pools.default();
     let (tx, _) = tokio::sync::broadcast::channel(64);
     let ctx = Ctx(Arc::new(CtxInner {
-        manager: manager.clone(),
+        pools: pools.clone(),
         config: parking_lot::RwLock::new(Arc::new(cfg.clone())),
         logger: None,
-        hold_ms: cfg.hold_seconds * 1000,
         activity: tx,
         reload: None,
         metrics: Metrics::default(),
@@ -288,7 +291,14 @@ async fn post(p: &Proxy, path: &str, body: Value) -> (StatusCode, Value, reqwest
 }
 
 fn cfg_with(accounts: Vec<AccountConfig>) -> Config {
-    Config { accounts, ..Default::default() }
+    let mut c = Config::default();
+    pool_of(&mut c).accounts = accounts;
+    c
+}
+
+/// The default pool, which is where every knob these tests set now lives.
+fn pool_of(c: &mut Config) -> &mut PoolConfig {
+    c.pool_mut(DEFAULT_POOL).expect("default pool always exists")
 }
 
 // ── tests ─────────────────────────────────────────────────────
@@ -400,6 +410,54 @@ async fn streaming_passes_through_and_usage_is_recorded() {
     assert_eq!(items[0]["tokens"]["unified7dSonnet"]["output"], 9);
 }
 
+/// `/pool/<name>` picks a fleet, is stripped before forwarding, composes with
+/// an account pin, and — because it sits under a fixed keyword real API paths
+/// never use — needs no reserved-name list.
+#[tokio::test]
+async fn pool_prefix_routes_to_its_own_fleet() {
+    let mock = spawn_mock().await;
+    let mut cfg = cfg_with(vec![account("a", "tok-a", 0, &mock.url())]);
+    // "v1" would be a reserved word under a bare-prefix scheme. It is not one here.
+    for pool in ["work", "v1"] {
+        cfg.pools.insert(pool.into(), PoolConfig { accounts: vec![account(pool, &format!("tok-{pool}"), 0, &mock.url())], ..Default::default() });
+    }
+    let p = spawn_proxy(cfg).await;
+
+    // No prefix: the default pool, exactly as before pools existed.
+    let (st, v, _) = post(&p, "/v1/messages", msg("claude-opus-5")).await;
+    assert_eq!(st, 200);
+    assert_eq!(v["served_by"], "tok-a");
+    assert_eq!(mock.seen().last().unwrap().path, "/v1/messages");
+
+    for pool in ["work", "v1"] {
+        let (st, v, _) = post(&p, &format!("/pool/{pool}/v1/messages"), msg("claude-opus-5")).await;
+        assert_eq!(st, 200);
+        assert_eq!(v["served_by"], format!("tok-{pool}"), "pool {pool} served the wrong account");
+        assert_eq!(mock.seen().last().unwrap().path, "/v1/messages", "pool prefix stripped");
+    }
+
+    // A pin resolves inside the addressed pool, and both prefixes come off.
+    let (st, v, _) = post(&p, "/pool/work/tc-acct/work/v1/messages", msg("claude-opus-5")).await;
+    assert_eq!(st, 200);
+    assert_eq!(v["served_by"], "tok-work");
+    assert_eq!(mock.seen().last().unwrap().path, "/v1/messages");
+
+    // An unknown pool degrades to the default fleet rather than failing the
+    // request: a stale ANTHROPIC_BASE_URL should not take a client down.
+    let (st, v, _) = post(&p, "/pool/gone/v1/messages", msg("claude-opus-5")).await;
+    assert_eq!(st, 200);
+    assert_eq!(v["served_by"], "tok-a");
+
+    // Each fleet accounts for its own traffic.
+    let st = p.ctx.pools.status(false);
+    let pools = st["pools"].as_array().unwrap();
+    let served =
+        |name: &str| pools.iter().find(|p| p["pool"] == name).and_then(|p| p.pointer("/accounts/0/usage/totalRequests").and_then(Value::as_u64)).unwrap_or(0);
+    assert_eq!(served("default"), 2, "no-prefix plus the unknown-pool fallback");
+    assert_eq!(served("work"), 2, "plain plus pinned");
+    assert_eq!(served("v1"), 1);
+}
+
 #[tokio::test]
 async fn pins_never_fail_over_and_unknown_pin_is_404() {
     let mock = spawn_mock().await;
@@ -476,7 +534,7 @@ async fn websocket_upgrade_is_relayed() {
 async fn blocked_models_and_body_limits() {
     let mock = spawn_mock().await;
     let mut cfg = cfg_with(vec![account("a", "tok-a", 0, &mock.url())]);
-    cfg.blocked_models = vec!["*fable*".into()];
+    pool_of(&mut cfg).blocked_models = vec!["*fable*".into()];
     cfg.proxy.max_body_bytes = 2048;
     let p = spawn_proxy(cfg).await;
     let (st, _, _) = post(&p, "/v1/messages", msg("claude-fable-5-1")).await;
@@ -535,7 +593,7 @@ async fn all_exhausted_returns_429_with_retry_after_then_hold_waits() {
     // With holdSeconds the request waits for the throttle to lift instead.
     let mock2 = spawn_mock().await;
     let mut cfg = cfg_with(vec![account("a", "tok-a", 0, &mock2.url())]);
-    cfg.hold_seconds = 20;
+    pool_of(&mut cfg).hold_seconds = 20;
     let p2 = spawn_proxy(cfg).await;
     mock2.queue("tok-a", Behaviour::QuotaRejected { retry_after: 2 });
     let t0 = std::time::Instant::now();
@@ -549,10 +607,10 @@ async fn all_exhausted_returns_429_with_retry_after_then_hold_waits() {
 async fn storm_control_paces_a_fresh_account() {
     let mock = spawn_mock().await;
     let mut cfg = cfg_with(vec![account("a", "tok-a", 0, &mock.url())]);
-    cfg.storm_ramp.start_conc = 1;
-    cfg.storm_ramp.step_conc = 1;
-    cfg.storm_ramp.step_ms = 150;
-    cfg.storm_ramp.window_ms = 10_000;
+    pool_of(&mut cfg).storm_ramp.start_conc = 1;
+    pool_of(&mut cfg).storm_ramp.step_conc = 1;
+    pool_of(&mut cfg).storm_ramp.step_ms = 150;
+    pool_of(&mut cfg).storm_ramp.window_ms = 10_000;
     let p = spawn_proxy(cfg).await;
     mock.delay_ms.store(120, Ordering::SeqCst);
     let mut tasks = Vec::new();
@@ -571,7 +629,7 @@ async fn storm_control_paces_a_fresh_account() {
 async fn distribute_sessions_pins_and_spreads() {
     let mock = spawn_mock().await;
     let mut cfg = cfg_with(vec![account("a", "tok-a", 0, &mock.url()), account("b", "tok-b", 0, &mock.url())]);
-    cfg.distribute_sessions = true;
+    pool_of(&mut cfg).distribute_sessions = true;
     let p = spawn_proxy(cfg).await;
     let s1 = "11111111-1111-1111-1111-111111111111";
     let s2 = "22222222-2222-2222-2222-222222222222";
@@ -595,7 +653,7 @@ async fn distribute_sessions_pins_and_spreads() {
 async fn routes_restrict_and_route_pin_endpoint_works() {
     let mock = spawn_mock().await;
     let mut cfg = cfg_with(vec![account("a", "tok-a", 0, &mock.url()), account("b", "tok-b", 5, &mock.url())]);
-    cfg.routes.push(teamclaude::config::RouteConfig {
+    pool_of(&mut cfg).routes.push(teamclaude::config::RouteConfig {
         name: "fable".into(),
         patterns: vec!["*fable*".into()],
         accounts: vec!["b".into()],
@@ -689,8 +747,11 @@ async fn control_plane_endpoints() {
     let c = http();
     let metrics = c.get(p.url("/teamclaude/metrics")).send().await.unwrap().text().await.unwrap();
     assert!(metrics.contains("teamclaude_requests_total 1"));
-    assert!(metrics.contains("teamclaude_account_quota_utilization{account=\"a\",bucket=\"unified5h\"} 0.4"));
+    // Per-account series carry the pool they rotate in, so two pools holding
+    // same-named accounts stay distinguishable.
+    assert!(metrics.contains("teamclaude_account_quota_utilization{pool=\"default\",account=\"a\",bucket=\"unified5h\"} 0.4"), "{metrics}");
     let quota: Value = c.get(p.url("/teamclaude/quota")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(quota["pool"], "default");
     assert_eq!(quota["accounts"][0]["unified5h"], 0.4);
     let dash = c.get(p.url("/teamclaude/dashboard")).send().await.unwrap();
     assert_eq!(dash.status(), 200);

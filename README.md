@@ -52,6 +52,9 @@ every reload instead, so a `/login` there is picked up automatically.
 
 ## What it does
 
+- Named pools: several independent fleets on one port, each with its own
+  accounts, thresholds, routes and sessions, addressed by a `/pool/<name>`
+  prefix on the base URL. An install with one pool is unaffected.
 - Rotates to the next account when the 5h session or 7d weekly bucket reaches
   the switch threshold (98% by default), preferring the lowest `priority` and,
   among equals, the account whose weekly window resets soonest.
@@ -106,6 +109,12 @@ teamclaude titles on            # name activity rows after the Claude Code sessi
 teamclaude login --codex        # add an OpenAI Codex subscription
 teamclaude import --codex       # or import the Codex CLI's login
 teamclaude route add fable --match '*fable*' --accounts personal-max
+teamclaude pool list            # pools with their accounts and settings
+teamclaude pool add work        # a second fleet, empty
+teamclaude pool set work --threshold 90 --hold 120
+teamclaude pool set work --account spare@example.com   # move an account in
+teamclaude login --pool work    # add an account to that pool
+teamclaude env --pool work      # export lines pointing at that pool
 teamclaude env                  # export lines for eval "$(teamclaude env)"
 teamclaude ca-path              # where the MITM CA certificate lives
 teamclaude config check         # validate and print a redacted config
@@ -116,20 +125,32 @@ teamclaude --help
 Every account-changing command notifies a running server to reload; there is
 also `POST /teamclaude/reload`.
 
+Every account command takes `--pool <name>` (or `TC_POOL` in the environment)
+and defaults to the pool named by `defaultPool`, so nothing has to change until
+a second pool exists. `teamclaude pool rm` refuses a pool that still holds
+accounts unless `--force` is given.
+
 ## How it works
 
 1. Claude Code talks to the local proxy instead of `api.anthropic.com`, either
    through `ANTHROPIC_BASE_URL` or through `HTTPS_PROXY` plus the local CA
    (`teamclaude run` and `teamclaude env` set both up).
-2. The proxy picks an eligible account, injects that account's real token and
-   rewrites `account_uuid` in the request body to match.
-3. `anthropic-ratelimit-unified-*` response headers feed the session (5h) and
+2. A `/pool/<name>` prefix on the base URL picks the fleet that serves the
+   request; without one it is the pool named by `defaultPool`. The prefix is
+   stripped before forwarding, and an unknown pool falls back to the default
+   rather than failing. In MITM mode there is no local URL to carry it, so the
+   pool rides in the proxy username next to the optional account pin
+   (`http://[<pin>]~<pool>:@127.0.0.1:3456`); `teamclaude env --pool` writes
+   whichever form applies.
+3. The proxy picks an eligible account from that pool, injects the account's
+   real token and rewrites `account_uuid` in the request body to match.
+4. `anthropic-ratelimit-unified-*` response headers feed the session (5h) and
    weekly (7d) quota view, which is persisted to `teamclaude.state.json` and
    survives a restart.
-4. At the threshold, rotation moves on. On a quota 429 the request is resent on
-   another account, so the client never sees the limit while some account still
-   has headroom.
-5. Expiring tokens, transient upstream errors, 401s and organization OAuth
+5. At the threshold, rotation moves on. On a quota 429 the request is resent on
+   another account of the same pool, so the client never sees the limit while
+   some account still has headroom.
+6. Expiring tokens, transient upstream errors, 401s and organization OAuth
    denials are handled inside the proxy and never interrupt the session.
 
 ## Configuration
@@ -139,27 +160,42 @@ Config lives at `~/.config/teamclaude.json` (`$XDG_CONFIG_HOME` and
 keys are preserved so hand edits are safe. A proxy API key is generated on
 first use. See [docs/configuration.md](docs/configuration.md) for every field.
 
+Accounts and rotation settings live inside a pool. A config written before
+pools existed is migrated into `pools.default` on load and re-saved, so an
+upgrade needs no manual work.
+
 ```json
 {
   "proxy": { "port": 3456, "apiKey": "tc-…", "requireKeyOnLoopback": false },
   "upstream": "https://api.anthropic.com",
-  "switchThreshold": 0.98,
-  "holdSeconds": 0,
-  "distributeSessions": false,
-  "quotaProbeSeconds": 0,
-  "accounts": [
-    { "name": "me@example.com", "type": "oauth", "importFrom": "~/.claude/.credentials.json" },
-    { "name": "spare@example.com", "type": "oauth", "priority": 1,
-      "accessToken": "sk-ant-oat01-…", "refreshToken": "sk-ant-ort01-…", "expiresAt": 1774384968427,
-      "maxUsage": { "unified7d": 0.6 } },
-    { "name": "deepseek", "type": "apikey", "priority": 100,
-      "apiKey": "sk-…", "upstream": "https://api.deepseek.com/anthropic",
-      "modelMap": { "claude-sonnet-4-6": "deepseek-v4-pro" },
-      "stripRequestFields": ["context_management"] }
-  ],
-  "routes": [
-    { "name": "fable", "match": ["*fable*"], "accounts": ["me@example.com"] }
-  ]
+  "defaultPool": "default",
+  "pools": {
+    "default": {
+      "switchThreshold": 0.98,
+      "holdSeconds": 0,
+      "distributeSessions": false,
+      "quotaProbeSeconds": 0,
+      "accounts": [
+        { "name": "me@example.com", "type": "oauth", "importFrom": "~/.claude/.credentials.json" },
+        { "name": "spare@example.com", "type": "oauth", "priority": 1,
+          "accessToken": "sk-ant-oat01-…", "refreshToken": "sk-ant-ort01-…", "expiresAt": 1774384968427,
+          "maxUsage": { "unified7d": 0.6 } },
+        { "name": "deepseek", "type": "apikey", "priority": 100,
+          "apiKey": "sk-…", "upstream": "https://api.deepseek.com/anthropic",
+          "modelMap": { "claude-sonnet-4-6": "deepseek-v4-pro" },
+          "stripRequestFields": ["context_management"] }
+      ],
+      "routes": [
+        { "name": "fable", "match": ["*fable*"], "accounts": ["me@example.com"] }
+      ]
+    },
+    "work": {
+      "switchThreshold": 0.9,
+      "accounts": [
+        { "name": "work@example.com", "type": "oauth", "accessToken": "sk-ant-oat01-…" }
+      ]
+    }
+  }
 }
 ```
 
@@ -191,7 +227,7 @@ short:
   ports. The CA private key is never written to disk.
 - **No secret in the process tree.** `teamclaude run`/`env` put the proxy key in
   the environment only when the proxy is bound off-loopback; on loopback the
-  pin travels alone.
+  account pin and pool name travel alone.
 - **OAuth callback hardened.** The login listener binds loopback only and checks
   `state` before trusting an `error` parameter.
 - **No unattended updates.** `teamclaude update` is explicit, verified against the signed checksums, fenced against downgrades and major jumps, and rolls back if the restarted server is unhealthy. The daily check only reports.
@@ -215,7 +251,8 @@ per-client keys, usage dimensions, client token-refresh and Remote Control
 passthrough (including the WebSocket), the state file, the browser dashboard,
 the TUI, and the CLI.
 
-Added: Prometheus metrics, health endpoint, JSON logs (`--log-format json`),
+Added: named pools with `/pool/<name>` routing, Prometheus metrics, health
+endpoint, JSON logs (`--log-format json`),
 `config check`, `import --link`, `requireKeyOnLoopback`, `maxBodyBytes`,
 tunnel allow-lists, graceful shutdown with state persistence, signed release
 builds with provenance attestations, and the security changes above.

@@ -13,7 +13,6 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 use serde_json::Value;
 
-use crate::manager::Manager;
 use crate::prober::Prober;
 use crate::proxy::server::{Activity, Ctx};
 use crate::security::safe_text;
@@ -28,7 +27,6 @@ struct InFlight {
 
 pub struct Tui {
     ctx: Ctx,
-    manager: Manager,
     prober: Prober,
     log: VecDeque<String>,
     inflight: Vec<InFlight>,
@@ -42,8 +40,22 @@ fn ts() -> String {
 }
 
 impl Tui {
-    pub fn new(ctx: Ctx, manager: Manager, prober: Prober, activity_file: Option<std::fs::File>) -> Tui {
-        Tui { ctx, manager, prober, log: VecDeque::new(), inflight: Vec::new(), selecting: None, message: None, activity_file }
+    pub fn new(ctx: Ctx, prober: Prober, activity_file: Option<std::fs::File>) -> Tui {
+        Tui { ctx, prober, log: VecDeque::new(), inflight: Vec::new(), selecting: None, message: None, activity_file }
+    }
+
+    /// The `(pool, account)` pairs the table shows, in display order. This is
+    /// also what the selection cursor walks, so an index means the same thing
+    /// in both places.
+    fn flat_accounts(st: &Value) -> Vec<(String, &Value)> {
+        let mut out = Vec::new();
+        for p in st.get("pools").and_then(Value::as_array).into_iter().flatten() {
+            let pool = p.get("pool").and_then(Value::as_str).unwrap_or("").to_string();
+            for a in p.get("accounts").and_then(Value::as_array).into_iter().flatten() {
+                out.push((pool.clone(), a));
+            }
+        }
+        out
     }
 
     fn push_log(&mut self, line: String) {
@@ -97,16 +109,15 @@ impl Tui {
 
     async fn event_loop(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>, shutdown: &mut tokio::sync::watch::Sender<bool>) -> Result<()> {
         let mut events = EventStream::new();
+        // Every pool's log lines already arrive here as `Activity::Log`.
         let mut activity = self.ctx.activity.subscribe();
-        let mut mgr_events = self.manager.events.subscribe();
         let mut tick = tokio::time::interval(Duration::from_millis(500));
         loop {
-            let st = self.manager.status(false);
+            let st = self.ctx.pools.status(false);
             terminal.draw(|f| self.draw(f, &st))?;
             tokio::select! {
                 _ = tick.tick() => {}
                 Ok(a) = activity.recv() => self.on_activity(a),
-                Ok(m) = mgr_events.recv() => self.push_log(format!("  {}  {m}", ts())),
                 Some(Ok(ev)) = events.next() => {
                     if let Event::Key(k) = ev {
                         if k.kind != KeyEventKind::Press { continue; }
@@ -115,14 +126,15 @@ impl Tui {
                             return Ok(());
                         }
                         if let Some(sel) = self.selecting {
-                            let n = st.get("accounts").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0);
+                            let flat = Self::flat_accounts(&st);
                             match k.code {
                                 KeyCode::Esc | KeyCode::Char('q') => self.selecting = None,
                                 KeyCode::Up | KeyCode::Char('k') => self.selecting = Some(sel.saturating_sub(1)),
-                                KeyCode::Down | KeyCode::Char('j') => self.selecting = Some((sel + 1).min(n.saturating_sub(1))),
+                                KeyCode::Down | KeyCode::Char('j') => self.selecting = Some((sel + 1).min(flat.len().saturating_sub(1))),
                                 KeyCode::Enter => {
-                                    if let Some(id) = st.pointer(&format!("/accounts/{sel}/id")).and_then(Value::as_str) {
-                                        if let Some((name, blocked)) = self.manager.switch_to(id) {
+                                    if let Some((pool, a)) = flat.get(sel) {
+                                        let id = a.get("id").and_then(Value::as_str).unwrap_or_default();
+                                        if let Some((name, blocked)) = self.ctx.pools.get(pool).and_then(|m| m.switch_to(id)) {
                                             self.message = Some(match blocked {
                                                 None => format!("switched to {name}"),
                                                 Some(b) => format!("switched to {name} (currently {b})"),
@@ -175,56 +187,61 @@ impl Tui {
                 n => format!("{n}s"),
             },
         );
-        let header = match self.manager.update_available() {
+        // The release check is daemon-wide and records itself on the default
+        // pool, which is what the status document's top level carries.
+        let header = match st.get("updateAvailable").and_then(Value::as_str) {
             Some(tag) => format!("{header}   UPDATE {tag} available (teamclaude update)"),
             None => header,
         };
         f.render_widget(Paragraph::new(header).style(Style::default().bold()), chunks[0]);
 
-        let rows: Vec<Row> = st
-            .get("accounts")
-            .and_then(Value::as_array)
-            .map(|accts| {
-                accts
-                    .iter()
-                    .enumerate()
-                    .map(|(i, a)| {
-                        let current = a.get("current").and_then(Value::as_bool).unwrap_or(false);
-                        let name = safe_text(a.get("name").and_then(Value::as_str).unwrap_or("?"), 28);
-                        let q = |b: &str| {
-                            let u = a.pointer(&format!("/quota/{b}/utilization")).and_then(Value::as_f64);
-                            let r = a.pointer(&format!("/quota/{b}/resetInSeconds")).and_then(Value::as_i64);
-                            format!("{} {} {}", bar(u, 10), u.map(|x| format!("{:>3.0}%", x * 100.0)).unwrap_or("  ?%".into()), countdown(r))
-                        };
-                        let blocked = a.get("blocked").and_then(Value::as_str);
-                        let status = if a.get("disabled").and_then(Value::as_bool).unwrap_or(false) {
-                            "disabled".into()
-                        } else {
-                            blocked.map(|b| safe_text(b, 30)).unwrap_or_else(|| "ready".into())
-                        };
-                        let style = if self.selecting == Some(i) {
-                            Style::default().bg(Color::Blue).fg(Color::White)
-                        } else if current {
-                            Style::default().fg(Color::Green).bold()
-                        } else if blocked.is_some() {
-                            Style::default().fg(Color::DarkGray)
-                        } else {
-                            Style::default()
-                        };
-                        Row::new(vec![
-                            Cell::from(if current { "►" } else { " " }),
-                            Cell::from(name),
-                            Cell::from(a.get("priority").and_then(Value::as_i64).unwrap_or(0).to_string()),
-                            Cell::from(q("unified5h")),
-                            Cell::from(q("unified7d")),
-                            Cell::from(q("unified7dFable")),
-                            Cell::from(status),
-                        ])
-                        .style(style)
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let flat = Self::flat_accounts(st);
+        let multi = st.get("pools").and_then(Value::as_array).map(|p| p.len() > 1).unwrap_or(false);
+        let mut rows: Vec<Row> = Vec::with_capacity(flat.len() + 2);
+        let mut shown_pool: Option<&str> = None;
+        for (i, (pool, a)) in flat.iter().enumerate() {
+            // With more than one pool, head each block with its name so the
+            // rotation each account competes in is obvious.
+            if multi && shown_pool != Some(pool.as_str()) {
+                shown_pool = Some(pool.as_str());
+                let label = format!("pool {}", safe_text(pool, 24));
+                rows.push(Row::new(vec![Cell::from(""), Cell::from(label)]).style(Style::default().fg(Color::Yellow).bold()));
+            }
+            let current = a.get("current").and_then(Value::as_bool).unwrap_or(false);
+            let name = safe_text(a.get("name").and_then(Value::as_str).unwrap_or("?"), 28);
+            let q = |b: &str| {
+                let u = a.pointer(&format!("/quota/{b}/utilization")).and_then(Value::as_f64);
+                let r = a.pointer(&format!("/quota/{b}/resetInSeconds")).and_then(Value::as_i64);
+                format!("{} {} {}", bar(u, 10), u.map(|x| format!("{:>3.0}%", x * 100.0)).unwrap_or("  ?%".into()), countdown(r))
+            };
+            let blocked = a.get("blocked").and_then(Value::as_str);
+            let status = if a.get("disabled").and_then(Value::as_bool).unwrap_or(false) {
+                "disabled".into()
+            } else {
+                blocked.map(|b| safe_text(b, 30)).unwrap_or_else(|| "ready".into())
+            };
+            let style = if self.selecting == Some(i) {
+                Style::default().bg(Color::Blue).fg(Color::White)
+            } else if current {
+                Style::default().fg(Color::Green).bold()
+            } else if blocked.is_some() {
+                Style::default().fg(Color::DarkGray)
+            } else {
+                Style::default()
+            };
+            rows.push(
+                Row::new(vec![
+                    Cell::from(if current { "►" } else { " " }),
+                    Cell::from(name),
+                    Cell::from(a.get("priority").and_then(Value::as_i64).unwrap_or(0).to_string()),
+                    Cell::from(q("unified5h")),
+                    Cell::from(q("unified7d")),
+                    Cell::from(q("unified7dFable")),
+                    Cell::from(status),
+                ])
+                .style(style),
+            );
+        }
         let table = Table::new(
             rows,
             [
