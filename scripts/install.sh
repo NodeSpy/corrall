@@ -55,7 +55,8 @@ while [ $# -gt 0 ]; do
 done
 
 need() { command -v "$1" >/dev/null 2>&1 || die "$1 is required"; }
-need gh; need tar; need shasum || need sha256sum
+need gh; need tar; need python3; need curl
+command -v sha256sum >/dev/null 2>&1 || command -v shasum >/dev/null 2>&1 || die "sha256sum or shasum is required"
 
 sha256_file() {
   if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'; else shasum -a 256 "$1" | awk '{print $1}'; fi
@@ -185,14 +186,18 @@ if [ -f "$INSTALL_DIR/teamclaude" ] && [ -z "$PREV_NPM_VERSION" ]; then
   run cp -p "$INSTALL_DIR/teamclaude" "$PREV_BINARY_BACKUP"
 fi
 
-cat > "$ROLLBACK_FILE" <<REC
+if [ "$DRY_RUN" = 0 ]; then
+  cat > "$ROLLBACK_FILE" <<REC
 WAS_ACTIVE=$WAS_ACTIVE
 PREV_NPM_VERSION=$PREV_NPM_VERSION
 CONFIG_BACKUP=$CONFIG_BACKUP
 STATE_BACKUP=$STATE_BACKUP
 PREV_BINARY_BACKUP=$PREV_BINARY_BACKUP
 REC
-chmod 600 "$ROLLBACK_FILE"
+  chmod 600 "$ROLLBACK_FILE"
+else
+  printf '   (dry-run) write rollback record to %s\n' "$ROLLBACK_FILE"
+fi
 
 on_failure() {
   local rc=$?
@@ -209,8 +214,15 @@ if [ "$WAS_ACTIVE" = 1 ]; then
   log "Stopping $UNIT"
   run systemctl --user stop "$UNIT"
 fi
-if pgrep -f "teamclaude server" >/dev/null 2>&1 && [ "$DRY_RUN" = 0 ]; then
-  die "a teamclaude server is still running outside systemd; stop it first"
+# A server that is not the unit we just stopped must not share the config.
+unit_pid="$(service_present && systemctl --user show -p MainPID --value "$UNIT" 2>/dev/null || echo 0)"
+strays="$(pgrep -f "teamclaude server" 2>/dev/null | grep -vx "${unit_pid:-0}" | grep -vx "$$" || true)"
+if [ -n "$strays" ] && [ "$DRY_RUN" = 0 ]; then
+  if [ "$MANAGE_SERVICE" = 1 ]; then
+    die "a teamclaude server is running outside systemd (pid $strays); stop it first so two instances never share the config"
+  else
+    warn "another teamclaude server is running (pid $strays); make sure it does not use $CONFIG"
+  fi
 fi
 
 if [ -n "$PREV_NPM_VERSION" ]; then
