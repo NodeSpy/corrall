@@ -1731,7 +1731,11 @@ pub async fn api(path: String, account: Option<String>, pool: Option<String>) ->
     let a = &cfg.pool(&owner).expect("located pool exists").accounts[idx];
     let m = crate::manager::Manager::new(&cfg, &owner);
     let id = a.id.clone().unwrap_or_default();
-    let cred = m.ensure_token_fresh(&id, false).await.or_else(|| a.api_key.clone()).ok_or_else(|| anyhow!("no credential for {}", a.name))?;
+    let cred = m
+        .ensure_token_fresh(&id, false, crate::manager::OnRefreshFail::MarkDead)
+        .await
+        .or_else(|| a.api_key.clone())
+        .ok_or_else(|| anyhow!("no credential for {}", a.name))?;
     let mut req = crate::upstream::client().get(format!("https://api.anthropic.com{path}"));
     req = match a.kind {
         AccountType::Oauth => req.bearer_auth(cred).header("anthropic-beta", oauth::USAGE_BETA),

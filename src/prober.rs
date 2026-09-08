@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
-use crate::manager::Manager;
+use crate::manager::{Manager, OnRefreshFail};
 use crate::oauth::{fetch_profile, fetch_usage, UsageResult};
 use crate::pools::Pools;
 
@@ -16,6 +16,10 @@ use crate::pools::Pools;
 const TICK: Duration = Duration::from_secs(5);
 /// Floor on a pool's probe interval, whatever its config says.
 const MIN_INTERVAL: u64 = 30;
+
+/// Per-account start offset within a probe run, so a fleet does not burst the
+/// token/usage endpoints simultaneously.
+const PROBE_STAGGER_MS: u64 = 300;
 
 #[derive(Clone)]
 pub struct Prober {
@@ -92,21 +96,30 @@ impl Prober {
         let now = crate::quota::now_ms();
         let secs = m.probe_seconds();
         m.probe_run_started(now, if secs > 0 { Some(now + secs as i64 * 1000) } else { None });
-        let tasks: Vec<_> = m.oauth_accounts().into_iter().map(|(id, name)| self.probe_one(m, id, name)).collect();
+        // Stagger the per-account starts so a multi-account pool does not burst
+        // the token/usage endpoints at once (which draws HTTP 429 at boot).
+        let tasks: Vec<_> =
+            m.oauth_accounts().into_iter().enumerate().map(|(i, (id, name))| self.probe_one(m, id, name, i as u64 * PROBE_STAGGER_MS)).collect();
         futures_util::future::join_all(tasks).await;
         m.probe_run_finished(crate::quota::now_ms());
     }
 
-    async fn probe_one(&self, m: &Manager, id: String, name: String) {
+    async fn probe_one(&self, m: &Manager, id: String, name: String, delay_ms: u64) {
+        if delay_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        }
         let started = crate::quota::now_ms();
         m.probe_account_status(&id, "running", started, None, None);
-        let Some(cred) = m.ensure_token_fresh(&id, false).await else {
+        // The probe is diagnostic: it may refresh, but a failure must never
+        // disable the account (OnRefreshFail::Keep). Only live request traffic
+        // marks a refresh token dead.
+        let Some(cred) = m.ensure_token_fresh(&id, false, OnRefreshFail::Keep).await else {
             m.probe_account_status(&id, "error", started, Some(crate::quota::now_ms()), Some("no usable token".into()));
             return;
         };
         let mut result = tokio::time::timeout(Duration::from_secs(15), fetch_usage(&cred)).await.unwrap_or(UsageResult::Error("probe timed out".into()));
         if matches!(result, UsageResult::Unauthorized) {
-            if let Some(c2) = m.ensure_token_fresh(&id, true).await {
+            if let Some(c2) = m.ensure_token_fresh(&id, true, OnRefreshFail::Keep).await {
                 result = tokio::time::timeout(Duration::from_secs(15), fetch_usage(&c2)).await.unwrap_or(UsageResult::Error("probe timed out".into()));
             }
         }

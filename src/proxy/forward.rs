@@ -193,7 +193,7 @@ fn rl_headers(h: &reqwest::header::HeaderMap) -> BTreeMap<String, String> {
 async fn attempt(ctx: &Ctx, mgr: &Manager, info: &ReqInfo, account: &Selected, headers: &HeaderMap, body: &Bytes) -> Attempt {
     // Freshen the OAuth token first (coalesced across callers).
     let credential = match account.kind {
-        AccountType::Oauth => match mgr.ensure_token_fresh(&account.id, false).await {
+        AccountType::Oauth => match mgr.ensure_token_fresh(&account.id, false, crate::manager::OnRefreshFail::MarkDead).await {
             Some(c) => c,
             None => return Attempt::Failover { reason: "no usable token".into(), transient: false },
         },
@@ -305,7 +305,7 @@ async fn attempt(ctx: &Ctx, mgr: &Manager, info: &ReqInfo, account: &Selected, h
             if account.kind == AccountType::Oauth {
                 mgr.log(format!("401 from upstream on \"{}\"; refreshing token", account.name));
                 let before = account.credential.clone();
-                let after = mgr.ensure_token_fresh(&account.id, true).await;
+                let after = mgr.ensure_token_fresh(&account.id, true, crate::manager::OnRefreshFail::MarkDead).await;
                 if after.is_some() && after.as_deref() != Some(before.as_str()) {
                     return Attempt::RetrySame { wait: Duration::ZERO };
                 }
