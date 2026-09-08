@@ -55,12 +55,10 @@ crossterm = { version = "0.28", features = ["event-stream"] }
 parking_lot = "0.12"
 percent-encoding = "2"
 regex = { version = "1", default-features = false, features = ["std", "perf", "unicode-case", "unicode-perl"] }
+tempfile = "3"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-
-[dev-dependencies]
-tempfile = "3"
 
 [profile.release]
 lto = "thin"

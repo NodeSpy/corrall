@@ -179,6 +179,7 @@ Bucket keys: `unified5h`, `unified7d`, `unified7dFable`, `unified7dSonnet`,
 | `TEAMCLAUDE_REFRESH_TIMEOUT_MS` | OAuth refresh timeout, default 30000 |
 | `TEAMCLAUDE_RATE_LIMIT_ABSORB_MAX_SECONDS` | Longest `retry-after` absorbed inline when holding, default 60 |
 | `TEAMCLAUDE_FAMILY_STALE_MS` | How long a spent family (Fable/Sonnet) reading is trusted before revalidation, default 1800000 |
+| `TEAMCLAUDE_REPO` | `owner/repo` `teamclaude update` fetches releases from, default `NodeSpy/teamclaude` (the same knob `scripts/install.sh` reads) |
 
 ## Control endpoints
 

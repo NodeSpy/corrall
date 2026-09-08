@@ -123,6 +123,8 @@ teamclaude env --pool work      # export lines pointing at that pool
 teamclaude env                  # export lines for eval "$(teamclaude env)"
 teamclaude ca-path              # where the MITM CA certificate lives
 teamclaude config check         # validate and print a redacted config
+teamclaude update --check       # is there a newer release?
+teamclaude update               # install it and restart the service
 teamclaude service install      # systemd --user unit (Linux)
 teamclaude --help
 ```
@@ -250,7 +252,9 @@ short:
   account pin and pool name travel alone.
 - **OAuth callback hardened.** The login listener binds loopback only and checks
   `state` before trusting an `error` parameter.
-- **No self-updater.** Update deliberately requires an operator action.
+- **No unattended updates.** `teamclaude update` runs only when you run it, and
+  it refuses an archive whose SHA256 is not the one `SHA256SUMS` publishes (plus
+  the Sigstore signature over that file when cosign is installed).
 - Constant-time key comparison; failed auth is delayed; internal error text is
   never echoed to clients; control characters are stripped from anything that
   reaches a terminal or a log.
@@ -276,9 +280,11 @@ auto-selection, Prometheus metrics, health endpoint, JSON logs
 (`--log-format json`),
 `config check`, `import --link`, `requireKeyOnLoopback`, `maxBodyBytes`,
 tunnel allow-lists, graceful shutdown with state persistence, signed release
-builds with provenance attestations, and the security changes above.
+builds with provenance attestations, a verifying `update` subcommand, and the
+security changes above.
 
-Not ported (by choice): the self-updater, the sx.org residential egress
+Not ported (by choice): the unattended daily self-update (`update` is manual
+and verifying), the sx.org residential egress
 integration, the egress-IP guard, the remote TUI (`attach`), shell alias
 installation, the launchd service file, warm-up wall-clock schedules (interval
 mode only), and the Nix packaging.
@@ -305,6 +311,34 @@ cargo clippy --all-targets -- -D warnings
 ```
 
 Rust 1.80 or newer. No OpenSSL: TLS is rustls with the ring provider.
+
+## Updating
+
+```bash
+teamclaude update --check          # latest release vs. this binary
+teamclaude update                  # download, verify, swap, restart
+teamclaude update --version v2.0.1 # a specific tag (re-install or downgrade)
+teamclaude update --binary ~/.local/bin/teamclaude   # a copy other than this one
+```
+
+`update` consumes the same release assets as `scripts/install.sh`: the archive
+for this OS/arch plus `SHA256SUMS`, fetched with `gh` because the repository is
+private. It refuses to continue unless the archive hashes to what `SHA256SUMS`
+publishes, verifies the Sigstore signature over that file when `cosign` is
+installed (warning, not failing, when it is not), and runs `--version` on the
+new binary before swapping it in.
+
+The swap is a rename inside the binary's own directory, so it is atomic and a
+running server keeps serving from the old inode; a `systemd --user`
+`teamclaude.service` that is active gets restarted afterwards. Unlike the
+original, nothing here updates on a timer — `update` runs when you run it, and
+never touches the config or the state file. A binary built by `cargo` in a
+checkout is refused (rebuild it instead); use `--binary` to point at an
+installed copy.
+
+`scripts/install.sh` remains the more thorough path: it also backs up the config
+and state, refuses to leave two implementations sharing them, waits for
+`/teamclaude/health`, and rolls the whole thing back on failure.
 
 ## Releases
 

@@ -74,6 +74,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Command::CaPath => cli::ca_path(),
         Command::Config { cmd } => cli::config_cmd(cmd),
         Command::Service { cmd } => cli::service(cmd),
+        Command::Update(a) => update::run(&a),
         Command::Api { path, account, pool } => cli::api(path, account, pool).await,
     }
 }
