@@ -1,4 +1,10 @@
-//! Updating an installed release in place.
+//! Updating an installed release in place, and the notify-only check that
+//! tells the operator a release exists. Nothing here ever runs unattended:
+//! `teamclaude update` installs only when invoked, and the background check
+//! only records the latest tag for `status` and the TUI to show.
+//!
+//! Adapted from draft PR #3 by @danielcbaldwin, with a version fence, a
+//! backup + health-checked restart, and the passive check added.
 //!
 //! The repository is private, so every network hop goes through the GitHub CLI
 //! instead of a bare HTTPS fetch: `gh` already holds a token with access to it,
@@ -31,6 +37,15 @@ pub struct UpdateArgs {
     /// Replace this file instead of the running binary
     #[arg(long, value_name = "PATH")]
     pub binary: Option<PathBuf>,
+    /// Allow a jump to a new major version (which may change behaviour)
+    #[arg(long)]
+    pub allow_major: bool,
+    /// Do not restart the systemd --user unit after swapping the binary
+    #[arg(long)]
+    pub no_restart: bool,
+    /// Skip the post-restart health check (and its automatic rollback)
+    #[arg(long)]
+    pub no_health_check: bool,
 }
 
 /// The release this binary was built from.
@@ -79,12 +94,108 @@ pub fn run(args: &UpdateArgs) -> Result<()> {
             target.display()
         );
     }
+    // Version fence: the implicit "latest" path never downgrades and never
+    // crosses a major version silently. An explicit --version is deliberate.
+    if args.version.is_none() {
+        match compare(current, &latest) {
+            Ordering::Downgrade => {
+                bail!("the latest release ({latest}) is older than this binary ({current}); pass --version {latest} to downgrade on purpose")
+            }
+            Ordering::Major if !args.allow_major => bail!("{latest} is a new major version; read the release notes, then re-run with --allow-major"),
+            Ordering::Unknown => bail!("cannot compare {current} with tag {latest}; pass --version to install it explicitly"),
+            _ => {}
+        }
+    }
 
     println!("Updating {current} → {latest} …");
-    apply(&repo, &latest, &target)?;
+    let backup = apply(&repo, &latest, &target)?;
     println!("Updated to {latest} at {}", target.display());
-    restart_service();
+    if args.no_restart {
+        println!("Not restarting {UNIT} (--no-restart); the running server keeps the old binary until restarted.");
+        return Ok(());
+    }
+    if !restart_service() {
+        return Ok(());
+    }
+    if args.no_health_check {
+        return Ok(());
+    }
+    match wait_healthy() {
+        Ok(v) => println!("Health check passed (server reports {v})."),
+        Err(e) => {
+            eprintln!("warning: the new binary did not come up healthy: {e}");
+            if let Some(b) = backup.filter(|b| b.is_file()) {
+                eprintln!("rolling back to the previous binary");
+                std::fs::rename(&b, &target).context("restoring the previous binary")?;
+                restart_service();
+                bail!("update rolled back; {UNIT} is running the previous binary again");
+            }
+            bail!("no backup to roll back to; inspect: journalctl --user -u {UNIT}");
+        }
+    }
     Ok(())
+}
+
+/// Relationship between the running version and a candidate tag.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Ordering {
+    Same,
+    Upgrade,
+    Major,
+    Downgrade,
+    Unknown,
+}
+
+pub fn parse_version(v: &str) -> Option<(u64, u64, u64)> {
+    let core = v.trim().trim_start_matches('v').split(['-', '+']).next()?;
+    let mut it = core.split('.').map(|p| p.parse::<u64>().ok());
+    Some((it.next()??, it.next()??, it.next()??))
+}
+
+pub fn compare(current: &str, candidate: &str) -> Ordering {
+    let (Some(c), Some(n)) = (parse_version(current), parse_version(candidate)) else { return Ordering::Unknown };
+    if n == c {
+        Ordering::Same
+    } else if n < c {
+        Ordering::Downgrade
+    } else if n.0 > c.0 {
+        Ordering::Major
+    } else {
+        Ordering::Upgrade
+    }
+}
+
+/// Poll the local proxy's health endpoint until it answers with a version.
+fn wait_healthy() -> Result<String> {
+    let port = crate::config::Config::load().ok().flatten().map(|c| c.proxy.port).unwrap_or(crate::config::DEFAULT_PORT);
+    let url = format!("http://127.0.0.1:{port}/teamclaude/health");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut last = String::new();
+    while std::time::Instant::now() < deadline {
+        match std::process::Command::new("curl").args(["-fsS", "--max-time", "2", &url]).stdin(Stdio::null()).output() {
+            Ok(o) if o.status.success() => {
+                let body = String::from_utf8_lossy(&o.stdout);
+                let v = serde_json::from_str::<serde_json::Value>(&body)
+                    .ok()
+                    .and_then(|j| j.get("version").and_then(|v| v.as_str()).map(str::to_string))
+                    .unwrap_or_else(|| "ok".into());
+                return Ok(v);
+            }
+            Ok(o) => last = safe_text(String::from_utf8_lossy(&o.stderr).trim(), 120),
+            Err(e) => last = e.to_string(),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    bail!("no healthy answer from {url} within 20s ({last})")
+}
+
+/// The latest release tag, or None when it cannot be determined (no gh, no
+/// network, no access). Used by the passive check; never fails loudly.
+pub fn latest_tag_quiet() -> Option<String> {
+    if std::env::var_os("TEAMCLAUDE_DISABLE_UPDATE_CHECK").is_some() {
+        return None;
+    }
+    latest_tag(&repo()).ok()
 }
 
 // ── steps ─────────────────────────────────────────────────────
@@ -98,7 +209,9 @@ fn latest_tag(repo: &str) -> Result<String> {
     Ok(tag)
 }
 
-fn apply(repo: &str, tag: &str, target: &Path) -> Result<()> {
+/// Download, verify and swap. Returns the path of the previous binary's
+/// backup (`<target>.prev`) so a failed restart can be rolled back.
+fn apply(repo: &str, tag: &str, target: &Path) -> Result<Option<PathBuf>> {
     let triple = target_triple(std::env::consts::OS, std::env::consts::ARCH)?;
     let asset = asset_name(tag, triple);
     let work = tempfile::Builder::new().prefix("teamclaude-update-").tempdir().context("creating a temporary directory")?;
@@ -134,7 +247,10 @@ fn apply(repo: &str, tag: &str, target: &Path) -> Result<()> {
     }
     println!("New binary: {}", safe_text(String::from_utf8_lossy(&v.stdout).trim(), 80));
 
-    replace(&new_bin, target)
+    let backup = target.with_extension("prev");
+    let kept = if target.is_file() { std::fs::copy(target, &backup).map(|_| backup).ok() } else { None };
+    replace(&new_bin, target)?;
+    Ok(kept)
 }
 
 /// A present-but-invalid signature is a failure; an absent verifier is not.
@@ -198,17 +314,25 @@ fn write_err(dir: &Path, e: std::io::Error) -> anyhow::Error {
     }
 }
 
-fn restart_service() {
+/// Restart the unit if it is running. Returns whether a restart happened.
+fn restart_service() -> bool {
     if !cfg!(target_os = "linux") {
-        return;
+        return false;
     }
     let active = Command::new("systemctl").args(["--user", "is-active", "--quiet", UNIT]).status().map(|s| s.success()).unwrap_or(false);
     if !active {
-        return;
+        println!("{UNIT} is not running; nothing to restart.");
+        return false;
     }
     match Command::new("systemctl").args(["--user", "restart", UNIT]).status() {
-        Ok(s) if s.success() => println!("Restarted {UNIT}."),
-        _ => eprintln!("note: could not restart {UNIT} automatically; run: systemctl --user restart {UNIT}"),
+        Ok(s) if s.success() => {
+            println!("Restarted {UNIT}.");
+            true
+        }
+        _ => {
+            eprintln!("note: could not restart {UNIT} automatically; run: systemctl --user restart {UNIT}");
+            false
+        }
     }
 }
 
@@ -305,6 +429,17 @@ mod tests {
         assert_eq!(target_triple("macos", "aarch64").unwrap(), "aarch64-apple-darwin");
         assert!(target_triple("windows", "x86_64").is_err());
         assert!(target_triple("linux", "riscv64").is_err());
+    }
+
+    #[test]
+    fn version_fence() {
+        assert_eq!(compare("2.0.1", "v2.0.2"), Ordering::Upgrade);
+        assert_eq!(compare("2.0.1", "v2.1.0"), Ordering::Upgrade);
+        assert_eq!(compare("2.0.1", "v2.0.1"), Ordering::Same);
+        assert_eq!(compare("2.0.1", "v2.0.0"), Ordering::Downgrade);
+        assert_eq!(compare("2.0.1", "v3.0.0"), Ordering::Major);
+        assert_eq!(compare("2.0.1", "nightly"), Ordering::Unknown);
+        assert_eq!(parse_version("v2.1.0-rc.1"), Some((2, 1, 0)));
     }
 
     #[test]
