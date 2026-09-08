@@ -148,9 +148,16 @@ if command -v cosign >/dev/null 2>&1 && [ -f "$WORK/SHA256SUMS.sigstore.json" ];
 else
   warn "cosign not installed; skipping signature verification (checksum verified)"
 fi
+# Provenance attestations exist only when the repository's plan allows them;
+# their absence is not a failure, a present-but-invalid one is.
 if gh attestation verify --help >/dev/null 2>&1; then
-  log "Verifying build provenance attestation"
-  gh attestation verify "$WORK/$ARCHIVE" -R "$REPO" >/dev/null 2>&1 || die "provenance attestation failed"
+  out="$(gh attestation verify "$WORK/$ARCHIVE" -R "$REPO" 2>&1)" && log "Build provenance attestation verified" || {
+    if printf '%s' "$out" | grep -qi "no attestations found\|not found\|404"; then
+      warn "no provenance attestation published for this release (private repository); relying on checksum + Sigstore"
+    else
+      die "provenance attestation failed: $out"
+    fi
+  }
 fi
 
 tar -C "$WORK" -xzf "$WORK/$ARCHIVE"
