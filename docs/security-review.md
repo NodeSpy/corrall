@@ -44,7 +44,7 @@ and state output.
 
 | # | Severity | Finding (original) | Disposition here |
 | --- | --- | --- | --- |
-| 1 | High (headless) | Daily unattended `npm install -g` from the registry with no provenance check, no `--ignore-scripts`, no major-version fence. | Fixed. `teamclaude update` is manual, fetches the release through authenticated `gh`, and verifies the archive against `SHA256SUMS` (and its Sigstore signature when cosign is present) before swapping the binary. |
+| 1 | High (headless) | Daily unattended `npm install -g` from the registry with no provenance check, no `--ignore-scripts`, no major-version fence. | Fixed. Nothing installs unattended: the server only *reports* a newer release. `teamclaude update` is operator-invoked, fetches through authenticated `gh`, verifies the archive against `SHA256SUMS` and its Sigstore signature, refuses downgrades and silent major jumps, and rolls the binary back if the restarted server is not healthy. |
 | 2 | Medium | `TC_ACCT` + MITM put the proxy master key into `HTTPS_PROXY` for every subprocess Claude Code spawns. | Fixed. `env`/`run` include the key only when the proxy is bound off-loopback; on loopback the pin travels alone. |
 | 3 | Medium | Client-controlled `model`, path and session id reached the TUI unsanitised (terminal escape injection). | Fixed. Everything shown in the TUI or logged goes through `security::safe_text`; session ids are validated on ingest. |
 | 4 | Low | Terminal title stripped C0 but not C1/format characters. | Title setting not ported; `safe_text` strips all control and C1 characters. |

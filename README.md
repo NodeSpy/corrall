@@ -276,9 +276,7 @@ short:
   account pin and pool name travel alone.
 - **OAuth callback hardened.** The login listener binds loopback only and checks
   `state` before trusting an `error` parameter.
-- **No unattended updates.** `teamclaude update` runs only when you run it, and
-  it refuses an archive whose SHA256 is not the one `SHA256SUMS` publishes (plus
-  the Sigstore signature over that file when cosign is installed).
+- **No unattended updates.** `teamclaude update` is explicit, verified against the signed checksums, fenced against downgrades and major jumps, and rolls back if the restarted server is unhealthy. The daily check only reports.
 - Constant-time key comparison; failed auth is delayed; internal error text is
   never echoed to clients; control characters are stripped from anything that
   reaches a terminal or a log.
@@ -339,30 +337,22 @@ Rust 1.80 or newer. No OpenSSL: TLS is rustls with the ring provider.
 ## Updating
 
 ```bash
-teamclaude update --check          # latest release vs. this binary
-teamclaude update                  # download, verify, swap, restart
-teamclaude update --version v2.0.1 # a specific tag (re-install or downgrade)
-teamclaude update --binary ~/.local/bin/teamclaude   # a copy other than this one
+teamclaude update --check     # is there a newer release?
+teamclaude update             # verify, swap, restart, health-check (rolls back on failure)
 ```
 
-`update` consumes the same release assets as `scripts/install.sh`: the archive
-for this OS/arch plus `SHA256SUMS`, fetched with `gh` because the repository is
-private. It refuses to continue unless the archive hashes to what `SHA256SUMS`
-publishes, verifies the Sigstore signature over that file when `cosign` is
-installed (warning, not failing, when it is not), and runs `--version` on the
-new binary before swapping it in.
+`update` fetches the release through the GitHub CLI, verifies the archive
+against `SHA256SUMS` and its Sigstore signature, replaces the binary with an
+atomic rename (keeping the old one as `teamclaude.prev`), restarts the
+`systemd --user` unit if it was running, and waits for the health endpoint. It
+never downgrades or crosses a major version unless told to (`--version`,
+`--allow-major`), refuses to overwrite a `cargo build` in a checkout, and never
+runs unattended. The server checks daily and only *tells* you a release exists
+(`Update` row in `status`, TUI header, `updateAvailable` in the status JSON);
+turn that off with `"updateCheck": false`.
 
-The swap is a rename inside the binary's own directory, so it is atomic and a
-running server keeps serving from the old inode; a `systemd --user`
-`teamclaude.service` that is active gets restarted afterwards. Unlike the
-original, nothing here updates on a timer — `update` runs when you run it, and
-never touches the config or the state file. A binary built by `cargo` in a
-checkout is refused (rebuild it instead); use `--binary` to point at an
-installed copy.
-
-`scripts/install.sh` remains the more thorough path: it also backs up the config
-and state, refuses to leave two implementations sharing them, waits for
-`/teamclaude/health`, and rolls the whole thing back on failure.
+`scripts/install.sh` remains the first-install and swap-over path: it also
+backs up config and state and rolls back the whole swap.
 
 ## Releases
 

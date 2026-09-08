@@ -187,6 +187,12 @@ impl Tui {
                 n => format!("{n}s"),
             },
         );
+        // The release check is daemon-wide and records itself on the default
+        // pool, which is what the status document's top level carries.
+        let header = match st.get("updateAvailable").and_then(Value::as_str) {
+            Some(tag) => format!("{header}   UPDATE {tag} available (teamclaude update)"),
+            None => header,
+        };
         f.render_widget(Paragraph::new(header).style(Style::default().bold()), chunks[0]);
 
         let flat = Self::flat_accounts(st);

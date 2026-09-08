@@ -59,7 +59,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
             cli::import_claudeacrobat(a).await
         }
         Command::Accounts { verbose, pool } => cli::accounts(verbose, pool),
-        Command::Status { json } => cli::status(json).await,
+        Command::Status { json, color } => cli::status(json, &color).await,
         Command::Switch { name, pool } => cli::switch(name, pool).await,
         Command::Remove { name, pool } => cli::remove(name, pool).await,
         Command::Disable { name, pool } => cli::set_disabled(name, true, pool).await,
@@ -103,6 +103,12 @@ async fn server(args: ServerArgs, interactive: bool) -> Result<()> {
     }
     if pools.account_count() == 0 {
         tracing::warn!("no usable accounts configured; run `teamclaude login` (the server will serve them after a reload)");
+    } else {
+        // Pick each pool's active account at boot, as the original does, so
+        // status shows them before the first request arrives.
+        for (_, m) in pools.each() {
+            let _ = m.select(&manager::SelectRequest { allow_probe: false, ..Default::default() });
+        }
     }
 
     let logger = cfg.log_dir.as_deref().and_then(|d| proxy::log::RequestLogger::new(d, cfg.log_level, cfg.log_max_body_bytes));
@@ -164,6 +170,26 @@ async fn server(args: ServerArgs, interactive: bool) -> Result<()> {
     // Background: prober, state saver, log sweeper, signals.
     tokio::spawn(prober.clone().run());
     tokio::spawn(warmer.clone().run());
+    // Notify-only release check: once shortly after start, then daily. It only
+    // records the tag for status/TUI; nothing is ever installed by itself.
+    if cfg.update_check && std::env::var_os("TEAMCLAUDE_DISABLE_UPDATE_CHECK").is_none() {
+        // Daemon-wide fact, recorded on the default pool: that is the section
+        // the status document flattens onto its top level.
+        let manager = pools.default();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(20)).await;
+            loop {
+                if let Ok(Some(tag)) = tokio::task::spawn_blocking(update::latest_tag_quiet).await {
+                    if matches!(update::compare(update::current_version(), &tag), update::Ordering::Upgrade | update::Ordering::Major) {
+                        manager.set_update_available(Some(tag));
+                    } else {
+                        manager.set_update_available(None);
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(24 * 3600)).await;
+            }
+        });
+    }
     {
         let pools = pools.clone();
         let mut rx = shutdown_rx.clone();
