@@ -225,7 +225,7 @@ impl Pools {
             }
             keep
         });
-        for (name, _) in cfg.pools.iter() {
+        for name in cfg.pools.keys() {
             match g.map.get(name) {
                 Some(m) => added += m.sync_config(cfg, name),
                 None => {

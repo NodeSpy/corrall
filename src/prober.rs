@@ -87,18 +87,30 @@ impl Prober {
     }
 
     async fn probe_pool(&self, m: &Manager) {
+        // Each pool reports its own run, so the status view can say when this
+        // pool last probed and when it is next due.
+        let now = crate::quota::now_ms();
+        let secs = m.probe_seconds();
+        m.probe_run_started(now, if secs > 0 { Some(now + secs as i64 * 1000) } else { None });
         let tasks: Vec<_> = m.oauth_accounts().into_iter().map(|(id, name)| self.probe_one(m, id, name)).collect();
         futures_util::future::join_all(tasks).await;
+        m.probe_run_finished(crate::quota::now_ms());
     }
 
     async fn probe_one(&self, m: &Manager, id: String, name: String) {
-        let Some(cred) = m.ensure_token_fresh(&id, false).await else { return };
+        let started = crate::quota::now_ms();
+        m.probe_account_status(&id, "running", started, None, None);
+        let Some(cred) = m.ensure_token_fresh(&id, false).await else {
+            m.probe_account_status(&id, "error", started, Some(crate::quota::now_ms()), Some("no usable token".into()));
+            return;
+        };
         let mut result = tokio::time::timeout(Duration::from_secs(15), fetch_usage(&cred)).await.unwrap_or(UsageResult::Error("probe timed out".into()));
         if matches!(result, UsageResult::Unauthorized) {
             if let Some(c2) = m.ensure_token_fresh(&id, true).await {
                 result = tokio::time::timeout(Duration::from_secs(15), fetch_usage(&c2)).await.unwrap_or(UsageResult::Error("probe timed out".into()));
             }
         }
+        let finished = crate::quota::now_ms();
         match result {
             UsageResult::Ok(u) => {
                 m.apply_usage(&id, &u);
@@ -109,9 +121,17 @@ impl Prober {
                         }
                     }
                 }
+                m.probe_account_status(&id, "ok", started, Some(finished), None);
             }
-            UsageResult::Unauthorized => m.log(format!("Quota probe: \"{name}\" token rejected")),
-            UsageResult::Error(e) => tracing::warn!("quota probe for \"{name}\": {e}"),
+            UsageResult::Unauthorized => {
+                m.log(format!("Quota probe: \"{name}\" token rejected"));
+                m.probe_account_status(&id, "error", started, Some(finished), Some("token rejected".into()));
+            }
+            UsageResult::Error(e) => {
+                tracing::warn!("quota probe for \"{name}\": {e}");
+                let status = if e.contains("timed out") { "timeout" } else { "error" };
+                m.probe_account_status(&id, status, started, Some(finished), Some(crate::security::safe_text(&e, 120)));
+            }
         }
     }
 }
