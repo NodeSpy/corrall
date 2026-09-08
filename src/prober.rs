@@ -54,19 +54,29 @@ impl Prober {
 
     pub async fn probe_all(&self) {
         let Ok(_g) = self.running.try_lock() else { return };
+        let now = crate::quota::now_ms();
+        let secs = self.interval();
+        self.manager.probe_run_started(now, if secs > 0 { Some(now + secs as i64 * 1000) } else { None });
         let accounts = self.manager.oauth_accounts();
         let tasks: Vec<_> = accounts.into_iter().map(|(id, name)| self.probe_one(id, name)).collect();
         futures_util::future::join_all(tasks).await;
+        self.manager.probe_run_finished(crate::quota::now_ms());
     }
 
     async fn probe_one(&self, id: String, name: String) {
-        let Some(cred) = self.manager.ensure_token_fresh(&id, false).await else { return };
+        let started = crate::quota::now_ms();
+        self.manager.probe_account_status(&id, "running", started, None, None);
+        let Some(cred) = self.manager.ensure_token_fresh(&id, false).await else {
+            self.manager.probe_account_status(&id, "error", started, Some(crate::quota::now_ms()), Some("no usable token".into()));
+            return;
+        };
         let mut result = tokio::time::timeout(Duration::from_secs(15), fetch_usage(&cred)).await.unwrap_or(UsageResult::Error("probe timed out".into()));
         if matches!(result, UsageResult::Unauthorized) {
             if let Some(c2) = self.manager.ensure_token_fresh(&id, true).await {
                 result = tokio::time::timeout(Duration::from_secs(15), fetch_usage(&c2)).await.unwrap_or(UsageResult::Error("probe timed out".into()));
             }
         }
+        let finished = crate::quota::now_ms();
         match result {
             UsageResult::Ok(u) => {
                 self.manager.apply_usage(&id, &u);
@@ -77,9 +87,17 @@ impl Prober {
                         }
                     }
                 }
+                self.manager.probe_account_status(&id, "ok", started, Some(finished), None);
             }
-            UsageResult::Unauthorized => self.manager.log(format!("Quota probe: \"{name}\" token rejected")),
-            UsageResult::Error(e) => tracing::warn!("quota probe for \"{name}\": {e}"),
+            UsageResult::Unauthorized => {
+                self.manager.log(format!("Quota probe: \"{name}\" token rejected"));
+                self.manager.probe_account_status(&id, "error", started, Some(finished), Some("token rejected".into()));
+            }
+            UsageResult::Error(e) => {
+                tracing::warn!("quota probe for \"{name}\": {e}");
+                let status = if e.contains("timed out") { "timeout" } else { "error" };
+                self.manager.probe_account_status(&id, status, started, Some(finished), Some(crate::security::safe_text(&e, 120)));
+            }
         }
     }
 }

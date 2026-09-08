@@ -306,7 +306,29 @@ pub struct Fleet {
     /// dimension name -> value -> usage
     pub dimension_usage: BTreeMap<String, BTreeMap<String, Usage>>,
     pub expiry: ExpiryRouting,
+    pub probe: ProbeState,
+    pub warmup_secs: u64,
     refresh_locks: HashMap<String, Arc<tokio::sync::Mutex<()>>>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProbeAccount {
+    pub status: String,
+    pub started_at: Option<i64>,
+    pub finished_at: Option<i64>,
+    pub duration_ms: Option<i64>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ProbeState {
+    pub interval_secs: u64,
+    pub running: bool,
+    pub last_run_started_at: Option<i64>,
+    pub last_run_finished_at: Option<i64>,
+    pub next_run_at: Option<i64>,
+    pub accounts: HashMap<String, ProbeAccount>,
 }
 
 pub const DIMENSION_MAX_VALUES: usize = 500;
@@ -336,6 +358,8 @@ impl Manager {
             client_usage: BTreeMap::new(),
             dimension_usage: BTreeMap::new(),
             expiry: cfg.expiry_routing.clone(),
+            probe: ProbeState { interval_secs: cfg.quota_probe_seconds, ..Default::default() },
+            warmup_secs: cfg.warmup_seconds,
             refresh_locks: HashMap::new(),
         };
         let m = Manager { inner: Arc::new(Mutex::new(fleet)), events: tx };
@@ -377,6 +401,8 @@ impl Manager {
                 }
             }
             f.expiry = cfg.expiry_routing.clone();
+            f.probe.interval_secs = cfg.quota_probe_seconds;
+            f.warmup_secs = cfg.warmup_seconds;
             let mut next: Vec<Account> = Vec::with_capacity(cfg.accounts.len());
             for c in &cfg.accounts {
                 let id = c.id.clone().unwrap_or_default();
@@ -912,6 +938,30 @@ impl Manager {
         })
     }
 
+    pub fn probe_run_started(&self, now: i64, next: Option<i64>) {
+        self.with(|f| {
+            f.probe.running = true;
+            f.probe.last_run_started_at = Some(now);
+            f.probe.next_run_at = next;
+        });
+    }
+
+    pub fn probe_run_finished(&self, now: i64) {
+        self.with(|f| {
+            f.probe.running = false;
+            f.probe.last_run_finished_at = Some(now);
+        });
+    }
+
+    pub fn probe_account_status(&self, id: &str, status: &str, started_at: i64, finished_at: Option<i64>, error: Option<String>) {
+        self.with(|f| {
+            f.probe.accounts.insert(
+                id.to_string(),
+                ProbeAccount { status: status.to_string(), started_at: Some(started_at), finished_at, duration_ms: finished_at.map(|t| t - started_at), error },
+            );
+        });
+    }
+
     /// Accounts keep-warm may touch: idle Anthropic subscription accounts
     /// whose 5h window is not running.
     pub fn warm_candidates(&self) -> Vec<(String, String)> {
@@ -980,7 +1030,6 @@ impl Fleet {
     pub fn account_mut(&mut self, id: &str) -> Option<&mut Account> {
         self.accounts.iter_mut().find(|a| a.id == id)
     }
-    #[allow(dead_code)]
     pub fn account_by_name(&self, name: &str) -> Option<&Account> {
         self.accounts.iter().find(|a| a.name == name || a.id == name)
     }
@@ -1555,6 +1604,20 @@ impl Fleet {
             "tier": a.rate_limit_tier.clone().or(a.seat_tier.clone()).or(a.subscription_type.clone()),
             "tokenExpiresAt": a.expires_at.map(iso),
             "rateLimitedUntil": a.rate_limited_until.map(iso),
+            "entitlementDeniedUntil": a.entitlement_denied_until.filter(|u| *u > now).map(iso),
+            "unavailable": reason.as_deref().map(unavailable_key),
+            "maxUsage": a.max_usage,
+            "sessions": self.sessions.stats(now).per_account_active.get(&a.id).copied().unwrap_or(0),
+            "probe": match a.kind {
+                AccountType::Apikey => json!({ "status": "not-applicable" }),
+                _ => self.probe.accounts.get(&a.id).map(|p| json!({
+                    "status": p.status,
+                    "startedAt": p.started_at.map(iso),
+                    "lastProbedAt": p.finished_at.map(iso),
+                    "durationMs": p.duration_ms,
+                    "error": p.error,
+                })).unwrap_or(json!({ "status": "never" })),
+            },
             "inFlight": a.in_flight,
             "quota": {
                 "unified5h": b(&a.quota.unified5h),
@@ -1580,24 +1643,67 @@ impl Fleet {
     pub fn status_json(&self, now: i64, session_detail: bool) -> Value {
         let stats = self.sessions.stats(now);
         let current_name = self.current.as_ref().and_then(|c| self.account(c)).map(|a| a.name.clone());
-        let routes: Vec<Value> = self
+        let sample_model = |patterns: &[String]| -> String {
+            patterns.first().map(|g| g.replace('*', "")).filter(|s| !s.is_empty()).map(|s| format!("claude-{s}")).unwrap_or_else(|| "claude-opus".into())
+        };
+        let eligible = |a: &Account, model: &str| self.unavailable_reason(a, Some(model), None, now).is_none();
+        let mut routes: Vec<Value> = self
             .routes
             .iter()
             .map(|r| {
+                let model = sample_model(&r.patterns);
+                let accounts: Vec<Value> = if r.accounts.is_empty() {
+                    self.accounts.iter().map(|a| json!({ "name": a.name, "eligible": eligible(a, &model) })).collect()
+                } else {
+                    r.accounts
+                        .iter()
+                        .filter_map(|n| self.account_by_name(n).or_else(|| n.parse::<usize>().ok().and_then(|i| self.accounts.get(i))))
+                        .map(|a| json!({ "name": a.name, "eligible": eligible(a, &model) }))
+                        .collect()
+                };
                 json!({
                     "name": r.name,
                     "match": r.patterns,
-                    "accounts": r.accounts,
+                    "accounts": accounts,
                     "bucket": r.bucket,
                     "color": r.color,
+                    "autocreated": false,
                     "pinned": self.route_pins.get(&r.name).and_then(|id| self.account(id)).map(|a| a.name.clone()),
                 })
             })
             .collect();
+        // Families metered separately with no configured route surface as auto routes.
+        for (family, key) in [("fable", BUCKET_7D_FABLE), ("sonnet", BUCKET_7D_SONNET)] {
+            let metered = self.accounts.iter().any(|a| a.quota.bucket(key).and_then(|b| b.utilization).is_some());
+            let configured = self.routes.iter().any(|r| r.patterns.iter().any(|g| g.to_ascii_lowercase().contains(family)));
+            if metered && !configured {
+                let model = format!("claude-{family}");
+                routes.push(json!({
+                    "name": family,
+                    "match": [format!("*{family}*")],
+                    "accounts": self.accounts.iter().map(|a| json!({ "name": a.name, "eligible": eligible(a, &model) })).collect::<Vec<_>>(),
+                    "bucket": Value::Null,
+                    "color": Value::Null,
+                    "autocreated": true,
+                    "pinned": self.route_pins.get(family).and_then(|id| self.account(id)).map(|a| a.name.clone()),
+                }));
+            }
+        }
         let mut v = json!({
             "version": env!("CARGO_PKG_VERSION"),
             "uptimeSeconds": (now - self.started_at) / 1000,
+            "server": { "uptimeSeconds": (now - self.started_at) / 1000, "startedAt": iso(self.started_at) },
             "current": current_name,
+            "currentAccount": current_name,
+            "probe": {
+                "enabled": self.probe.interval_secs > 0,
+                "intervalSeconds": self.probe.interval_secs,
+                "running": self.probe.running,
+                "lastRunStartedAt": self.probe.last_run_started_at.map(iso),
+                "lastRunFinishedAt": self.probe.last_run_finished_at.map(iso),
+                "nextRunAt": self.probe.next_run_at.map(iso),
+            },
+            "warm": { "enabled": self.warmup_secs > 0, "intervalSeconds": self.warmup_secs },
             "switchThreshold": self.threshold,
             "distributeSessions": self.distribute_sessions,
             "stormRamp": self.storm,
@@ -1610,6 +1716,7 @@ impl Fleet {
                 "active": stats.active,
                 "known": stats.known,
                 "inFlight": stats.in_flight,
+                "distribute": self.distribute_sessions,
                 "perAccount": self.accounts.iter().map(|a| json!({
                     "name": a.name,
                     "active": stats.per_account_active.get(&a.id).copied().unwrap_or(0),
@@ -1681,6 +1788,38 @@ impl Fleet {
                 "resetAt7d": a.quota.unified7d.reset_at.map(iso),
             })).collect::<Vec<_>>(),
         })
+    }
+}
+
+/// Map an internal unavailability reason to the original's stable keys so the
+/// status renderer can phrase it in the operator's terms.
+pub fn unavailable_key(reason: &str) -> &'static str {
+    if reason.starts_with("disabled") {
+        "disabled"
+    } else if reason.starts_with("rate-limited") {
+        "throttled"
+    } else if reason.starts_with("error") {
+        "error"
+    } else if reason.starts_with("oauth not allowed") {
+        "entitlement"
+    } else if reason.starts_with("advisor-capped") {
+        "advisor-capped"
+    } else if reason.starts_with("capped") {
+        "capped"
+    } else if reason.starts_with("quota (advisor)") {
+        "advisor-quota"
+    } else if reason.starts_with("quota") {
+        "quota"
+    } else if reason.starts_with("route excludes the advisor") {
+        "advisor-route"
+    } else if reason.starts_with("route") {
+        "route"
+    } else if reason.starts_with("upstream refused") {
+        "upstream-refused"
+    } else if reason.starts_with("other provider") {
+        "other-provider"
+    } else {
+        "unknown"
     }
 }
 

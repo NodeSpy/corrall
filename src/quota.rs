@@ -232,6 +232,44 @@ impl Quota {
     }
 }
 
+/// Paid-overage ("extra usage") information, normalised like the original:
+/// `{ enabled, usedMinor, limitMinor, currency, exponent, userDisabled, disabledReason }`.
+pub fn normalize_spend(data: &Value) -> Option<Value> {
+    let extra = data.get("extra_usage").filter(|v| v.is_object());
+    let spend = data.get("spend").filter(|v| v.is_object());
+    if extra.is_none() && spend.is_none() {
+        return None;
+    }
+    let money = |m: Option<&Value>| -> Option<f64> {
+        let m = m?.as_object()?;
+        let v = m.get("amount_minor")?;
+        v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+    };
+    let used = spend.and_then(|s| s.get("used"));
+    let limit = spend.and_then(|s| s.get("limit"));
+    let currency = used
+        .and_then(|u| u.get("currency"))
+        .or_else(|| limit.and_then(|l| l.get("currency")))
+        .or_else(|| extra.and_then(|e| e.get("currency")))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let exponent = used
+        .and_then(|u| u.get("exponent"))
+        .or_else(|| limit.and_then(|l| l.get("exponent")))
+        .or_else(|| extra.and_then(|e| e.get("decimal_places")))
+        .and_then(Value::as_i64)
+        .unwrap_or(2);
+    Some(serde_json::json!({
+        "enabled": extra.and_then(|e| e.get("is_enabled")).and_then(Value::as_bool).unwrap_or(false),
+        "usedMinor": money(used),
+        "limitMinor": money(limit),
+        "currency": currency,
+        "exponent": exponent,
+        "userDisabled": extra.and_then(|e| e.get("user_disabled")).and_then(Value::as_bool).unwrap_or(false),
+        "disabledReason": extra.and_then(|e| e.get("disabled_reason")).and_then(Value::as_str),
+    }))
+}
+
 pub fn parse_iso_ms(s: &str) -> Option<i64> {
     chrono::DateTime::parse_from_rfc3339(s).ok().map(|d| d.timestamp_millis())
 }
@@ -286,7 +324,7 @@ pub fn normalize_usage(data: &Value) -> UsagePayload {
         }
     }
     let find = |needle: &str| scoped.iter().find(|(k, _)| k.contains(needle)).map(|(_, b)| *b);
-    let spend = data.get("extra_usage").cloned().filter(|v| !v.is_null());
+    let spend = normalize_spend(data);
     UsagePayload {
         five_hour: normalize_bucket(data.get("five_hour")),
         seven_day: normalize_bucket(data.get("seven_day")),

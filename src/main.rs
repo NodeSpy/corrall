@@ -55,7 +55,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
             cli::import(a).await
         }
         Command::Accounts { verbose } => cli::accounts(verbose),
-        Command::Status { json } => cli::status(json).await,
+        Command::Status { json, color } => cli::status(json, &color).await,
         Command::Switch { name } => cli::switch(name).await,
         Command::Remove { name } => cli::remove(name).await,
         Command::Disable { name } => cli::set_disabled(name, true).await,

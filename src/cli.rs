@@ -36,6 +36,9 @@ pub enum Command {
     Status {
         #[arg(long)]
         json: bool,
+        /// ANSI colors: auto, always or never
+        #[arg(long, default_value = "auto")]
+        color: String,
     },
     /// Make the running server prefer one account
     Switch { name: Option<String> },
@@ -493,14 +496,19 @@ pub fn accounts(verbose: bool) -> Result<()> {
     Ok(())
 }
 
-pub async fn status(json_out: bool) -> Result<()> {
+pub async fn status(json_out: bool, color: &str) -> Result<()> {
     let cfg = Config::load()?.ok_or_else(|| anyhow!("no config yet"))?;
     crate::upstream::init(&cfg)?;
     let st = control_get(&cfg, "/teamclaude/status").await?;
     if json_out {
         println!("{}", serde_json::to_string_pretty(&st)?);
     } else {
-        print!("{}", crate::status::render(&st));
+        let use_color = match color {
+            "always" => true,
+            "never" => false,
+            _ => std::io::IsTerminal::is_terminal(&std::io::stdout()) && std::env::var_os("NO_COLOR").is_none(),
+        };
+        println!("{}", crate::status::render(&st, use_color, crate::quota::now_ms()));
     }
     Ok(())
 }
