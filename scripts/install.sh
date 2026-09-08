@@ -216,7 +216,8 @@ if [ "$WAS_ACTIVE" = 1 ]; then
 fi
 # A server that is not the unit we just stopped must not share the config.
 unit_pid="$(service_present && systemctl --user show -p MainPID --value "$UNIT" 2>/dev/null || echo 0)"
-strays="$(pgrep -f "teamclaude server" 2>/dev/null | grep -vx "${unit_pid:-0}" | grep -vx "$$" || true)"
+own="$(printf '%s\n' "$$" "$BASHPID"; pgrep -P "$$" 2>/dev/null || true)"
+strays="$(pgrep -f "teamclaude server" 2>/dev/null | grep -vx "${unit_pid:-0}" | grep -vxF -f <(printf '%s\n' "$own") || true)"
 if [ -n "$strays" ] && [ "$DRY_RUN" = 0 ]; then
   if [ "$MANAGE_SERVICE" = 1 ]; then
     die "a teamclaude server is running outside systemd (pid $strays); stop it first so two instances never share the config"
