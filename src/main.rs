@@ -73,6 +73,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Command::CaPath => cli::ca_path(),
         Command::Config { cmd } => cli::config_cmd(cmd),
         Command::Service { cmd } => cli::service(cmd),
+        Command::Update(a) => update::run(&a),
         Command::Api { path, account } => cli::api(path, account).await,
     }
 }
@@ -155,6 +156,24 @@ async fn server(args: ServerArgs, interactive: bool) -> Result<()> {
     // Background: prober, state saver, log sweeper, signals.
     tokio::spawn(prober.clone().run());
     tokio::spawn(warmer.clone().run());
+    // Notify-only release check: once shortly after start, then daily. It only
+    // records the tag for status/TUI; nothing is ever installed by itself.
+    if cfg.update_check && std::env::var_os("TEAMCLAUDE_DISABLE_UPDATE_CHECK").is_none() {
+        let manager = manager.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(20)).await;
+            loop {
+                if let Ok(Some(tag)) = tokio::task::spawn_blocking(update::latest_tag_quiet).await {
+                    if matches!(update::compare(update::current_version(), &tag), update::Ordering::Upgrade | update::Ordering::Major) {
+                        manager.set_update_available(Some(tag));
+                    } else {
+                        manager.set_update_available(None);
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(24 * 3600)).await;
+            }
+        });
+    }
     {
         let manager = manager.clone();
         let mut rx = shutdown_rx.clone();

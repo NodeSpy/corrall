@@ -175,6 +175,10 @@ impl Tui {
                 n => format!("{n}s"),
             },
         );
+        let header = match self.manager.update_available() {
+            Some(tag) => format!("{header}   UPDATE {tag} available (teamclaude update)"),
+            None => header,
+        };
         f.render_widget(Paragraph::new(header).style(Style::default().bold()), chunks[0]);
 
         let rows: Vec<Row> = st

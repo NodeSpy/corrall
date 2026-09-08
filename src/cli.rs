@@ -96,6 +96,8 @@ pub enum Command {
         #[command(subcommand)]
         cmd: ServiceCmd,
     },
+    /// Replace this binary with the latest release (verified; never runs unattended)
+    Update(crate::update::UpdateArgs),
     /// Call an API endpoint with an account's credentials (GET)
     Api {
         path: String,

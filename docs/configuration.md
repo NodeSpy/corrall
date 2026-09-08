@@ -119,3 +119,21 @@ or launch it behind the MITM proxy (`eval "$(teamclaude env)"`), which
 intercepts `chatgpt.com` as soon as one Codex account is configured
 (`ab.chatgpt.com`, OpenAI's telemetry host, is never intercepted). Codex and
 Anthropic accounts rotate independently on one port.
+
+## Updating
+
+`teamclaude update --check` compares this binary with the latest GitHub
+release. `teamclaude update` downloads the archive for this OS/arch through
+the GitHub CLI (the repository is private), verifies it against `SHA256SUMS`
+and the Sigstore signature (when `cosign` is installed), swaps the binary
+atomically beside the old one (kept as `teamclaude.prev`), restarts the
+`systemd --user` unit if it was running, and waits for `/teamclaude/health`.
+If the new binary does not come up healthy the previous one is restored and
+restarted. The implicit "latest" path never downgrades and refuses a new major
+version without `--allow-major`; `--version vX.Y.Z` installs a specific tag on
+purpose.
+
+The server checks once a day (`updateCheck`, default on; or
+`TEAMCLAUDE_DISABLE_UPDATE_CHECK=1`) and only *reports* a newer release in
+`teamclaude status`, the TUI header and `/teamclaude/status` (`updateAvailable`).
+Nothing is ever installed unattended.

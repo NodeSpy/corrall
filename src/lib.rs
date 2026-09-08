@@ -15,5 +15,6 @@ pub mod session;
 pub mod status;
 pub mod titles;
 pub mod tui;
+pub mod update;
 pub mod upstream;
 pub mod warmer;

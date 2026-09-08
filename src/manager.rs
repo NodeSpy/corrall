@@ -308,6 +308,7 @@ pub struct Fleet {
     pub expiry: ExpiryRouting,
     pub probe: ProbeState,
     pub warmup_secs: u64,
+    pub update_available: Option<String>,
     refresh_locks: HashMap<String, Arc<tokio::sync::Mutex<()>>>,
 }
 
@@ -360,6 +361,7 @@ impl Manager {
             expiry: cfg.expiry_routing.clone(),
             probe: ProbeState { interval_secs: cfg.quota_probe_seconds, ..Default::default() },
             warmup_secs: cfg.warmup_seconds,
+            update_available: None,
             refresh_locks: HashMap::new(),
         };
         let m = Manager { inner: Arc::new(Mutex::new(fleet)), events: tx };
@@ -936,6 +938,21 @@ impl Manager {
                 .map(|a| (a.id.clone(), a.name.clone()))
                 .collect()
         })
+    }
+
+    pub fn set_update_available(&self, tag: Option<String>) {
+        let announce = self.with(|f| {
+            let changed = f.update_available != tag;
+            f.update_available = tag.clone();
+            changed && tag.is_some()
+        });
+        if announce {
+            self.log(format!("Update available: {} → {} (run: teamclaude update)", env!("CARGO_PKG_VERSION"), tag.unwrap_or_default()));
+        }
+    }
+
+    pub fn update_available(&self) -> Option<String> {
+        self.with(|f| f.update_available.clone())
     }
 
     pub fn probe_run_started(&self, now: i64, next: Option<i64>) {
@@ -1704,6 +1721,7 @@ impl Fleet {
                 "nextRunAt": self.probe.next_run_at.map(iso),
             },
             "warm": { "enabled": self.warmup_secs > 0, "intervalSeconds": self.warmup_secs },
+            "updateAvailable": self.update_available,
             "switchThreshold": self.threshold,
             "distributeSessions": self.distribute_sessions,
             "stormRamp": self.storm,

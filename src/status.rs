@@ -644,6 +644,9 @@ pub fn render(st: &Value, color: bool, now: i64) -> String {
     if let Some(up) = st.pointer("/server/uptimeSeconds").and_then(Value::as_i64).or_else(|| st.get("uptimeSeconds").and_then(Value::as_i64)) {
         lines.push(format!("{} up {}", paint.dim(&pad("Server", 12)), format_duration(up * 1000)));
     }
+    if let Some(tag) = s(st, "updateAvailable") {
+        lines.push(format!("{} {}", paint.dim(&pad("Update", 12)), paint.yellow(&format!("{} available — run: teamclaude update", safe_text(tag, 30)))));
+    }
     lines.push(String::new());
 
     let routes: Vec<Value> = st.get("routes").and_then(Value::as_array).cloned().unwrap_or_default();

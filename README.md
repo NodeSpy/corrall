@@ -194,7 +194,7 @@ short:
   pin travels alone.
 - **OAuth callback hardened.** The login listener binds loopback only and checks
   `state` before trusting an `error` parameter.
-- **No self-updater.** Update deliberately requires an operator action.
+- **No unattended updates.** `teamclaude update` is explicit, verified against the signed checksums, fenced against downgrades and major jumps, and rolls back if the restarted server is unhealthy. The daily check only reports.
 - Constant-time key comparison; failed auth is delayed; internal error text is
   never echoed to clients; control characters are stripped from anything that
   reaches a terminal or a log.
@@ -247,6 +247,26 @@ cargo clippy --all-targets -- -D warnings
 ```
 
 Rust 1.80 or newer. No OpenSSL: TLS is rustls with the ring provider.
+
+## Updating
+
+```bash
+teamclaude update --check     # is there a newer release?
+teamclaude update             # verify, swap, restart, health-check (rolls back on failure)
+```
+
+`update` fetches the release through the GitHub CLI, verifies the archive
+against `SHA256SUMS` and its Sigstore signature, replaces the binary with an
+atomic rename (keeping the old one as `teamclaude.prev`), restarts the
+`systemd --user` unit if it was running, and waits for the health endpoint. It
+never downgrades or crosses a major version unless told to (`--version`,
+`--allow-major`), refuses to overwrite a `cargo build` in a checkout, and never
+runs unattended. The server checks daily and only *tells* you a release exists
+(`Update` row in `status`, TUI header, `updateAvailable` in the status JSON);
+turn that off with `"updateCheck": false`.
+
+`scripts/install.sh` remains the first-install and swap-over path: it also
+backs up config and state and rolls back the whole swap.
 
 ## Releases
 
