@@ -16,10 +16,31 @@ This is a from-scratch port of [KarpelesLab/teamclaude](https://github.com/Karpe
 
 ## Quick start
 
-```bash
-cargo install --git https://github.com/NodeSpy/teamclaude
-# or: git clone … && cargo build --release && cp target/release/teamclaude ~/.local/bin/
+Install a signed release binary (the repository is private, so downloads go
+through the GitHub CLI):
 
+```bash
+gh auth login                # once
+gh api repos/NodeSpy/teamclaude/contents/scripts/install.sh -H "Accept: application/vnd.github.raw" | bash
+```
+
+The installer verifies the checksum (and the Sigstore signature and build
+provenance when `cosign` / `gh attestation` are available), installs to
+`~/.local/bin/teamclaude`, and, if the original Node.js TeamClaude is present,
+swaps over in place: it backs up the config, stops the `systemd --user` unit,
+removes the npm package, starts the new binary under the same unit and waits
+for it to be healthy. Any failure rolls back automatically, and
+`scripts/install.sh --rollback` does so on demand. `--dry-run` prints the plan.
+
+Or build from source:
+
+```bash
+cargo install --git https://github.com/NodeSpy/teamclaude --locked
+```
+
+Then:
+
+```bash
 teamclaude login       # browser OAuth, once per account
 teamclaude server      # start the proxy; shows the TUI on a terminal
 teamclaude run         # in another terminal: Claude Code through the proxy
@@ -227,9 +248,19 @@ cargo clippy --all-targets -- -D warnings
 
 Rust 1.80 or newer. No OpenSSL: TLS is rustls with the ring provider.
 
-Tagged releases (`v*`) are built for Linux (x86_64/aarch64, musl) and macOS
-(x86_64/aarch64) by GitHub Actions, with `SHA256SUMS` signed keylessly through
-Sigstore and a build-provenance attestation per archive. Verify with:
+## Releases
+
+Pushing a `v*` tag (or running the Release workflow by hand with a tag name)
+builds static binaries for Linux (x86_64/aarch64, musl) and macOS
+(x86_64/aarch64), publishes them as a GitHub release with `SHA256SUMS` signed
+keylessly through Sigstore and a build-provenance attestation per archive.
+`scripts/install.sh` consumes exactly these assets. To cut a release:
+
+```bash
+git tag -a v2.0.1 -m "v2.0.1" && git push origin v2.0.1
+```
+
+Verify an archive by hand with:
 
 ```bash
 cosign verify-blob --bundle SHA256SUMS.sigstore.json \
