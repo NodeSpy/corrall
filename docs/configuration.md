@@ -112,7 +112,7 @@ directory, for a wrapper resolving a project it has not entered yet.
 | Field | Default | Description |
 | --- | --- | --- |
 | `proxy.port` | `3456` | Local port. `teamclaude server --port N` overrides it for one run |
-| `proxy.host` | `127.0.0.1` | Bind address. Anything non-loopback requires `proxy.apiKey` of at least 16 chars; the server refuses to start otherwise. `TEAMCLAUDE_HOST` overrides, as does `teamclaude server --listen HOST:PORT` for one run |
+| `proxy.host` | `127.0.0.1` | Bind address. Anything non-loopback requires `proxy.apiKey` of at least 16 chars; the server refuses to start otherwise. `TEAMCLAUDE_HOST` overrides, as does `teamclaude server --listen HOST:PORT` for one run. `teamclaude env`/`run` and the CLI's own control calls dial loopback when this is a wildcard (`0.0.0.0`, `::`) — nothing can connect to a wildcard — and dial the host itself when it is specific |
 | `proxy.apiKey` | generated | Key clients present via `x-api-key` (or `Authorization: Bearer tc-…`, or the Basic password on CONNECT). Generated once as `tc-…` and written back if the file has none; a key you set is never touched |
 | `proxy.clientKeys` | `[]` | `[{ "name", "key" }]`; usage is attributed to `name` |
 | `proxy.requireKeyOnLoopback` | `false` | Require the key even from 127.0.0.1. Recommended on shared hosts |

@@ -352,7 +352,7 @@ pub enum ServiceCmd {
 // ── helpers ───────────────────────────────────────────────────
 
 pub fn proxy_base(cfg: &Config) -> String {
-    format!("http://127.0.0.1:{}", cfg.proxy.port)
+    format!("http://{}", cfg.dial_authority())
 }
 
 async fn control_get(cfg: &Config, path: &str) -> Result<Value> {
@@ -1494,7 +1494,9 @@ fn pin_component(s: &str) -> String {
 /// default pool is never named in either form: an install with one pool emits
 /// byte-for-byte the lines it emitted before pools existed.
 pub fn env_lines(cfg: &Config, use_mitm: bool, pin: Option<&str>, pool: Option<&str>) -> Vec<String> {
-    let port = cfg.proxy.port;
+    // What a client on this machine dials, which is not always what the
+    // listener binds: a wildcard bind is reached over loopback.
+    let authority = cfg.dial_authority();
     let mut lines = Vec::new();
     let loopback = crate::security::is_loopback_host(&cfg.bind_host());
     let key = if loopback && !cfg.proxy.require_key_on_loopback { "" } else { cfg.proxy.api_key.as_str() };
@@ -1507,7 +1509,7 @@ pub fn env_lines(cfg: &Config, use_mitm: bool, pin: Option<&str>, pool: Option<&
             (None, None) => String::new(),
         };
         let userinfo = if user.is_empty() && key.is_empty() { String::new() } else { format!("{}:{}@", pin_component(&user), pin_component(key)) };
-        let url = format!("http://{userinfo}127.0.0.1:{port}");
+        let url = format!("http://{userinfo}{authority}");
         for v in ["HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"] {
             lines.push(format!("export {v}={}", shell_quote(&url)));
         }
@@ -1520,7 +1522,7 @@ pub fn env_lines(cfg: &Config, use_mitm: bool, pin: Option<&str>, pool: Option<&
         // the pool keyword comes first.
         let pool_prefix = named.map(|p| format!("{}{p}", crate::pools::POOL_PREFIX)).unwrap_or_default();
         let pin_prefix = pin.map(|p| format!("/tc-acct/{}", pin_component(p))).unwrap_or_default();
-        lines.push(format!("export ANTHROPIC_BASE_URL=http://127.0.0.1:{port}{pool_prefix}{pin_prefix}"));
+        lines.push(format!("export ANTHROPIC_BASE_URL=http://{authority}{pool_prefix}{pin_prefix}"));
         if !key.is_empty() {
             lines.push("unset ANTHROPIC_AUTH_TOKEN".into());
             lines.push(format!("export ANTHROPIC_API_KEY={}", shell_quote(key)));
@@ -1761,6 +1763,80 @@ mod tests {
         cfg.proxy.host = Some("0.0.0.0".into());
         let lines = env_lines(&cfg, false, None, None).join("\n");
         assert!(lines.contains("ANTHROPIC_API_KEY='tc-secret-0123456789abcdef'"));
+    }
+
+    /// The re-login shape that bit claudeacrobat: a profile lookup that comes
+    /// back with no `accountUuid` leaves nothing to match on but the name, and
+    /// must refresh the account it named — in place, keeping the identity that
+    /// account already had — rather than adding a second one beside it.
+    #[test]
+    fn a_relogin_with_an_empty_profile_refreshes_the_account_it_named() {
+        let tokens = |t: &str| oauth::Tokens { access_token: t.into(), refresh_token: Some(format!("r-{t}")), expires_at: 1 };
+        let mut cfg = Config::default();
+        let pool = cfg.default_pool.clone();
+        let first = oauth::Profile {
+            account_uuid: Some("u1".into()),
+            email: Some("alice@example.com".into()),
+            org_uuid: Some("o1".into()),
+            org_name: Some("Acme".into()),
+            rate_limit_tier: Some("tier2".into()),
+            ..Default::default()
+        };
+        assert!(!upsert_oauth(&mut cfg, &pool, "alice@example.com", &tokens("old"), Some(&first)), "the first login adds");
+
+        // The lookup answered, with nothing in it.
+        assert!(
+            upsert_oauth(&mut cfg, &pool, "alice@example.com", &tokens("fresh"), Some(&oauth::Profile::default())),
+            "an empty profile must update the named account, not add another"
+        );
+        // And the same when it failed outright, which is what `--name` is for.
+        assert!(upsert_oauth(&mut cfg, &pool, "alice@example.com", &tokens("fresher"), None));
+
+        let accounts = &cfg.pools[&pool].accounts;
+        assert_eq!(accounts.len(), 1, "{accounts:#?}");
+        let a = &accounts[0];
+        assert_eq!(a.access_token.as_deref(), Some("fresher"));
+        assert_eq!(a.refresh_token.as_deref(), Some("r-fresher"));
+        // Every profile field is merged on its own, so an empty one keeps what
+        // was stored instead of wiping the account's identity.
+        assert_eq!(a.account_uuid.as_deref(), Some("u1"));
+        assert_eq!(a.org_uuid.as_deref(), Some("o1"));
+        assert_eq!(a.org_name.as_deref(), Some("Acme"));
+        assert_eq!(a.email.as_deref(), Some("alice@example.com"));
+        assert_eq!(a.rate_limit_tier.as_deref(), Some("tier2"));
+
+        // A login that is genuinely another account still lands beside it.
+        let bob = oauth::Profile { account_uuid: Some("u2".into()), email: Some("bob@example.com".into()), ..Default::default() };
+        assert!(!upsert_oauth(&mut cfg, &pool, "bob@example.com", &tokens("bob"), Some(&bob)));
+        assert_eq!(cfg.pools[&pool].accounts.len(), 2);
+    }
+
+    /// `env` configures a client on this machine, so it emits an address that
+    /// client can actually dial: loopback for a bind nothing can connect to,
+    /// and the bound host itself when that is the only address answering.
+    #[test]
+    fn a_local_client_is_pointed_at_an_address_it_can_dial() {
+        let mut cfg = Config::default();
+        cfg.proxy.api_key = "tc-secret-0123456789abcdef".into();
+        for host in ["0.0.0.0", "::", "[::]", "127.0.0.1", "localhost"] {
+            cfg.proxy.host = Some(host.into());
+            let lines = env_lines(&cfg, false, None, None);
+            assert!(lines.contains(&"export ANTHROPIC_BASE_URL=http://127.0.0.1:3456".to_string()), "{host}: {lines:?}");
+            assert_eq!(proxy_base(&cfg), "http://127.0.0.1:3456");
+        }
+        // A specific host is kept: loopback is nowhere to dial when the
+        // listener only answers there.
+        cfg.proxy.host = Some("192.168.1.10".into());
+        assert!(env_lines(&cfg, false, None, None).join("\n").contains("ANTHROPIC_BASE_URL=http://192.168.1.10:3456"));
+        assert!(env_lines(&cfg, true, None, None).join("\n").contains("@192.168.1.10:3456'"));
+        assert_eq!(proxy_base(&cfg), "http://192.168.1.10:3456");
+        // A bare IPv6 literal has to come back bracketed to carry a port, and
+        // a specific loopback address is specific too — a listener on `::1`
+        // does not answer on `127.0.0.1`.
+        cfg.proxy.host = Some("fd00::1".into());
+        assert_eq!(proxy_base(&cfg), "http://[fd00::1]:3456");
+        cfg.proxy.host = Some("[::1]".into());
+        assert_eq!(proxy_base(&cfg), "http://[::1]:3456");
     }
 
     /// Naming the default pool must not change a single byte: an existing

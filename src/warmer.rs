@@ -13,7 +13,8 @@ use crate::pools::Pools;
 #[derive(Clone)]
 pub struct Warmer {
     pools: Arc<Pools>,
-    port: u16,
+    /// `host:port` a local client dials, from `Config::dial_authority`.
+    authority: String,
     api_key: Arc<Mutex<String>>,
     interval: Arc<Mutex<u64>>,
     running: Arc<tokio::sync::Mutex<()>>,
@@ -21,10 +22,10 @@ pub struct Warmer {
 }
 
 impl Warmer {
-    pub fn new(pools: Arc<Pools>, port: u16, api_key: &str, interval_secs: u64) -> Warmer {
+    pub fn new(pools: Arc<Pools>, authority: String, api_key: &str, interval_secs: u64) -> Warmer {
         Warmer {
             pools,
-            port,
+            authority,
             api_key: Arc::new(Mutex::new(api_key.to_string())),
             interval: Arc::new(Mutex::new(interval_secs)),
             running: Arc::new(tokio::sync::Mutex::new(())),
@@ -78,7 +79,7 @@ impl Warmer {
 
     async fn warm_one(&self, m: &Manager, prefix: &str, id: &str, name: &str) {
         let key = self.api_key.lock().clone();
-        let base = format!("http://127.0.0.1:{}{prefix}/tc-acct/{}", self.port, id);
+        let base = format!("http://{}{prefix}/tc-acct/{}", self.authority, id);
         let mut cmd = tokio::process::Command::new("claude");
         cmd.args(["-p", "--bare", "--model", &self.model, "--output-format", "text", "hi"])
             .env_remove("TC_ACCT")

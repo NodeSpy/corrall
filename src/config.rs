@@ -671,6 +671,36 @@ impl Config {
         std::env::var("TEAMCLAUDE_HOST").ok().filter(|h| !h.is_empty()).or_else(|| self.proxy.host.clone()).unwrap_or_else(|| "127.0.0.1".to_string())
     }
 
+    /// The host a client *on this machine* dials to reach the listener.
+    ///
+    /// A wildcard bind (`0.0.0.0`, `::`) is an address nothing can connect to,
+    /// so a local client reaches the listener over loopback instead, and
+    /// `localhost` resolves there anyway — both give the `127.0.0.1` every
+    /// release has emitted. Any other host is kept as it stands: when the
+    /// listener only answers on `192.168.1.10` (or on `::1`), `127.0.0.1` is
+    /// nowhere to dial.
+    pub fn dial_host(&self) -> String {
+        let host = self.bind_host();
+        let h = host.trim().trim_start_matches('[').trim_end_matches(']');
+        let wildcard = h.is_empty() || h.parse::<std::net::IpAddr>().map(|ip| ip.is_unspecified()).unwrap_or(false);
+        if wildcard || h.eq_ignore_ascii_case("localhost") {
+            "127.0.0.1".to_string()
+        } else {
+            h.to_string()
+        }
+    }
+
+    /// [`Self::dial_host`] with the port, ready to drop into a URL.
+    pub fn dial_authority(&self) -> String {
+        let h = self.dial_host();
+        // A bare IPv6 literal has to be bracketed before it can carry a port.
+        if h.contains(':') {
+            format!("[{h}]:{}", self.proxy.port)
+        } else {
+            format!("{h}:{}", self.proxy.port)
+        }
+    }
+
     /// Reject configurations that would leak credentials or misroute traffic.
     pub fn validate(&self) -> Result<()> {
         let host = self.bind_host();
