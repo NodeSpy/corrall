@@ -39,6 +39,9 @@ pub enum Command {
     Status {
         #[arg(long)]
         json: bool,
+        /// ANSI colors: auto, always or never
+        #[arg(long, default_value = "auto")]
+        color: String,
     },
     /// Make the running server prefer one account
     Switch {
@@ -135,6 +138,8 @@ pub enum Command {
         #[command(subcommand)]
         cmd: ServiceCmd,
     },
+    /// Replace this binary with the latest release (verified; never runs unattended)
+    Update(crate::update::UpdateArgs),
     /// Call an API endpoint with an account's credentials (GET)
     Api {
         path: String,
@@ -709,14 +714,19 @@ pub fn accounts(verbose: bool, pool: Option<String>) -> Result<()> {
     Ok(())
 }
 
-pub async fn status(json_out: bool) -> Result<()> {
+pub async fn status(json_out: bool, color: &str) -> Result<()> {
     let cfg = Config::load()?.ok_or_else(|| anyhow!("no config yet"))?;
     crate::upstream::init(&cfg)?;
     let st = control_get(&cfg, "/teamclaude/status").await?;
     if json_out {
         println!("{}", serde_json::to_string_pretty(&st)?);
     } else {
-        print!("{}", crate::status::render(&st));
+        let use_color = match color {
+            "always" => true,
+            "never" => false,
+            _ => std::io::IsTerminal::is_terminal(&std::io::stdout()) && std::env::var_os("NO_COLOR").is_none(),
+        };
+        println!("{}", crate::status::render(&st, use_color, crate::quota::now_ms()));
     }
     Ok(())
 }

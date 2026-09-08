@@ -419,6 +419,9 @@ pub struct Config {
     pub session_titles: SessionTitles,
     /// Keep-warm interval in seconds (0 = off). Spends a little quota.
     pub warmup_seconds: u64,
+    /// Check GitHub once a day for a newer release and say so in status and
+    /// the TUI. Notify-only: nothing is ever installed automatically.
+    pub update_check: bool,
     pub mitm: MitmConfig,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub log_dir: Option<String>,
@@ -446,6 +449,7 @@ impl Default for Config {
             event_logging: EventLogging::Hide,
             session_titles: SessionTitles::default(),
             warmup_seconds: 0,
+            update_check: true,
             mitm: MitmConfig::default(),
             log_dir: None,
             log_level: LogLevel::Body,

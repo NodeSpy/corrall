@@ -1,6 +1,6 @@
 [package]
 name = "teamclaude"
-version = "2.0.0"
+version = "2.0.3"
 edition = "2021"
 rust-version = "1.80"
 description = "Multi-account Claude proxy with automatic quota-based rotation for Claude Code, rewritten in Rust"
@@ -54,12 +54,11 @@ ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
 parking_lot = "0.12"
 percent-encoding = "2"
+tempfile = "3"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
-[dev-dependencies]
-tempfile = "3"
 
 [profile.release]
 lto = "thin"
