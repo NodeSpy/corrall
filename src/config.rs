@@ -61,6 +61,12 @@ pub fn crash_log_path() -> PathBuf {
     sibling(&config_path(), "-crash.log", "-crash.log")
 }
 
+/// Short-lived cache of the latest release tag, so repeated `status` calls do
+/// not each shell out to `gh` while the daemon's own check is still pending.
+pub fn update_cache_path() -> PathBuf {
+    sibling(&config_path(), ".update-check.json", ".update-check")
+}
+
 fn sibling(cfg: &Path, json_suffix: &str, other_suffix: &str) -> PathBuf {
     let s = cfg.to_string_lossy();
     if let Some(stem) = s.strip_suffix(".json") {
@@ -496,8 +502,10 @@ pub struct Config {
     pub session_titles: SessionTitles,
     /// Keep-warm interval in seconds (0 = off). Spends a little quota.
     pub warmup_seconds: u64,
-    /// Check GitHub once a day for a newer release and say so in status and
-    /// the TUI. Notify-only: nothing is ever installed automatically.
+    /// Check GitHub for a newer release and say so in status and the TUI: the
+    /// daemon does so once a day, and `status` does one on demand while the
+    /// daemon's first check is still pending. Notify-only: nothing is ever
+    /// installed automatically. Set to false to disable both.
     pub update_check: bool,
     pub mitm: MitmConfig,
     #[serde(skip_serializing_if = "Option::is_none")]

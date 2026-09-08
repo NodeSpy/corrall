@@ -285,4 +285,8 @@ purpose.
 The server checks once a day (`updateCheck`, default on; or
 `CORRALL_DISABLE_UPDATE_CHECK=1`) and only *reports* a newer release in
 `corrall status`, the TUI header and `/corrall/status` (`updateAvailable`).
-Nothing is ever installed unattended.
+While the server's first check is still pending (it runs shortly after
+start), `corrall status` does one on demand so a freshly started proxy
+still shows an available update; the result is cached for an hour in
+`corrall.update-check.json` next to the config. The same flag and variable
+disable both checks. Nothing is ever installed unattended.

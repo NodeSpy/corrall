@@ -198,6 +198,43 @@ pub fn latest_tag_quiet() -> Option<String> {
     latest_tag(&repo()).ok()
 }
 
+/// How long a `status` on-demand check reuses its last on-disk result before
+/// shelling out to `gh` again.
+const CACHE_TTL_MS: i64 = 60 * 60 * 1000;
+
+/// `latest_tag_quiet` behind a short-lived on-disk cache, for the `status`
+/// on-demand check. A fresh cache entry is trusted as-is — including a cached
+/// "could not determine" (`None`), so a machine without `gh`/network is not
+/// re-probed on every `status`. Stale or missing entries trigger one real
+/// check, whose result (tag or not) is written back with the current time.
+pub fn latest_tag_cached() -> Option<String> {
+    if std::env::var_os("CORRALL_DISABLE_UPDATE_CHECK").is_some() {
+        return None;
+    }
+    let now = crate::quota::now_ms();
+    let path = crate::config::update_cache_path();
+    if let Some((checked_at, tag)) = read_tag_cache(&path) {
+        if now - checked_at < CACHE_TTL_MS {
+            return tag;
+        }
+    }
+    let tag = latest_tag_quiet();
+    write_tag_cache(&path, now, tag.as_deref());
+    tag
+}
+
+fn read_tag_cache(path: &Path) -> Option<(i64, Option<String>)> {
+    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    let checked_at = v.get("checkedAt")?.as_i64()?;
+    let tag = v.get("tag").and_then(serde_json::Value::as_str).map(str::to_string);
+    Some((checked_at, tag))
+}
+
+fn write_tag_cache(path: &Path, now: i64, tag: Option<&str>) {
+    let body = serde_json::json!({ "checkedAt": now, "tag": tag }).to_string();
+    let _ = std::fs::write(path, body);
+}
+
 // ── steps ─────────────────────────────────────────────────────
 
 fn latest_tag(repo: &str) -> Result<String> {
@@ -429,6 +466,24 @@ mod tests {
         assert_eq!(target_triple("macos", "aarch64").unwrap(), "aarch64-apple-darwin");
         assert!(target_triple("windows", "x86_64").is_err());
         assert!(target_triple("linux", "riscv64").is_err());
+    }
+
+    #[test]
+    fn tag_cache_round_trips_and_expires() {
+        let path = std::env::temp_dir().join(format!("tc-update-cache-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        // Missing file → nothing to read.
+        assert_eq!(read_tag_cache(&path), None);
+        // A recorded tag comes back with its timestamp.
+        write_tag_cache(&path, 1_000, Some("v9.9.9"));
+        assert_eq!(read_tag_cache(&path), Some((1_000, Some("v9.9.9".to_string()))));
+        // A recorded "no tag" is a real cache entry, distinct from a miss.
+        write_tag_cache(&path, 2_000, None);
+        assert_eq!(read_tag_cache(&path), Some((2_000, None)));
+        // Freshness is the caller's TTL window against checkedAt.
+        let now = 2_000 + CACHE_TTL_MS;
+        assert!(now - 2_000 >= CACHE_TTL_MS, "entry at the TTL edge counts as stale");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
