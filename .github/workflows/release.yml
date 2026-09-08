@@ -51,6 +51,16 @@ jobs:
         uses: taiki-e/setup-cross-toolchain-action@12b7ad4acfa95a1476779d6c06699b96ec1691f8 # v1
         with:
           target: ${{ matrix.target }}
+      - name: Tag must match Cargo.toml version
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          crate="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
+          if [ "v$crate" != "$tag" ]; then
+            echo "::error::tag $tag does not match Cargo.toml version $crate; bump the version and retag" >&2
+            exit 1
+          fi
       - run: cargo build --release --locked --target ${{ matrix.target }}
       - name: Smoke the binary (native targets)
         if: ${{ !matrix.cross }}
