@@ -113,7 +113,7 @@ directory, for a wrapper resolving a project it has not entered yet.
 | --- | --- | --- |
 | `proxy.port` | `3456` | Local port |
 | `proxy.host` | `127.0.0.1` | Bind address. Anything non-loopback requires `proxy.apiKey` of at least 16 chars; the server refuses to start otherwise. `TEAMCLAUDE_HOST` overrides |
-| `proxy.apiKey` | generated | Key clients present via `x-api-key` (or `Authorization: Bearer tc-…`, or the Basic password on CONNECT) |
+| `proxy.apiKey` | generated | Key clients present via `x-api-key` (or `Authorization: Bearer tc-…`, or the Basic password on CONNECT). Generated once as `tc-…` and written back if the file has none; a key you set is never touched |
 | `proxy.clientKeys` | `[]` | `[{ "name", "key" }]`; usage is attributed to `name` |
 | `proxy.requireKeyOnLoopback` | `false` | Require the key even from 127.0.0.1. Recommended on shared hosts |
 | `proxy.sessionDetail` | `false` | Include a per-session breakdown in `/teamclaude/status` |

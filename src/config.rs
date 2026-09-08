@@ -140,12 +140,28 @@ pub struct ProxyConfig {
     pub max_body_bytes: u64,
 }
 
+/// The shared client key. The `tc-` prefix is what tells an operator what they
+/// are looking at in a config file or an environment variable.
+pub fn new_api_key() -> String {
+    format!("tc-{}", random_key(24))
+}
+
+/// Whether a config document on disk still owes itself a shared key. A key the
+/// operator set is left alone however short it is — `validate` is what decides
+/// whether it is long enough for the address being bound.
+fn needs_api_key(doc: &Value) -> bool {
+    match doc.get("proxy").and_then(|p| p.get("apiKey")).and_then(Value::as_str) {
+        Some(k) => k.trim().is_empty(),
+        None => true,
+    }
+}
+
 impl Default for ProxyConfig {
     fn default() -> Self {
         Self {
             port: DEFAULT_PORT,
             host: None,
-            api_key: format!("tc-{}", random_key(24)),
+            api_key: new_api_key(),
             client_keys: Vec::new(),
             require_key_on_loopback: false,
             session_detail: false,
@@ -518,17 +534,28 @@ impl Config {
         };
         let mut doc: Value = serde_json::from_slice(&raw).with_context(|| format!("parsing {}", path.display()))?;
         let migrated = migrate_pools(&mut doc);
+        // A file with no `proxy.apiKey` picks up a fresh one from
+        // `ProxyConfig::default()` on every load, which is worse than none: it
+        // is long enough to satisfy an off-loopback bind, yet no client can
+        // present a key that changes on every restart. Generate it once and
+        // write it back, exactly as the first run does.
+        let keyless = needs_api_key(&doc);
         let mut cfg: Config = serde_json::from_value(doc).with_context(|| format!("parsing {}", path.display()))?;
+        if keyless {
+            cfg.proxy.api_key = new_api_key();
+        }
         cfg.ensure_pools();
         cfg.ensure_account_ids();
         cfg.validate()?;
         warn_if_permissive(&path);
-        if migrated {
-            // Rewrite once so a pre-pools install lands on the new shape without
-            // any manual migration. Failure is not fatal: we already hold a
-            // usable config in memory.
+        if migrated || keyless {
+            // Rewrite once so a pre-pools install lands on the new shape, and a
+            // keyless one on a stable key, without any manual migration.
+            // Failure is not fatal: we already hold a usable config in memory.
             if let Err(e) = cfg.save() {
-                tracing::warn!("could not rewrite {} after pool migration: {e:#}", path.display());
+                tracing::warn!("could not rewrite {}: {e:#}", path.display());
+            } else if keyless {
+                tracing::info!("generated proxy.apiKey in {}", path.display());
             }
         }
         Ok(Some(cfg))
@@ -888,6 +915,23 @@ mod tests {
         let mut c: Config = serde_json::from_value(doc).unwrap();
         c.ensure_pools();
         c
+    }
+
+    #[test]
+    fn a_config_without_a_key_asks_for_one_generated() {
+        let doc = |raw: &str| serde_json::from_str::<Value>(raw).unwrap();
+        assert!(needs_api_key(&doc(r#"{"accounts":[]}"#)), "no proxy block at all");
+        assert!(needs_api_key(&doc(r#"{"proxy":{"port":3456}}"#)), "no apiKey");
+        assert!(needs_api_key(&doc(r#"{"proxy":{"apiKey":"  "}}"#)), "blank apiKey");
+        // A key the operator set is never regenerated, however short: how long
+        // it has to be is `validate`'s call, and it depends on the bind address.
+        assert!(!needs_api_key(&doc(r#"{"proxy":{"apiKey":"short"}}"#)));
+        assert!(!needs_api_key(&doc(r#"{"proxy":{"apiKey":"tc-0123456789abcdef0123"}}"#)));
+
+        let k = new_api_key();
+        assert!(k.starts_with("tc-"), "{k}");
+        assert!(k.len() >= 16, "{k}");
+        assert_ne!(k, new_api_key());
     }
 
     #[test]
