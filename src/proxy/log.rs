@@ -32,7 +32,7 @@ impl RequestLogger {
 
     fn path(&self, req_id: &str) -> PathBuf {
         let ts = chrono::Utc::now().format("%Y%m%dT%H%M%S%.3fZ");
-        self.dir.join(format!("teamclaude-{ts}-{req_id}.log"))
+        self.dir.join(format!("corrall-{ts}-{req_id}.log"))
     }
 
     fn cap(&self, body: &[u8]) -> Vec<u8> {
@@ -107,7 +107,7 @@ pub fn sweep_dir(dir: &Path, max_age: Duration) {
     let now = std::time::SystemTime::now();
     for e in rd.flatten() {
         let name = e.file_name().to_string_lossy().to_string();
-        if !(name.starts_with("teamclaude-") && name.ends_with(".log")) {
+        if !(name.starts_with("corrall-") && name.ends_with(".log")) {
             continue;
         }
         if let Ok(md) = e.metadata() {

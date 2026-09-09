@@ -64,15 +64,15 @@ jobs:
       - run: cargo build --release --locked --target ${{ matrix.target }}
       - name: Smoke the binary (native targets)
         if: ${{ !matrix.cross }}
-        run: target/${{ matrix.target }}/release/teamclaude --version
+        run: target/${{ matrix.target }}/release/corrall --version
       - name: Package
         shell: bash
         run: |
           set -euo pipefail
           tag="${{ github.event.inputs.tag || github.ref_name }}"
-          name="teamclaude-${tag}-${{ matrix.target }}"
+          name="corrall-${tag}-${{ matrix.target }}"
           mkdir -p "dist/$name"
-          cp "target/${{ matrix.target }}/release/teamclaude" README.md LICENSE SECURITY.md "dist/$name/"
+          cp "target/${{ matrix.target }}/release/corrall" README.md LICENSE SECURITY.md "dist/$name/"
           cp -r docs "dist/$name/docs"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
           (cd dist && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256")

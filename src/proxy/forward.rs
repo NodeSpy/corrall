@@ -27,7 +27,7 @@ pub const HOP_BY_HOP: &[&str] =
 pub const CLIENT_CREDENTIAL_HEADERS: &[&str] = &["x-api-key", "authorization", "chatgpt-account-id", "cookie"];
 
 fn rate_limit_absorb_max() -> u64 {
-    std::env::var("TEAMCLAUDE_RATE_LIMIT_ABSORB_MAX_SECONDS").ok().and_then(|v| v.parse().ok()).unwrap_or(60)
+    std::env::var("CORRALL_RATE_LIMIT_ABSORB_MAX_SECONDS").ok().and_then(|v| v.parse().ok()).unwrap_or(60)
 }
 
 pub fn json_response(status: StatusCode, body: Value) -> Response<BoxBody> {

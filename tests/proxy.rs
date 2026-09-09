@@ -20,10 +20,10 @@ use hyper_util::rt::TokioIo;
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
 
-use teamclaude::config::{AccountConfig, AccountType, Config, PoolConfig, ProxyConfig, DEFAULT_POOL};
-use teamclaude::manager::Manager;
-use teamclaude::pools::Pools;
-use teamclaude::proxy::server::{run, Ctx, CtxInner, Metrics};
+use corrall::config::{AccountConfig, AccountType, Config, PoolConfig, ProxyConfig, DEFAULT_POOL};
+use corrall::manager::Manager;
+use corrall::pools::Pools;
+use corrall::proxy::server::{run, Ctx, CtxInner, Metrics};
 
 const KEY: &str = "tc-test-key-0123456789abcdef";
 
@@ -200,11 +200,11 @@ async fn spawn_mock() -> Mock {
 fn test_env() {
     static ONCE: OnceLock<()> = OnceLock::new();
     ONCE.get_or_init(|| {
-        let dir = std::env::temp_dir().join(format!("teamclaude-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("corrall-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("TEAMCLAUDE_CONFIG", dir.join("teamclaude.json"));
+        std::env::set_var("CORRALL_CONFIG", dir.join("corrall.json"));
         let cfg = Config { proxy: ProxyConfig { api_key: KEY.into(), ..Default::default() }, ..Default::default() };
-        teamclaude::upstream::init(&cfg).unwrap();
+        corrall::upstream::init(&cfg).unwrap();
     });
 }
 
@@ -256,7 +256,7 @@ async fn spawn_proxy(mut cfg: Config) -> Proxy {
         reload: None,
         metrics: Metrics::default(),
         tls: parking_lot::RwLock::new(None),
-        titles: teamclaude::titles::Titles::new(&cfg.session_titles),
+        titles: corrall::titles::Titles::new(&cfg.session_titles),
     }));
     let (_stx, srx) = tokio::sync::watch::channel(false);
     let bind: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
@@ -308,17 +308,17 @@ async fn auth_gate_loopback_rebinding_browser_and_keys() {
     let mock = spawn_mock().await;
     let p = spawn_proxy(cfg_with(vec![account("a", "tok-a", 0, &mock.url())])).await;
     let c = http();
-    let ok = c.get(p.url("/teamclaude/health")).send().await.unwrap();
+    let ok = c.get(p.url("/corrall/health")).send().await.unwrap();
     assert_eq!(ok.status(), 200, "loopback with loopback Host is exempt");
-    let rebind = c.get(p.url("/teamclaude/status")).header("host", "attacker.example:3456").send().await.unwrap();
+    let rebind = c.get(p.url("/corrall/status")).header("host", "attacker.example:3456").send().await.unwrap();
     assert_eq!(rebind.status(), 401, "DNS rebinding: non-loopback Host is refused");
-    let origin = c.get(p.url("/teamclaude/status")).header("origin", "http://evil").send().await.unwrap();
+    let origin = c.get(p.url("/corrall/status")).header("origin", "http://evil").send().await.unwrap();
     assert_eq!(origin.status(), 401, "browser-originated request is refused");
     let sfs = c.post(p.url("/v1/messages")).header("sec-fetch-site", "cross-site").json(&msg("claude-opus-5")).send().await.unwrap();
     assert_eq!(sfs.status(), 401, "no-cors POST from a page is refused on data paths too");
-    let keyed = c.get(p.url("/teamclaude/status")).header("host", "attacker.example").header("x-api-key", KEY).send().await.unwrap();
+    let keyed = c.get(p.url("/corrall/status")).header("host", "attacker.example").header("x-api-key", KEY).send().await.unwrap();
     assert_eq!(keyed.status(), 200, "a valid key works regardless of Host");
-    let wrong = c.get(p.url("/teamclaude/status")).header("host", "attacker.example").header("x-api-key", "nope").send().await.unwrap();
+    let wrong = c.get(p.url("/corrall/status")).header("host", "attacker.example").header("x-api-key", "nope").send().await.unwrap();
     assert_eq!(wrong.status(), 401);
     assert!(mock.seen().is_empty(), "nothing reached upstream");
 }
@@ -542,7 +542,7 @@ async fn blocked_models_and_body_limits() {
     let big = json!({ "model": "claude-opus-5", "messages": [{ "role": "user", "content": "x".repeat(5000) }] });
     let (st, _, _) = post(&p, "/v1/messages", big).await;
     assert_eq!(st, StatusCode::PAYLOAD_TOO_LARGE);
-    let r = http().post(p.url("/teamclaude/switch")).body("a".repeat(70_000)).send().await.unwrap();
+    let r = http().post(p.url("/corrall/switch")).body("a".repeat(70_000)).send().await.unwrap();
     assert_eq!(r.status(), 413);
     assert!(mock.seen().is_empty());
 }
@@ -653,7 +653,7 @@ async fn distribute_sessions_pins_and_spreads() {
 async fn routes_restrict_and_route_pin_endpoint_works() {
     let mock = spawn_mock().await;
     let mut cfg = cfg_with(vec![account("a", "tok-a", 0, &mock.url()), account("b", "tok-b", 5, &mock.url())]);
-    pool_of(&mut cfg).routes.push(teamclaude::config::RouteConfig {
+    pool_of(&mut cfg).routes.push(corrall::config::RouteConfig {
         name: "fable".into(),
         patterns: vec!["*fable*".into()],
         accounts: vec!["b".into()],
@@ -664,7 +664,7 @@ async fn routes_restrict_and_route_pin_endpoint_works() {
     assert_eq!(v["served_by"], "tok-b");
     let (_, v, _) = post(&p, "/v1/messages", msg("claude-opus-5")).await;
     assert_eq!(v["served_by"], "tok-a");
-    let r = http().post(p.url("/teamclaude/switch")).json(&json!({ "account": "b" })).send().await.unwrap();
+    let r = http().post(p.url("/corrall/switch")).json(&json!({ "account": "b" })).send().await.unwrap();
     assert_eq!(r.status(), 200);
     let (_, v, _) = post(&p, "/v1/messages", msg("claude-opus-5")).await;
     assert_eq!(v["served_by"], "tok-a", "a has strictly better priority, so the switch is a weak preference");
@@ -730,13 +730,13 @@ async fn codex_requests_use_codex_pool_only() {
 async fn usage_dimensions_are_consumed_and_attributed() {
     let mock = spawn_mock().await;
     let mut cfg = cfg_with(vec![account("a", "tok-a", 0, &mock.url())]);
-    cfg.proxy.usage_dimensions = vec![teamclaude::config::UsageDimension { name: "project".into(), header: "x-teamclaude-project".into() }];
+    cfg.proxy.usage_dimensions = vec![corrall::config::UsageDimension { name: "project".into(), header: "x-corrall-project".into() }];
     let p = spawn_proxy(cfg).await;
-    let r = http().post(p.url("/v1/messages")).header("x-teamclaude-project", "NodeSpy/teamclaude").json(&msg("claude-opus-5")).send().await.unwrap();
+    let r = http().post(p.url("/v1/messages")).header("x-corrall-project", "NodeSpy/corrall").json(&msg("claude-opus-5")).send().await.unwrap();
     assert_eq!(r.status(), 200);
-    assert!(!mock.seen()[0].headers.contains_key("x-teamclaude-project"), "dimension header stays on this side");
+    assert!(!mock.seen()[0].headers.contains_key("x-corrall-project"), "dimension header stays on this side");
     let st = p.manager.status(false);
-    assert_eq!(st["usageDimensions"]["project"]["NodeSpy/teamclaude"]["totalRequests"], 1);
+    assert_eq!(st["usageDimensions"]["project"]["NodeSpy/corrall"]["totalRequests"], 1);
 }
 
 #[tokio::test]
@@ -745,18 +745,18 @@ async fn control_plane_endpoints() {
     let p = spawn_proxy(cfg_with(vec![account("a", "tok-a", 0, &mock.url())])).await;
     let _ = post(&p, "/v1/messages", msg("claude-opus-5")).await;
     let c = http();
-    let metrics = c.get(p.url("/teamclaude/metrics")).send().await.unwrap().text().await.unwrap();
-    assert!(metrics.contains("teamclaude_requests_total 1"));
+    let metrics = c.get(p.url("/corrall/metrics")).send().await.unwrap().text().await.unwrap();
+    assert!(metrics.contains("corrall_requests_total 1"));
     // Per-account series carry the pool they rotate in, so two pools holding
     // same-named accounts stay distinguishable.
-    assert!(metrics.contains("teamclaude_account_quota_utilization{pool=\"default\",account=\"a\",bucket=\"unified5h\"} 0.4"), "{metrics}");
-    let quota: Value = c.get(p.url("/teamclaude/quota")).send().await.unwrap().json().await.unwrap();
+    assert!(metrics.contains("corrall_account_quota_utilization{pool=\"default\",account=\"a\",bucket=\"unified5h\"} 0.4"), "{metrics}");
+    let quota: Value = c.get(p.url("/corrall/quota")).send().await.unwrap().json().await.unwrap();
     assert_eq!(quota["pool"], "default");
     assert_eq!(quota["accounts"][0]["unified5h"], 0.4);
-    let dash = c.get(p.url("/teamclaude/dashboard")).send().await.unwrap();
+    let dash = c.get(p.url("/corrall/dashboard")).send().await.unwrap();
     assert_eq!(dash.status(), 200);
     assert!(dash.headers().get("content-security-policy").is_some());
-    let reload = c.post(p.url("/teamclaude/reload")).send().await.unwrap();
+    let reload = c.post(p.url("/corrall/reload")).send().await.unwrap();
     assert_eq!(reload.status(), 501, "no reload hook in tests");
     let _ = p.ctx.config();
 }
@@ -767,10 +767,10 @@ async fn mitm_connect_intercepts_with_local_ca_and_refuses_blind_tunnels() {
     let mut cfg = cfg_with(vec![account("a", "tok-a", 0, &mock.url())]);
     cfg.upstream = mock.url();
     let p = spawn_proxy(cfg).await;
-    let ca = std::fs::read(teamclaude::proxy::mitm::ca_cert_path())
+    let ca = std::fs::read(corrall::proxy::mitm::ca_cert_path())
         .or_else(|_| {
             p.ctx.tls_config().unwrap();
-            std::fs::read(teamclaude::proxy::mitm::ca_cert_path())
+            std::fs::read(corrall::proxy::mitm::ca_cert_path())
         })
         .unwrap();
     let cert = reqwest::Certificate::from_pem(&ca).unwrap();

@@ -3,16 +3,16 @@
 //! claudeacrobat is the sibling Go proxy. It keeps one JSON file per account
 //! under its state directory: `accounts/` for the pool that serves unprefixed
 //! requests, and `pools/<name>/accounts/` for a named one. This module turns
-//! those files into teamclaude [`AccountConfig`] values; `teamclaude
+//! those files into corrall [`AccountConfig`] values; `corrall
 //! import-claudeacrobat` is what writes them into the config.
 //!
 //! The mapping is the inverse of claudeacrobat's own `import-teamclaude`. An
 //! `owned` account — claudeacrobat holds the tokens and refreshes them — becomes
 //! an OAuth account with the tokens inline. A `linked` one — tokens are read
 //! live out of a Claude Code credentials file — becomes an OAuth account whose
-//! `importFrom` points at that same file, which is exactly how teamclaude
+//! `importFrom` points at that same file, which is exactly how corrall
 //! models the arrangement. Nothing else in claudeacrobat's model has a
-//! teamclaude equivalent, so anything that cannot map is reported rather than
+//! corrall equivalent, so anything that cannot map is reported rather than
 //! guessed at.
 //!
 //! Nothing here touches claudeacrobat's files: the import is a read, and both
@@ -57,7 +57,7 @@ fn state_dir_of(path: &Path) -> Option<PathBuf> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Mapped {
     /// The pool it came from: `None` for claudeacrobat's default pool, which
-    /// belongs in whichever pool teamclaude serves unprefixed requests from.
+    /// belongs in whichever pool corrall serves unprefixed requests from.
     pub pool: Option<String>,
     pub account: AccountConfig,
 }
@@ -73,7 +73,7 @@ impl Mapped {
     }
 }
 
-/// A claudeacrobat account that has no teamclaude equivalent.
+/// A claudeacrobat account that has no corrall equivalent.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Skipped {
     pub name: String,
@@ -97,12 +97,12 @@ pub fn plan(dir: &Path) -> Result<Plan> {
     collect(&dir.join("accounts"), None, &mut plan);
     for name in pool_names(&dir.join("pools")) {
         let accounts = dir.join("pools").join(&name).join("accounts");
-        // teamclaude's pool charset is the stricter of the two, and the name
+        // corrall's pool charset is the stricter of the two, and the name
         // becomes a URL segment here. Reject it loudly rather than mangling it
         // into something the router would not recognise.
         if let Err(e) = validate_pool_name(&name) {
             for f in account_files(&accounts) {
-                plan.skipped.push(Skipped { name: file_label(&f), reason: format!("pool \"{name}\" cannot be named that in teamclaude: {e}") });
+                plan.skipped.push(Skipped { name: file_label(&f), reason: format!("pool \"{name}\" cannot be named that in corrall: {e}") });
             }
             continue;
         }
@@ -153,7 +153,7 @@ fn read_account(path: &Path) -> Result<AccountConfig, String> {
 //
 // Only the fields that carry over are named. `source` and `addedAt` are
 // claudeacrobat bookkeeping, and its per-account state (usage windows, cooldown)
-// lives in a separate state.json that teamclaude rebuilds by probing.
+// lives in a separate state.json that corrall rebuilds by probing.
 
 #[derive(Debug, Default, Deserialize)]
 struct AccountFile {
@@ -202,7 +202,7 @@ struct OAuthTokens {
     access_token: String,
     #[serde(default)]
     refresh_token: Option<String>,
-    /// ms since epoch, same unit as teamclaude's `expiresAt`.
+    /// ms since epoch, same unit as corrall's `expiresAt`.
     #[serde(default)]
     expires_at: i64,
     #[serde(default)]
@@ -223,7 +223,7 @@ fn map(file: AccountFile) -> Result<AccountConfig, String> {
             let o = file.oauth.filter(|o| !o.access_token.trim().is_empty()).ok_or("an owned account with no access token")?;
             a.access_token = Some(o.access_token);
             a.refresh_token = some_text(o.refresh_token);
-            // 0 means "unknown" in claudeacrobat; teamclaude reads a missing
+            // 0 means "unknown" in claudeacrobat; corrall reads a missing
             // expiry as "refresh before the next request", which is what we want.
             a.expires_at = (o.expires_at > 0).then_some(o.expires_at);
             a.subscription_type = some_text(o.subscription_type);
@@ -341,14 +341,14 @@ mod tests {
     }
 
     #[test]
-    fn a_pool_teamclaude_cannot_name_is_skipped_not_mangled() {
+    fn a_pool_corrall_cannot_name_is_skipped_not_mangled() {
         let dir = tempfile::tempdir().unwrap();
         let d = dir.path();
         write(&d.join("pools/Work/accounts/a.json"), r#"{"name":"a","kind":"owned","oauth":{"accessToken":"t"}}"#);
         let p = plan(d).unwrap();
         assert!(p.accounts.is_empty());
         assert_eq!(p.skipped.len(), 1);
-        assert!(p.skipped[0].reason.contains("cannot be named that in teamclaude"), "{:?}", p.skipped[0].reason);
+        assert!(p.skipped[0].reason.contains("cannot be named that in corrall"), "{:?}", p.skipped[0].reason);
     }
 
     #[test]

@@ -12,15 +12,15 @@ use crate::config::Config;
 static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
 pub fn headers_timeout() -> Duration {
-    env_ms("TEAMCLAUDE_UPSTREAM_HEADERS_TIMEOUT_MS", 120_000)
+    env_ms("CORRALL_UPSTREAM_HEADERS_TIMEOUT_MS", 120_000)
 }
 
 pub fn body_idle_timeout() -> Duration {
-    env_ms("TEAMCLAUDE_UPSTREAM_BODY_TIMEOUT_MS", 120_000)
+    env_ms("CORRALL_UPSTREAM_BODY_TIMEOUT_MS", 120_000)
 }
 
 pub fn refresh_timeout() -> Duration {
-    env_ms("TEAMCLAUDE_REFRESH_TIMEOUT_MS", 30_000)
+    env_ms("CORRALL_REFRESH_TIMEOUT_MS", 30_000)
 }
 
 fn env_ms(name: &str, default: u64) -> Duration {
@@ -35,13 +35,13 @@ pub fn init(cfg: &Config) -> Result<()> {
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(20))
         .pool_idle_timeout(Duration::from_secs(90))
-        .pool_max_idle_per_host(std::env::var("TEAMCLAUDE_UPSTREAM_MAX_SOCKETS").ok().and_then(|v| v.parse().ok()).unwrap_or(256))
+        .pool_max_idle_per_host(std::env::var("CORRALL_UPSTREAM_MAX_SOCKETS").ok().and_then(|v| v.parse().ok()).unwrap_or(256))
         .tcp_keepalive(Duration::from_secs(30))
         .http1_only()
         .no_gzip()
         .no_brotli()
         .no_deflate()
-        .user_agent(format!("teamclaude/{}", env!("CARGO_PKG_VERSION")));
+        .user_agent(format!("corrall/{}", env!("CARGO_PKG_VERSION")));
 
     match resolve_proxy(cfg) {
         ProxySetting::Env => {}

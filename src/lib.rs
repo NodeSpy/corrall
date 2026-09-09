@@ -1,4 +1,4 @@
-//! TeamClaude library: everything the binary uses, exposed so integration
+//! Corrall library: everything the binary uses, exposed so integration
 //! tests can drive the proxy in-process.
 
 pub mod cli;

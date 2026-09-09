@@ -1,4 +1,4 @@
-# TeamClaude (Rust)
+# Corrall (Rust)
 
 Multi-account Claude proxy with automatic quota-based rotation for
 [Claude Code](https://claude.ai/claude-code), rewritten in Rust with the
@@ -11,8 +11,10 @@ close to its 5-hour or weekly limit. The session keeps running instead of
 stopping on a 429.
 
 This is a from-scratch port of [KarpelesLab/teamclaude](https://github.com/KarpelesLab/teamclaude)
-(MIT). The config file format is compatible, so an existing
-`~/.config/teamclaude.json` works unchanged.
+(MIT), published as TeamClaude until it was renamed to Corrall. The config
+file format is compatible: the installer renames an existing
+`~/.config/teamclaude.json` for you, see
+[Migrating from TeamClaude](#migrating-from-teamclaude).
 
 ## Quick start
 
@@ -21,37 +23,73 @@ through the GitHub CLI):
 
 ```bash
 gh auth login                # once
-gh api repos/NodeSpy/teamclaude/contents/scripts/install.sh -H "Accept: application/vnd.github.raw" | bash
+gh api repos/NodeSpy/corrall/contents/scripts/install.sh -H "Accept: application/vnd.github.raw" | bash
 ```
 
 The installer verifies the checksum (and the Sigstore signature and build
 provenance when `cosign` / `gh attestation` are available), installs to
-`~/.local/bin/teamclaude`, and, if the original Node.js TeamClaude is present,
-swaps over in place: it backs up the config, stops the `systemd --user` unit,
-removes the npm package, starts the new binary under the same unit and waits
-for it to be healthy. Any failure rolls back automatically, and
-`scripts/install.sh --rollback` does so on demand. `--dry-run` prints the plan.
+`~/.local/bin/corrall`, and, if a TeamClaude install is present (this project
+before the rename, or the original Node.js one), migrates it in place: it backs
+up the config, stops the `systemd --user` unit, renames the config, state and
+MITM certificate files, replaces the unit, removes the old binary and the npm
+package, then starts the new binary and waits for it to be healthy. Any failure
+rolls back automatically, and `scripts/install.sh --rollback` does so on
+demand. `--dry-run` prints the plan.
 
 Or build from source:
 
 ```bash
-cargo install --git https://github.com/NodeSpy/teamclaude --locked
+cargo install --git https://github.com/NodeSpy/corrall --locked
 ```
 
 Then:
 
 ```bash
-teamclaude login       # browser OAuth, once per account
-teamclaude server      # start the proxy; shows the TUI on a terminal
-teamclaude run         # in another terminal: Claude Code through the proxy
+corrall login       # browser OAuth, once per account
+corrall server      # start the proxy; shows the TUI on a terminal
+corrall run         # in another terminal: Claude Code through the proxy
 ```
 
-Already logged into Claude Code? `teamclaude import` copies its credentials.
-`teamclaude import --link` keeps reading them from Claude Code's own store on
+Already logged into Claude Code? `corrall import` copies its credentials.
+`corrall import --link` keeps reading them from Claude Code's own store on
 every reload instead, so a `/login` there is picked up automatically.
 
-Coming from [claudeacrobat](#coming-from-claudeacrobat)? `teamclaude
+Coming from [claudeacrobat](#coming-from-claudeacrobat)? `corrall
 import-claudeacrobat` brings its accounts and pools across.
+
+## Migrating from TeamClaude
+
+Corrall is the same program under a new name, and everything that carried the
+old name moves with it:
+
+| TeamClaude | Corrall |
+| --- | --- |
+| `~/.local/bin/teamclaude` | `~/.local/bin/corrall` |
+| `~/.config/teamclaude.json`, `teamclaude.state.json`, `teamclaude.lock` | `corrall.json`, `corrall.state.json`, `corrall.lock` |
+| `teamclaude-ca.pem`, `teamclaude-leaf.pem`, `teamclaude-leaf.key` | `corrall-ca.pem`, `corrall-leaf.pem`, `corrall-leaf.key` (same CA, so nothing to re-trust) |
+| `teamclaude.service` | `corrall.service` |
+| `TEAMCLAUDE_CONFIG`, `TEAMCLAUDE_HOST`, `TEAMCLAUDE_LOG`, every other `TEAMCLAUDE_*` | `CORRALL_*` |
+| `/teamclaude/status`, `/teamclaude/health`, … | `/corrall/status`, `/corrall/health`, … |
+| `teamclaude_requests_total` and the other metrics | `corrall_*` |
+| `NodeSpy/teamclaude` releases, `teamclaude-vX-<triple>.tar.gz` | `NodeSpy/corrall`, `corrall-vX-<triple>.tar.gz` |
+
+`TC_ACCT`, `TC_POOL` and the `/tc-acct/` pin prefix are unchanged. The
+`@karpeleslab/teamclaude` npm package and `KarpelesLab/teamclaude` keep their
+names: they are the original project this one was ported from.
+
+Run the installer from the quick start. It detects a TeamClaude install and
+performs the whole move, with `--dry-run` showing exactly what it would touch
+and `--rollback` undoing it. `teamclaude update` cannot cross the rename: it
+looks for release assets under the old name. Afterwards update anything of
+yours that spelled the old name, which the installer lists: shell wrappers
+(`eval "$(corrall env)"`), `TEAMCLAUDE_*` environment variables, dashboards
+and health checks on `/teamclaude/*`, Prometheus rules on `teamclaude_*`, and a
+Codex `model_provider` you may have named `teamclaude`.
+
+To migrate by hand instead, stop the old server, rename the files in the table
+above, and reinstall the unit with `corrall service install`. A `corrall`
+binary that finds `teamclaude.json` but no `corrall.json` refuses to start
+rather than create an empty config beside your accounts.
 
 ## What it does
 
@@ -94,65 +132,65 @@ import-claudeacrobat` brings its accounts and pools across.
   Code's own files (`titles on`), usage dimensions for per-project attribution.
 - Client-side OAuth token refresh and Remote Control (`/v1/code/*`, including
   its WebSocket) pass through untouched with the client's own credentials.
-- Browser dashboard at `/teamclaude/dashboard`, plus `/teamclaude/status`,
-  `/teamclaude/quota`, `/teamclaude/metrics` (Prometheus) and `/teamclaude/health`.
+- Browser dashboard at `/corrall/dashboard`, plus `/corrall/status`,
+  `/corrall/quota`, `/corrall/metrics` (Prometheus) and `/corrall/health`.
 
 ## Everyday commands
 
 ```bash
-teamclaude accounts -v          # accounts with tier and token status
-teamclaude status               # live proxy status (needs a running server)
-teamclaude status --json
-teamclaude switch <name>        # make the server prefer one account
-teamclaude disable <name>       # pause an account without removing it
-teamclaude priority <name> 1    # rotation order, lower = preferred
-teamclaude threshold 90         # switch at 90% (or: threshold unified7d=90)
-teamclaude distribute on        # spread sessions across equal-priority accounts
-teamclaude probe 300            # background quota probe every 300s (zero-spend)
-teamclaude warmup 600           # keep idle accounts' 5h windows running (spends a little)
-teamclaude expiry on            # expiry-pressure routing (--tolerance 1.5 --preempt on)
-teamclaude titles on            # name activity rows after the Claude Code session
-teamclaude login --codex        # add an OpenAI Codex subscription
-teamclaude import --codex       # or import the Codex CLI's login
-teamclaude import-claudeacrobat --dry-run   # accounts from a claudeacrobat install
-teamclaude route add fable --match '*fable*' --accounts personal-max
-teamclaude pool list            # pools with their accounts and settings
-teamclaude pool add work        # a second fleet, empty
-teamclaude pool set work --threshold 90 --hold 120
-teamclaude pool set work --account spare@example.com   # move an account in
-teamclaude pool set work --match-path ~/Projects/acme  # auto-select it there
-teamclaude pool set work --match-remote '(?i)acme/'    # ...or by git remote
-teamclaude login --pool work    # add an account to that pool
-teamclaude env --pool work      # export lines pointing at that pool
-teamclaude env                  # export lines for eval "$(teamclaude env)"
-teamclaude ca-path              # where the MITM CA certificate lives
-teamclaude config check         # validate and print a redacted config
-teamclaude server --listen 127.0.0.1:3457   # bind elsewhere for one run
-teamclaude update --check       # is there a newer release?
-teamclaude update               # install it and restart the service
-teamclaude service install      # systemd --user unit (Linux)
-teamclaude --help
+corrall accounts -v          # accounts with tier and token status
+corrall status               # live proxy status (needs a running server)
+corrall status --json
+corrall switch <name>        # make the server prefer one account
+corrall disable <name>       # pause an account without removing it
+corrall priority <name> 1    # rotation order, lower = preferred
+corrall threshold 90         # switch at 90% (or: threshold unified7d=90)
+corrall distribute on        # spread sessions across equal-priority accounts
+corrall probe 300            # background quota probe every 300s (zero-spend)
+corrall warmup 600           # keep idle accounts' 5h windows running (spends a little)
+corrall expiry on            # expiry-pressure routing (--tolerance 1.5 --preempt on)
+corrall titles on            # name activity rows after the Claude Code session
+corrall login --codex        # add an OpenAI Codex subscription
+corrall import --codex       # or import the Codex CLI's login
+corrall import-claudeacrobat --dry-run   # accounts from a claudeacrobat install
+corrall route add fable --match '*fable*' --accounts personal-max
+corrall pool list            # pools with their accounts and settings
+corrall pool add work        # a second fleet, empty
+corrall pool set work --threshold 90 --hold 120
+corrall pool set work --account spare@example.com   # move an account in
+corrall pool set work --match-path ~/Projects/acme  # auto-select it there
+corrall pool set work --match-remote '(?i)acme/'    # ...or by git remote
+corrall login --pool work    # add an account to that pool
+corrall env --pool work      # export lines pointing at that pool
+corrall env                  # export lines for eval "$(corrall env)"
+corrall ca-path              # where the MITM CA certificate lives
+corrall config check         # validate and print a redacted config
+corrall server --listen 127.0.0.1:3457   # bind elsewhere for one run
+corrall update --check       # is there a newer release?
+corrall update               # install it and restart the service
+corrall service install      # systemd --user unit (Linux)
+corrall --help
 ```
 
 Every account-changing command notifies a running server to reload; there is
-also `POST /teamclaude/reload`.
+also `POST /corrall/reload`.
 
 Every account command takes `--pool <name>` (or `TC_POOL` in the environment)
 and defaults to the pool named by `defaultPool`, so nothing has to change until
-a second pool exists. `teamclaude pool rm` refuses a pool that still holds
+a second pool exists. `corrall pool rm` refuses a pool that still holds
 accounts unless `--force` is given.
 
 With `--match-path` / `--match-remote` / `--match-env` rules in place, the
 usual wrapper needs no per-project cases at all:
 
 ```bash
-eval "$(teamclaude env)"; exec claude "$@"
+eval "$(corrall env)"; exec claude "$@"
 ```
 
 `env` matches the launch directory (or `--cwd DIR`) against every non-default
 pool in sorted name order, first match wins, default pool otherwise. Exports go
 to stdout; when a rule fires, the pool and the reason go to stderr
-(`[TeamClaude] pool "work" (path ~/Projects/acme)`). With no rules configured
+(`[Corrall] pool "work" (path ~/Projects/acme)`). With no rules configured
 it stays silent and emits exactly what it always did. `--pool` and `TC_POOL`
 skip matching. See [docs/configuration.md](docs/configuration.md#auto-selecting-a-pool).
 
@@ -160,18 +198,18 @@ skip matching. See [docs/configuration.md](docs/configuration.md#auto-selecting-
 
 1. Claude Code talks to the local proxy instead of `api.anthropic.com`, either
    through `ANTHROPIC_BASE_URL` or through `HTTPS_PROXY` plus the local CA
-   (`teamclaude run` and `teamclaude env` set both up).
+   (`corrall run` and `corrall env` set both up).
 2. A `/pool/<name>` prefix on the base URL picks the fleet that serves the
    request; without one it is the pool named by `defaultPool`. The prefix is
    stripped before forwarding, and an unknown pool falls back to the default
    rather than failing. In MITM mode there is no local URL to carry it, so the
    pool rides in the proxy username next to the optional account pin
-   (`http://[<pin>]~<pool>:@127.0.0.1:3456`); `teamclaude env --pool` writes
+   (`http://[<pin>]~<pool>:@127.0.0.1:3456`); `corrall env --pool` writes
    whichever form applies.
 3. The proxy picks an eligible account from that pool, injects the account's
    real token and rewrites `account_uuid` in the request body to match.
 4. `anthropic-ratelimit-unified-*` response headers feed the session (5h) and
-   weekly (7d) quota view, which is persisted to `teamclaude.state.json` and
+   weekly (7d) quota view, which is persisted to `corrall.state.json` and
    survives a restart.
 5. At the threshold, rotation moves on. On a quota 429 the request is resent on
    another account of the same pool, so the client never sees the limit while
@@ -181,8 +219,8 @@ skip matching. See [docs/configuration.md](docs/configuration.md#auto-selecting-
 
 ## Configuration
 
-Config lives at `~/.config/teamclaude.json` (`$XDG_CONFIG_HOME` and
-`$TEAMCLAUDE_CONFIG` honoured). It is written `0600` and atomically; unknown
+Config lives at `~/.config/corrall.json` (`$XDG_CONFIG_HOME` and
+`$CORRALL_CONFIG` honoured). It is written `0600` and atomically; unknown
 keys are preserved so hand edits are safe. A proxy API key is generated on
 first use. See [docs/configuration.md](docs/configuration.md) for every field.
 
@@ -230,12 +268,12 @@ upgrade needs no manual work.
 
 [claudeacrobat](https://github.com/EdnitionCode/claudeacrobat) is the sibling Go
 proxy; the two share this design and can run side by side on different ports.
-`teamclaude import-claudeacrobat` brings its accounts across:
+`corrall import-claudeacrobat` brings its accounts across:
 
 ```bash
-teamclaude import-claudeacrobat --dry-run   # what would land where
-teamclaude import-claudeacrobat             # keep its pool layout
-teamclaude import-claudeacrobat --pool work # or put everything in one pool
+corrall import-claudeacrobat --dry-run   # what would land where
+corrall import-claudeacrobat             # keep its pool layout
+corrall import-claudeacrobat --pool work # or put everything in one pool
 ```
 
 An account claudeacrobat owns arrives with its tokens; one it reads live from
@@ -271,12 +309,12 @@ short:
 - **Safer MITM defaults.** Blind CONNECT tunnels to other hosts are off unless
   `mitm.allowTunnel` is set, and then refuse private addresses and non-443
   ports. The CA private key is never written to disk.
-- **No secret in the process tree.** `teamclaude run`/`env` put the proxy key in
+- **No secret in the process tree.** `corrall run`/`env` put the proxy key in
   the environment only when the proxy is bound off-loopback; on loopback the
   account pin and pool name travel alone.
 - **OAuth callback hardened.** The login listener binds loopback only and checks
   `state` before trusting an `error` parameter.
-- **No unattended updates.** `teamclaude update` is explicit, verified against the signed checksums, fenced against downgrades and major jumps, and rolls back if the restarted server is unhealthy. The daily check only reports.
+- **No unattended updates.** `corrall update` is explicit, verified against the signed checksums, fenced against downgrades and major jumps, and rolls back if the restarted server is unhealthy. The daily check only reports.
 - Constant-time key comparison; failed auth is delayed; internal error text is
   never echoed to clients; control characters are stripped from anything that
   reaches a terminal or a log.
@@ -322,12 +360,12 @@ stripping, passthrough, WebSocket relay, MITM interception and the auth gate.
 
 What is **not** covered: the OAuth login and refresh flows against the real
 Anthropic and OpenAI endpoints. Those need a real account; run
-`teamclaude login` and `teamclaude api /api/oauth/profile` to exercise them.
+`corrall login` and `corrall api /api/oauth/profile` to exercise them.
 
 ## Building
 
 ```bash
-cargo build --release          # binary at target/release/teamclaude
+cargo build --release          # binary at target/release/corrall
 cargo test
 cargo clippy --all-targets -- -D warnings
 ```
@@ -337,13 +375,13 @@ Rust 1.80 or newer. No OpenSSL: TLS is rustls with the ring provider.
 ## Updating
 
 ```bash
-teamclaude update --check     # is there a newer release?
-teamclaude update             # verify, swap, restart, health-check (rolls back on failure)
+corrall update --check     # is there a newer release?
+corrall update             # verify, swap, restart, health-check (rolls back on failure)
 ```
 
 `update` fetches the release through the GitHub CLI, verifies the archive
 against `SHA256SUMS` and its Sigstore signature, replaces the binary with an
-atomic rename (keeping the old one as `teamclaude.prev`), restarts the
+atomic rename (keeping the old one as `corrall.prev`), restarts the
 `systemd --user` unit if it was running, and waits for the health endpoint. It
 never downgrades or crosses a major version unless told to (`--version`,
 `--allow-major`), refuses to overwrite a `cargo build` in a checkout, and never
@@ -370,9 +408,9 @@ Verify an archive by hand with:
 
 ```bash
 cosign verify-blob --bundle SHA256SUMS.sigstore.json \
-  --certificate-identity-regexp 'github.com/NodeSpy/teamclaude' \
+  --certificate-identity-regexp 'github.com/NodeSpy/corrall' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com SHA256SUMS
-gh attestation verify teamclaude-*.tar.gz --repo NodeSpy/teamclaude
+gh attestation verify corrall-*.tar.gz --repo NodeSpy/corrall
 ```
 
 ## License

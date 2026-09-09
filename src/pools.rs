@@ -321,7 +321,7 @@ mod tests {
         // API path segment.
         assert_eq!(parse_pool_path("/pool/v1/messages"), Some(("v1", "/messages".into())));
         assert_eq!(parse_pool_path("/pool/api/oauth/token"), Some(("api", "/oauth/token".into())));
-        assert_eq!(parse_pool_path("/pool/teamclaude/status"), Some(("teamclaude", "/status".into())));
+        assert_eq!(parse_pool_path("/pool/corrall/status"), Some(("corrall", "/status".into())));
         assert_eq!(parse_pool_path("/pool/pool/x"), Some(("pool", "/x".into())));
     }
 
@@ -329,7 +329,7 @@ mod tests {
     fn real_api_paths_carry_no_pool() {
         assert_eq!(parse_pool_path("/v1/messages"), None);
         assert_eq!(parse_pool_path("/api/oauth/token"), None);
-        assert_eq!(parse_pool_path("/teamclaude/status"), None);
+        assert_eq!(parse_pool_path("/corrall/status"), None);
         assert_eq!(parse_pool_path("/"), None);
         assert_eq!(parse_pool_path(""), None);
         // Not the keyword: a path that merely starts with the same letters.

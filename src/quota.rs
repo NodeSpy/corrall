@@ -59,7 +59,7 @@ pub struct Quota {
 /// family can be revalidated (see docs: the `7d_oi` headers only ride on Fable
 /// responses, so a spent reading is otherwise self-sealing).
 pub fn family_stale_ms() -> i64 {
-    std::env::var("TEAMCLAUDE_FAMILY_STALE_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(30 * 60 * 1000)
+    std::env::var("CORRALL_FAMILY_STALE_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(30 * 60 * 1000)
 }
 
 impl Quota {

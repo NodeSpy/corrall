@@ -655,7 +655,7 @@ impl Manager {
             if a.dead_refresh_token.as_deref() == Some(rt.as_str()) {
                 if on_fail == OnRefreshFail::MarkDead && a.status != Status::Error {
                     a.status = Status::Error;
-                    a.error_message = Some("refresh token rejected; run: teamclaude login".into());
+                    a.error_message = Some("refresh token rejected; run: corrall login".into());
                 }
                 return (false, lock, a.name.clone(), None);
             }
@@ -740,7 +740,7 @@ impl Manager {
                     self.with(|f| {
                         if let Some(a) = f.account_mut(id) {
                             a.status = Status::Error;
-                            a.error_message = Some("refresh token rejected; run: teamclaude login".into());
+                            a.error_message = Some("refresh token rejected; run: corrall login".into());
                             a.dead_refresh_token = Some(rt.clone());
                         }
                     });
@@ -997,7 +997,7 @@ impl Manager {
             changed && tag.is_some()
         });
         if announce {
-            self.log(format!("Update available: {} → {} (run: teamclaude update)", env!("CARGO_PKG_VERSION"), tag.unwrap_or_default()));
+            self.log(format!("Update available: {} → {} (run: corrall update)", env!("CARGO_PKG_VERSION"), tag.unwrap_or_default()));
         }
     }
 
@@ -1991,7 +1991,7 @@ mod tests {
         m.with(|f| {
             let a = f.account(&id).unwrap();
             assert_eq!(a.status, Status::Error);
-            assert!(a.error_message.as_deref().unwrap().contains("teamclaude login"));
+            assert!(a.error_message.as_deref().unwrap().contains("corrall login"));
         });
     }
 

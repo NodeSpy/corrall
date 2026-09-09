@@ -289,6 +289,50 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
+name = "corrall"
+version = "2.2.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "bytes",
+ "chrono",
+ "clap",
+ "crossterm",
+ "dirs",
+ "futures-util",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "libc",
+ "parking_lot",
+ "percent-encoding",
+ "rand",
+ "ratatui",
+ "rcgen",
+ "regex",
+ "reqwest",
+ "rustls",
+ "rustls-pemfile",
+ "serde",
+ "serde_json",
+ "sha2",
+ "subtle",
+ "tempfile",
+ "thiserror 1.0.69",
+ "time",
+ "tokio",
+ "tokio-rustls",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "uuid",
+ "webbrowser",
+ "webpki-roots",
+ "x509-parser",
+]
+
+[[package]]
 name = "cpufeatures"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1849,50 +1893,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
-]
-
-[[package]]
-name = "teamclaude"
-version = "2.2.0"
-dependencies = [
- "anyhow",
- "base64",
- "bytes",
- "chrono",
- "clap",
- "crossterm",
- "dirs",
- "futures-util",
- "http-body-util",
- "hyper",
- "hyper-util",
- "libc",
- "parking_lot",
- "percent-encoding",
- "rand",
- "ratatui",
- "rcgen",
- "regex",
- "reqwest",
- "rustls",
- "rustls-pemfile",
- "serde",
- "serde_json",
- "sha2",
- "subtle",
- "tempfile",
- "thiserror 1.0.69",
- "time",
- "tokio",
- "tokio-rustls",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
- "url",
- "uuid",
- "webbrowser",
- "webpki-roots",
- "x509-parser",
 ]
 
 [[package]]

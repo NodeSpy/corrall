@@ -10,7 +10,7 @@ use crate::config::{AccountConfig, AccountType, Config, PoolConfig, RouteConfig,
 use crate::oauth;
 
 #[derive(Parser, Debug)]
-#[command(name = "teamclaude", version, about = "Multi-account Claude proxy with automatic quota-based rotation", long_about = None)]
+#[command(name = "corrall", version, about = "Multi-account Claude proxy with automatic quota-based rotation", long_about = None)]
 pub struct Cli {
     /// Log format for the server: text or json
     #[arg(long, global = true, default_value = "text")]
@@ -362,7 +362,7 @@ async fn control_get(cfg: &Config, path: &str) -> Result<Value> {
         .timeout(std::time::Duration::from_secs(10))
         .send()
         .await
-        .map_err(|_| anyhow!("proxy is not running on port {} (start it with `teamclaude server`)", cfg.proxy.port))?;
+        .map_err(|_| anyhow!("proxy is not running on port {} (start it with `corrall server`)", cfg.proxy.port))?;
     if !r.status().is_success() {
         bail!("proxy answered HTTP {}", r.status());
     }
@@ -382,7 +382,7 @@ async fn control_post(cfg: &Config, path: &str, body: Value) -> Result<Value> {
 
 /// Ask a running server to reload; silently no-op if none.
 pub async fn notify_reload(cfg: &Config) {
-    let _ = control_post(cfg, "/teamclaude/reload", json!({})).await;
+    let _ = control_post(cfg, "/corrall/reload", json!({})).await;
 }
 
 /// Resolve a `--pool` flag to a configured pool name, defaulting to the pool
@@ -392,7 +392,7 @@ fn pool_name(cfg: &Config, pool: Option<&str>) -> Result<String> {
     match pool {
         None => Ok(cfg.default_pool.clone()),
         Some(p) if cfg.pools.contains_key(p) => Ok(p.to_string()),
-        Some(p) => bail!("no pool named \"{p}\"; `teamclaude pool list` shows the configured pools"),
+        Some(p) => bail!("no pool named \"{p}\"; `corrall pool list` shows the configured pools"),
     }
 }
 
@@ -481,7 +481,7 @@ fn pool_mut_of<'a>(cfg: &'a mut Config, pool: Option<&str>) -> Result<&'a mut Po
 
 /// Locate an account for a command: inside `--pool` when one was given, and
 /// anywhere in the file otherwise. Searching every pool by default keeps
-/// `teamclaude disable <name>` working exactly as it did before pools existed.
+/// `corrall disable <name>` working exactly as it did before pools existed.
 fn locate(cfg: &Config, pool: Option<&str>, needle: &str) -> Result<(String, usize)> {
     let found = match pool {
         Some(p) => {
@@ -768,7 +768,7 @@ pub async fn import_claudeacrobat(args: ImportAcrobatArgs) -> Result<()> {
             let existing = &cfg.pool(&p).expect("locate_by returns a configured pool").accounts[i];
             if !is_anthropic_oauth(existing) {
                 let what = if existing.is_codex() { "a Codex account" } else { "an API-key account" };
-                skipped.push((m.account.name.clone(), format!("teamclaude already has {what} named that in pool \"{p}\"")));
+                skipped.push((m.account.name.clone(), format!("corrall already has {what} named that in pool \"{p}\"")));
                 continue;
             }
         }
@@ -807,7 +807,7 @@ pub async fn import_claudeacrobat(args: ImportAcrobatArgs) -> Result<()> {
         c.ensure_account_ids();
         // The imported accounts have to satisfy the same rules as a hand-written
         // config; a failure here aborts the whole write rather than saving a
-        // file teamclaude would refuse to load.
+        // file corrall would refuse to load.
         c.validate()
     })?;
 
@@ -819,11 +819,11 @@ pub async fn import_claudeacrobat(args: ImportAcrobatArgs) -> Result<()> {
     };
     println!("\nImported {} account(s) into pool{} {}.", added + updated, if pools.len() == 1 { "" } else { "s" }, quoted_list(&pools));
     if updated > 0 {
-        println!("{updated} of them updated an account teamclaude already had.");
+        println!("{updated} of them updated an account corrall already had.");
     }
-    println!("`teamclaude accounts` lists them; `eval \"$(teamclaude env)\"` points Claude Code at this proxy.");
+    println!("`corrall accounts` lists them; `eval \"$(corrall env)\"` points Claude Code at this proxy.");
     for p in pools.iter().filter(|p| **p != cfg.default_pool) {
-        println!("Pool \"{p}\" serves `/pool/{p}`: `eval \"$(teamclaude env --pool {p})\"`.");
+        println!("Pool \"{p}\" serves `/pool/{p}`: `eval \"$(corrall env --pool {p})\"`.");
     }
     println!("claudeacrobat's own files are untouched, so it keeps working on its own port.");
     notify_reload(&cfg).await;
@@ -837,11 +837,11 @@ fn is_anthropic_oauth(a: &AccountConfig) -> bool {
 }
 
 /// Write one imported account into `pool`, returning whether it replaced an
-/// account teamclaude already had. Identity comes from the account uuid when
+/// account corrall already had. Identity comes from the account uuid when
 /// claudeacrobat recorded one, and the name otherwise.
 ///
 /// Only the fields the import actually carries are assigned: an account that
-/// already had teamclaude-only settings — a route, a model map, its own upstream
+/// already had corrall-only settings — a route, a model map, its own upstream
 /// — keeps them, and only its credential and profile are refreshed.
 fn upsert_acrobat(cfg: &mut Config, pool: &str, src: &AccountConfig) -> bool {
     let found = src
@@ -881,7 +881,7 @@ fn quoted_list(items: &[&str]) -> String {
 }
 
 pub fn accounts(verbose: bool, pool: Option<String>) -> Result<()> {
-    let cfg = Config::load()?.ok_or_else(|| anyhow!("no config yet; run `teamclaude login`"))?;
+    let cfg = Config::load()?.ok_or_else(|| anyhow!("no config yet; run `corrall login`"))?;
     if let Some(p) = &pool {
         pool_name(&cfg, Some(p))?;
     }
@@ -900,7 +900,7 @@ pub fn accounts(verbose: bool, pool: Option<String>) -> Result<()> {
     if listed.is_empty() {
         match &pool {
             Some(p) => println!("No accounts in pool \"{p}\"."),
-            None => println!("No accounts. Run `teamclaude login` or `teamclaude import`."),
+            None => println!("No accounts. Run `corrall login` or `corrall import`."),
         }
         return Ok(());
     }
@@ -949,7 +949,7 @@ pub fn accounts(verbose: bool, pool: Option<String>) -> Result<()> {
 pub async fn status(json_out: bool, color: &str) -> Result<()> {
     let cfg = Config::load()?.ok_or_else(|| anyhow!("no config yet"))?;
     crate::upstream::init(&cfg)?;
-    let st = control_get(&cfg, "/teamclaude/status").await?;
+    let st = control_get(&cfg, "/corrall/status").await?;
     if json_out {
         println!("{}", serde_json::to_string_pretty(&st)?);
     } else {
@@ -968,7 +968,7 @@ pub async fn switch(name: Option<String>, pool: Option<String>) -> Result<()> {
     crate::upstream::init(&cfg)?;
     match name {
         None => {
-            let st = control_get(&cfg, "/teamclaude/status").await?;
+            let st = control_get(&cfg, "/corrall/status").await?;
             // Every pool's accounts, so `switch` with no argument still shows
             // the whole set you could switch to.
             let empty = vec![];
@@ -994,7 +994,7 @@ pub async fn switch(name: Option<String>, pool: Option<String>) -> Result<()> {
             if let Some(p) = &pool {
                 body["pool"] = json!(p);
             }
-            let r = control_post(&cfg, "/teamclaude/switch", body).await?;
+            let r = control_post(&cfg, "/corrall/switch", body).await?;
             if r.get("ok").and_then(Value::as_bool).unwrap_or(false) {
                 println!(
                     "Switched to {}{}{}",
@@ -1365,13 +1365,13 @@ pub async fn pool(cmd: Option<PoolCmd>) -> Result<()> {
             let cfg = Config::update(|c| {
                 let name = pool_name(c, Some(&name))?;
                 if name == c.default_pool {
-                    bail!("\"{name}\" is the default pool; point defaultPool elsewhere first (`teamclaude pool set <other> --make-default`)");
+                    bail!("\"{name}\" is the default pool; point defaultPool elsewhere first (`corrall pool set <other> --make-default`)");
                 }
                 let held = c.pool(&name).map(|p| p.accounts.len()).unwrap_or(0);
                 if held > 0 && !force {
                     bail!(
                         "pool \"{name}\" still holds {held} account(s); move them with \
-                         `teamclaude pool set <other> --account <name>`, or pass --force to delete them with the pool"
+                         `corrall pool set <other> --account <name>`, or pass --force to delete them with the pool"
                     );
                 }
                 c.pools.remove(&name);
@@ -1566,7 +1566,7 @@ fn launch_target(cfg: &Config, pool_flag: Option<&str>, cwd: Option<&str>) -> Re
                 // which is every install that has not opted in — must not start
                 // writing to a wrapper's stderr on every launch.
                 if choice.matched {
-                    eprintln!("[TeamClaude] pool \"{}\" ({})", choice.pool, choice.reason);
+                    eprintln!("[Corrall] pool \"{}\" ({})", choice.pool, choice.reason);
                     Some(choice.pool)
                 } else {
                     None
@@ -1597,18 +1597,18 @@ pub fn env(args: EnvArgs) -> Result<()> {
 }
 
 pub async fn run(args: RunArgs) -> Result<()> {
-    let cfg = Config::load()?.ok_or_else(|| anyhow!("no config yet; run `teamclaude login` first"))?;
+    let cfg = Config::load()?.ok_or_else(|| anyhow!("no config yet; run `corrall login` first"))?;
     crate::upstream::init(&cfg)?;
-    let up = control_get(&cfg, "/teamclaude/health").await.is_ok();
+    let up = control_get(&cfg, "/corrall/health").await.is_ok();
     let mut cmd = std::process::Command::new("claude");
     cmd.args(&args.args);
     cmd.env_remove("TC_ACCT");
     cmd.env_remove("TC_POOL");
     if !up {
         if args.auto_fallback {
-            eprintln!("[TeamClaude] proxy is not running; launching claude directly (no rotation)");
+            eprintln!("[Corrall] proxy is not running; launching claude directly (no rotation)");
         } else {
-            bail!("proxy is not running on port {}; start `teamclaude server` or pass --auto-fallback", cfg.proxy.port);
+            bail!("proxy is not running on port {}; start `corrall server` or pass --auto-fallback", cfg.proxy.port);
         }
     } else {
         let (pin, pool) = launch_target(&cfg, args.pool.as_deref(), None)?;
@@ -1673,13 +1673,13 @@ pub fn service(cmd: ServiceCmd) -> Result<()> {
     }
     let exe = std::env::current_exe()?;
     let unit = format!(
-        "[Unit]\nDescription=TeamClaude multi-account Claude proxy\nAfter=network-online.target\n\n[Service]\nExecStart={} server --headless\nRestart=on-failure\nRestartSec=3\nEnvironment=TEAMCLAUDE_CONFIG={}\nNoNewPrivileges=yes\nPrivateTmp=yes\nProtectSystem=strict\nReadWritePaths={}\n\n[Install]\nWantedBy=default.target\n",
+        "[Unit]\nDescription=Corrall multi-account Claude proxy\nAfter=network-online.target\n\n[Service]\nExecStart={} server --headless\nRestart=on-failure\nRestartSec=3\nEnvironment=CORRALL_CONFIG={}\nNoNewPrivileges=yes\nPrivateTmp=yes\nProtectSystem=strict\nReadWritePaths={}\n\n[Install]\nWantedBy=default.target\n",
         exe.display(),
         crate::config::config_path().display(),
         crate::config::config_dir().display()
     );
     let dir: PathBuf = dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("systemd/user");
-    let path = dir.join("teamclaude.service");
+    let path = dir.join("corrall.service");
     match cmd {
         ServiceCmd::Print => {
             print!("{unit}");
@@ -1689,7 +1689,7 @@ pub fn service(cmd: ServiceCmd) -> Result<()> {
             std::fs::create_dir_all(&dir)?;
             std::fs::write(&path, unit)?;
             let _ = std::process::Command::new("systemctl").args(["--user", "daemon-reload"]).status();
-            let st = std::process::Command::new("systemctl").args(["--user", "enable", "--now", "teamclaude.service"]).status()?;
+            let st = std::process::Command::new("systemctl").args(["--user", "enable", "--now", "corrall.service"]).status()?;
             if !st.success() {
                 bail!("systemctl enable failed");
             }
@@ -1697,14 +1697,14 @@ pub fn service(cmd: ServiceCmd) -> Result<()> {
             Ok(())
         }
         ServiceCmd::Uninstall => {
-            let _ = std::process::Command::new("systemctl").args(["--user", "disable", "--now", "teamclaude.service"]).status();
+            let _ = std::process::Command::new("systemctl").args(["--user", "disable", "--now", "corrall.service"]).status();
             let _ = std::fs::remove_file(&path);
             let _ = std::process::Command::new("systemctl").args(["--user", "daemon-reload"]).status();
             eprintln!("removed {}", path.display());
             Ok(())
         }
         ServiceCmd::Status => {
-            let st = std::process::Command::new("systemctl").args(["--user", "status", "teamclaude.service", "--no-pager"]).status()?;
+            let st = std::process::Command::new("systemctl").args(["--user", "status", "corrall.service", "--no-pager"]).status()?;
             std::process::exit(st.code().unwrap_or(1));
         }
     }
@@ -1844,7 +1844,7 @@ mod tests {
     }
 
     /// Naming the default pool must not change a single byte: an existing
-    /// wrapper doing `eval "$(teamclaude env)"` keeps working untouched.
+    /// wrapper doing `eval "$(corrall env)"` keeps working untouched.
     #[test]
     fn default_pool_is_never_named() {
         let cfg = Config::default();
@@ -1986,9 +1986,9 @@ mod tests {
         assert!(apply_listen_override(&mut cfg, Some("127.0.0.1:9004"), None).is_ok());
     }
 
-    /// Re-importing must refresh the account teamclaude already has rather than
+    /// Re-importing must refresh the account corrall already has rather than
     /// add a second copy of the same credential, and it must leave the
-    /// teamclaude-only settings on that entry in place.
+    /// corrall-only settings on that entry in place.
     #[test]
     fn importing_twice_updates_one_account() {
         let mut cfg = Config::default();
@@ -2011,7 +2011,7 @@ mod tests {
         assert_eq!(accounts.len(), 1);
         assert_eq!(accounts[0].name, "renamed");
         assert_eq!(accounts[0].access_token.as_deref(), Some("at2"));
-        assert_eq!(accounts[0].upstream.as_deref(), Some("https://alt.example/v1"), "teamclaude-only settings survive");
+        assert_eq!(accounts[0].upstream.as_deref(), Some("https://alt.example/v1"), "corrall-only settings survive");
     }
 
     /// An API-key account is a different thing wearing the same name; an import
