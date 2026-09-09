@@ -1,10 +1,10 @@
 //! Configuration and persisted state.
 //!
-//! The config lives at `~/.config/teamclaude.json` (or `$XDG_CONFIG_HOME`,
-//! or `$TEAMCLAUDE_CONFIG`). It holds account credentials, so it is always
+//! The config lives at `~/.config/corrall.json` (or `$XDG_CONFIG_HOME`,
+//! or `$CORRALL_CONFIG`). It holds account credentials, so it is always
 //! written `0600` and atomically (temp file + rename) so a crash mid-write can
 //! never truncate a credential file. Volatile runtime state (observed quota)
-//! goes to a sibling `teamclaude.state.json`.
+//! goes to a sibling `corrall.state.json`.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -24,7 +24,7 @@ pub const DEFAULT_POOL: &str = "default";
 pub const MAX_POOL_NAME_LEN: usize = 32;
 
 pub fn config_path() -> PathBuf {
-    if let Ok(p) = std::env::var("TEAMCLAUDE_CONFIG") {
+    if let Ok(p) = std::env::var("CORRALL_CONFIG") {
         if !p.is_empty() {
             return PathBuf::from(p);
         }
@@ -34,7 +34,18 @@ pub fn config_path() -> PathBuf {
         .filter(|p| p.is_absolute())
         .or_else(|| dirs::home_dir().map(|h| h.join(".config")))
         .unwrap_or_else(|| PathBuf::from("."));
-    dir.join("teamclaude.json")
+    dir.join("corrall.json")
+}
+
+/// Where this config lived before the project was renamed from TeamClaude:
+/// `teamclaude.json` beside a default-named `corrall.json` that does not exist
+/// yet. `None` when there is nothing to migrate or the path was overridden.
+pub fn legacy_config_path(path: &Path) -> Option<PathBuf> {
+    if path.file_name()? != "corrall.json" || path.exists() {
+        return None;
+    }
+    let legacy = path.with_file_name("teamclaude.json");
+    legacy.is_file().then_some(legacy)
 }
 
 pub fn config_dir() -> PathBuf {
@@ -129,9 +140,9 @@ pub struct ProxyConfig {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub client_keys: Vec<ClientKey>,
     /// Require the proxy key even from loopback clients. Off by default for
-    /// compatibility with `teamclaude run`, but recommended on shared hosts.
+    /// compatibility with `corrall run`, but recommended on shared hosts.
     pub require_key_on_loopback: bool,
-    /// Per-session breakdown in `/teamclaude/status`. Off: it exposes what each
+    /// Per-session breakdown in `/corrall/status`. Off: it exposes what each
     /// consumer works on to every other key holder.
     pub session_detail: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -360,7 +371,7 @@ pub struct PoolConfig {
     pub routes: Vec<RouteConfig>,
     pub storm_ramp: StormRamp,
     pub expiry_routing: ExpiryRouting,
-    /// When set, `teamclaude env`/`run` can select this pool from the launch
+    /// When set, `corrall env`/`run` can select this pool from the launch
     /// context instead of being told which one to use. The default pool is the
     /// catch-all and needs no rules.
     #[serde(rename = "match", skip_serializing_if = "Option::is_none")]
@@ -533,7 +544,18 @@ impl Config {
         let path = config_path();
         let raw = match std::fs::read(&path) {
             Ok(b) => b,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Never start a fresh, empty config next to a pre-rename one:
+                // the accounts in it would silently stop being served.
+                if let Some(legacy) = legacy_config_path(&path) {
+                    bail!(
+                        "{} does not exist but the pre-rename {} does; run scripts/install.sh to migrate it, or move it (with its .state.json and the teamclaude-*.pem certificates) to the corrall.* names yourself",
+                        path.display(),
+                        legacy.display()
+                    );
+                }
+                return Ok(None);
+            }
             Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
         };
         let mut doc: Value = serde_json::from_slice(&raw).with_context(|| format!("parsing {}", path.display()))?;
@@ -668,7 +690,7 @@ impl Config {
     }
 
     pub fn bind_host(&self) -> String {
-        std::env::var("TEAMCLAUDE_HOST").ok().filter(|h| !h.is_empty()).or_else(|| self.proxy.host.clone()).unwrap_or_else(|| "127.0.0.1".to_string())
+        std::env::var("CORRALL_HOST").ok().filter(|h| !h.is_empty()).or_else(|| self.proxy.host.clone()).unwrap_or_else(|| "127.0.0.1".to_string())
     }
 
     /// The host a client *on this machine* dials to reach the listener.
@@ -1047,9 +1069,21 @@ mod tests {
     }
 
     #[test]
+    fn a_pre_rename_config_is_detected_only_beside_a_missing_default_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let new = dir.path().join("corrall.json");
+        assert_eq!(legacy_config_path(&new), None, "nothing to migrate");
+        std::fs::write(dir.path().join("teamclaude.json"), b"{}").unwrap();
+        assert_eq!(legacy_config_path(&new), Some(dir.path().join("teamclaude.json")));
+        assert_eq!(legacy_config_path(&dir.path().join("other.json")), None, "overridden paths are never redirected");
+        std::fs::write(&new, b"{}").unwrap();
+        assert_eq!(legacy_config_path(&new), None, "an existing corrall.json wins");
+    }
+
+    #[test]
     fn pool_names_are_charset_checked_but_never_reserved() {
         // No name is reserved: routing lives under the /pool/ keyword.
-        for ok in ["default", "work", "v1", "api", "teamclaude", "a", "a-b-c", "pool", "x9", &"a".repeat(MAX_POOL_NAME_LEN)] {
+        for ok in ["default", "work", "v1", "api", "corrall", "a", "a-b-c", "pool", "x9", &"a".repeat(MAX_POOL_NAME_LEN)] {
             assert!(validate_pool_name(ok).is_ok(), "{ok} should be a legal pool name");
         }
         for bad in ["", "Work", "WORK", "-work", "work-", "wo rk", "work/other", "work.io", "work_id", "wörk", &"a".repeat(MAX_POOL_NAME_LEN + 1)] {

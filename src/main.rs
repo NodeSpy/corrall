@@ -1,6 +1,6 @@
-//! TeamClaude: multi-account Claude proxy with quota-based rotation.
+//! Corrall: multi-account Claude proxy with quota-based rotation.
 
-use teamclaude::*;
+use corrall::*;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,7 +16,7 @@ use proxy::server::{Ctx, CtxInner, Metrics};
 
 fn init_logging(json: bool, to_stderr_only: bool) {
     use tracing_subscriber::{fmt, EnvFilter};
-    let filter = EnvFilter::try_from_env("TEAMCLAUDE_LOG").unwrap_or_else(|_| EnvFilter::new("info,hyper=warn,rustls=warn,reqwest=warn"));
+    let filter = EnvFilter::try_from_env("CORRALL_LOG").unwrap_or_else(|_| EnvFilter::new("info,hyper=warn,rustls=warn,reqwest=warn"));
     let builder = fmt().with_env_filter(filter).with_target(false).with_writer(std::io::stderr);
     let _ = to_stderr_only;
     if json {
@@ -102,7 +102,7 @@ async fn server(args: ServerArgs, interactive: bool) -> Result<()> {
         Err(e) => tracing::warn!("state file ignored: {e}"),
     }
     if pools.account_count() == 0 {
-        tracing::warn!("no usable accounts configured; run `teamclaude login` (the server will serve them after a reload)");
+        tracing::warn!("no usable accounts configured; run `corrall login` (the server will serve them after a reload)");
     } else {
         // Pick each pool's active account at boot, as the original does, so
         // status shows them before the first request arrives.
@@ -172,7 +172,7 @@ async fn server(args: ServerArgs, interactive: bool) -> Result<()> {
     tokio::spawn(warmer.clone().run());
     // Notify-only release check: once shortly after start, then daily. It only
     // records the tag for status/TUI; nothing is ever installed by itself.
-    if cfg.update_check && std::env::var_os("TEAMCLAUDE_DISABLE_UPDATE_CHECK").is_none() {
+    if cfg.update_check && std::env::var_os("CORRALL_DISABLE_UPDATE_CHECK").is_none() {
         // Daemon-wide fact, recorded on the default pool: that is the section
         // the status document flattens onto its top level.
         let manager = pools.default();
@@ -258,7 +258,7 @@ async fn server(args: ServerArgs, interactive: bool) -> Result<()> {
         n => format!(", {n} pools"),
     };
     tracing::info!(
-        "TeamClaude v{} listening on http://{bind} ({} accounts{pool_note}){}",
+        "Corrall v{} listening on http://{bind} ({} accounts{pool_note}){}",
         env!("CARGO_PKG_VERSION"),
         pools.account_count(),
         if interactive { "" } else { " [headless]" }

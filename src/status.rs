@@ -1,4 +1,4 @@
-//! Human-readable rendering of `/teamclaude/status`, a 1:1 port of the
+//! Human-readable rendering of `/corrall/status`, a 1:1 port of the
 //! original renderer: header rows, routing table, one block per account with
 //! gradient quota bars, model eligibility, blocked reason, spend, usage and
 //! probe rows, then per-client and per-dimension usage.
@@ -632,7 +632,7 @@ fn daemon_lines(st: &Value, paint: Paint) -> Vec<String> {
         lines.push(format!("{} up {}", paint.dim(&pad("Server", 12)), format_duration(up * 1000)));
     }
     if let Some(tag) = s(st, "updateAvailable") {
-        lines.push(format!("{} {}", paint.dim(&pad("Update", 12)), paint.yellow(&format!("{} available — run: teamclaude update", safe_text(tag, 30)))));
+        lines.push(format!("{} {}", paint.dim(&pad("Update", 12)), paint.yellow(&format!("{} available — run: corrall update", safe_text(tag, 30)))));
     }
     lines
 }
@@ -646,10 +646,10 @@ fn daemon_lines(st: &Value, paint: Paint) -> Vec<String> {
 pub fn render(st: &Value, color: bool, now: i64) -> String {
     let paint = Paint { on: color };
     let Some(pools) = st.get("pools").and_then(Value::as_array).filter(|p| p.len() > 1) else {
-        return render_pool(st, "TeamClaude status", paint, now, true);
+        return render_pool(st, "Corrall status", paint, now, true);
     };
     let mut out = vec![
-        paint.bold(&format!("TeamClaude status — {} pools", pools.len())),
+        paint.bold(&format!("Corrall status — {} pools", pools.len())),
         format!("{} {}", paint.dim(&pad("Default", 12)), paint.cyan(s(st, "defaultPool").unwrap_or("-"))),
     ];
     out.extend(daemon_lines(st, paint));
@@ -817,7 +817,7 @@ mod tests {
         });
         let out = render(&st, false, now);
         let expected = "\
-TeamClaude status
+Corrall status
 Active       a@x.com
 Switch at    98%
 Sessions     1 active / 2 known · single-account
@@ -859,7 +859,7 @@ Clients
 
         let out = render(&st, false, now);
         let expected = "\
-TeamClaude status — 2 pools
+Corrall status — 2 pools
 Default      default
 Server       up 3m
 
@@ -878,6 +878,6 @@ Probe        off (passive only)
 
         // A single pool is the pre-pools render, daemon rows inline and all.
         st["pools"] = json!([pool("default", true, "a@x.com")]);
-        assert!(render(&st, false, now).starts_with("TeamClaude status\nActive       a@x.com"));
+        assert!(render(&st, false, now).starts_with("Corrall status\nActive       a@x.com"));
     }
 }

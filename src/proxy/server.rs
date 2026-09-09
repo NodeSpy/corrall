@@ -1,5 +1,5 @@
 //! The local listener: one port serving plain HTTP requests (base-URL mode),
-//! the control plane under `/teamclaude/*`, and `CONNECT` tunnels for the MITM
+//! the control plane under `/corrall/*`, and `CONNECT` tunnels for the MITM
 //! mode. Every accepted connection is dispatched by `serve_connection`.
 
 use std::collections::HashSet;
@@ -257,7 +257,7 @@ async fn handle(ctx: Ctx, req: Request<Incoming>, peer: IpAddr, tunnel: Option<&
     // The dashboard page is a static asset with no data in it; everything it
     // shows is fetched with the key. Serving it unauthenticated lets a browser
     // load it, which an address bar cannot do with a header.
-    if req.method() == Method::GET && path == "/teamclaude/dashboard" && tunnel.is_none() {
+    if req.method() == Method::GET && path == "/corrall/dashboard" && tunnel.is_none() {
         let mut r = Response::new(Full::new(Bytes::from_static(super::dashboard::HTML.as_bytes())).map_err(|e| match e {}).boxed());
         r.headers_mut().insert("content-type", HeaderValue::from_static("text/html; charset=utf-8"));
         r.headers_mut().insert("cache-control", HeaderValue::from_static("no-store"));
@@ -282,7 +282,7 @@ async fn handle(ctx: Ctx, req: Request<Incoming>, peer: IpAddr, tunnel: Option<&
     }
 
     // Control plane.
-    if path.starts_with("/teamclaude/") && tunnel.is_none() {
+    if path.starts_with("/corrall/") && tunnel.is_none() {
         return control(&ctx, req, &auth, asked_pool.as_deref()).await;
     }
 
@@ -442,8 +442,8 @@ async fn control(ctx: &Ctx, req: Request<Incoming>, auth: &Auth, asked_pool: Opt
     let cfg = ctx.config();
     let path = req.uri().path().to_string();
     match (req.method().clone(), path.as_str()) {
-        (Method::GET, "/teamclaude/health") => json_response(StatusCode::OK, json!({ "ok": true, "version": env!("CARGO_PKG_VERSION") })),
-        (Method::GET, "/teamclaude/status") => {
+        (Method::GET, "/corrall/health") => json_response(StatusCode::OK, json!({ "ok": true, "version": env!("CARGO_PKG_VERSION") })),
+        (Method::GET, "/corrall/status") => {
             let mut st = ctx.pools.status(cfg.proxy.session_detail);
             st["upstream"] = json!(cfg.upstream);
             st["upstreamProxy"] = json!(crate::upstream::describe_proxy(&cfg));
@@ -453,7 +453,7 @@ async fn control(ctx: &Ctx, req: Request<Incoming>, auth: &Auth, asked_pool: Opt
             st["warmupSeconds"] = json!(cfg.warmup_seconds);
             json_response(StatusCode::OK, st)
         }
-        (Method::GET, "/teamclaude/quota") => {
+        (Method::GET, "/corrall/quota") => {
             let (name, m) = ctx.pools.resolve_request(asked_pool);
             let mut q = m.quota_summary();
             if let Some(o) = q.as_object_mut() {
@@ -461,12 +461,12 @@ async fn control(ctx: &Ctx, req: Request<Incoming>, auth: &Auth, asked_pool: Opt
             }
             json_response(StatusCode::OK, q)
         }
-        (Method::GET, "/teamclaude/metrics") => {
+        (Method::GET, "/corrall/metrics") => {
             let mut r = Response::new(Full::new(Bytes::from(render_metrics(ctx))).map_err(|e| match e {}).boxed());
             r.headers_mut().insert("content-type", HeaderValue::from_static("text/plain; version=0.0.4"));
             r
         }
-        (Method::POST, "/teamclaude/reload") => match &ctx.reload {
+        (Method::POST, "/corrall/reload") => match &ctx.reload {
             None => json_response(StatusCode::NOT_IMPLEMENTED, json!({ "ok": false, "error": "reload not supported" })),
             Some(f) => match f() {
                 Ok(added) => json_response(StatusCode::OK, json!({ "ok": true, "added": added })),
@@ -476,7 +476,7 @@ async fn control(ctx: &Ctx, req: Request<Incoming>, auth: &Auth, asked_pool: Opt
                 }
             },
         },
-        (Method::POST, "/teamclaude/switch") => {
+        (Method::POST, "/corrall/switch") => {
             let body = match read_body(req.into_body(), CONTROL_BODY_LIMIT).await {
                 Ok(b) => b,
                 Err(true) => return json_response(StatusCode::PAYLOAD_TOO_LARGE, json!({ "ok": false, "error": "request body too large" })),
@@ -484,7 +484,7 @@ async fn control(ctx: &Ctx, req: Request<Incoming>, auth: &Auth, asked_pool: Opt
             };
             let v: Value = serde_json::from_slice(&body).unwrap_or(json!({}));
             // A pool from the body, the URL keyword, or — with neither — search
-            // every pool so `teamclaude switch <name>` keeps working unqualified.
+            // every pool so `corrall switch <name>` keeps working unqualified.
             let asked = v.get("pool").and_then(Value::as_str).or(asked_pool);
             let scoped = asked.map(|p| ctx.pools.resolve_request(Some(p)));
             let names: Vec<String> = match &scoped {
@@ -509,7 +509,7 @@ async fn control(ctx: &Ctx, req: Request<Incoming>, auth: &Auth, asked_pool: Opt
                 None => json_response(StatusCode::NOT_FOUND, json!({ "ok": false, "error": "unknown account" })),
             }
         }
-        (Method::POST, "/teamclaude/route-pin") => {
+        (Method::POST, "/corrall/route-pin") => {
             let body = match read_body(req.into_body(), CONTROL_BODY_LIMIT).await {
                 Ok(b) => b,
                 Err(_) => return json_response(StatusCode::BAD_REQUEST, json!({ "ok": false, "error": "invalid request body" })),
@@ -539,17 +539,17 @@ async fn control(ctx: &Ctx, req: Request<Incoming>, auth: &Auth, asked_pool: Opt
 fn render_metrics(ctx: &Ctx) -> String {
     use std::sync::atomic::Ordering;
     let mut out = String::new();
-    out.push_str("# TYPE teamclaude_requests_total counter\n");
-    out.push_str(&format!("teamclaude_requests_total {}\n", ctx.metrics.requests_total.load(Ordering::Relaxed)));
-    out.push_str("# TYPE teamclaude_requests_failed_total counter\n");
-    out.push_str(&format!("teamclaude_requests_failed_total {}\n", ctx.metrics.requests_failed.load(Ordering::Relaxed)));
-    out.push_str("# TYPE teamclaude_auth_failures_total counter\n");
-    out.push_str(&format!("teamclaude_auth_failures_total {}\n", ctx.metrics.auth_failures.load(Ordering::Relaxed)));
-    out.push_str("# TYPE teamclaude_connects_total counter\n");
-    out.push_str(&format!("teamclaude_connects_total {}\n", ctx.metrics.connects_total.load(Ordering::Relaxed)));
-    out.push_str("# TYPE teamclaude_account_quota_utilization gauge\n");
-    out.push_str("# TYPE teamclaude_account_available gauge\n");
-    out.push_str("# TYPE teamclaude_account_requests_total counter\n");
+    out.push_str("# TYPE corrall_requests_total counter\n");
+    out.push_str(&format!("corrall_requests_total {}\n", ctx.metrics.requests_total.load(Ordering::Relaxed)));
+    out.push_str("# TYPE corrall_requests_failed_total counter\n");
+    out.push_str(&format!("corrall_requests_failed_total {}\n", ctx.metrics.requests_failed.load(Ordering::Relaxed)));
+    out.push_str("# TYPE corrall_auth_failures_total counter\n");
+    out.push_str(&format!("corrall_auth_failures_total {}\n", ctx.metrics.auth_failures.load(Ordering::Relaxed)));
+    out.push_str("# TYPE corrall_connects_total counter\n");
+    out.push_str(&format!("corrall_connects_total {}\n", ctx.metrics.connects_total.load(Ordering::Relaxed)));
+    out.push_str("# TYPE corrall_account_quota_utilization gauge\n");
+    out.push_str("# TYPE corrall_account_available gauge\n");
+    out.push_str("# TYPE corrall_account_requests_total counter\n");
     let esc = |s: &str| s.replace(['"', '\\', '\n'], "_");
     let mut sessions = String::new();
     for (pool, m) in ctx.pools.each() {
@@ -560,19 +560,19 @@ fn render_metrics(ctx: &Ctx) -> String {
                 let name = esc(a.get("name").and_then(Value::as_str).unwrap_or(""));
                 for b in ["unified5h", "unified7d", "unified7dFable", "unified7dSonnet"] {
                     if let Some(u) = a.pointer(&format!("/quota/{b}/utilization")).and_then(Value::as_f64) {
-                        out.push_str(&format!("teamclaude_account_quota_utilization{{pool=\"{pool}\",account=\"{name}\",bucket=\"{b}\"}} {u}\n"));
+                        out.push_str(&format!("corrall_account_quota_utilization{{pool=\"{pool}\",account=\"{name}\",bucket=\"{b}\"}} {u}\n"));
                     }
                 }
                 let avail = if a.get("blocked").map(Value::is_null).unwrap_or(false) { 1 } else { 0 };
-                out.push_str(&format!("teamclaude_account_available{{pool=\"{pool}\",account=\"{name}\"}} {avail}\n"));
+                out.push_str(&format!("corrall_account_available{{pool=\"{pool}\",account=\"{name}\"}} {avail}\n"));
                 let n = a.pointer("/usage/totalRequests").and_then(Value::as_u64).unwrap_or(0);
-                out.push_str(&format!("teamclaude_account_requests_total{{pool=\"{pool}\",account=\"{name}\"}} {n}\n"));
+                out.push_str(&format!("corrall_account_requests_total{{pool=\"{pool}\",account=\"{name}\"}} {n}\n"));
             }
         }
         let active = st.pointer("/sessions/active").and_then(Value::as_u64).unwrap_or(0);
-        sessions.push_str(&format!("teamclaude_sessions_active{{pool=\"{pool}\"}} {active}\n"));
+        sessions.push_str(&format!("corrall_sessions_active{{pool=\"{pool}\"}} {active}\n"));
     }
-    out.push_str("# TYPE teamclaude_sessions_active gauge\n");
+    out.push_str("# TYPE corrall_sessions_active gauge\n");
     out.push_str(&sessions);
     out
 }
@@ -593,7 +593,7 @@ async fn handle_connect(ctx: Ctx, req: Request<Incoming>, peer: IpAddr) -> Respo
         ctx.metrics.auth_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         tracing::warn!("CONNECT denied from {peer}: {why}");
         let mut r = error_response(StatusCode::PROXY_AUTHENTICATION_REQUIRED, "authentication_error", "proxy authentication required");
-        r.headers_mut().insert("proxy-authenticate", HeaderValue::from_static("Basic realm=\"teamclaude\""));
+        r.headers_mut().insert("proxy-authenticate", HeaderValue::from_static("Basic realm=\"corrall\""));
         return r;
     }
     let authority = req.uri().authority().map(|a| a.to_string()).unwrap_or_default();
@@ -620,7 +620,7 @@ async fn handle_connect(ctx: Ctx, req: Request<Incoming>, peer: IpAddr) -> Respo
                 if mgr.resolve_pin(p).is_none() {
                     tracing::warn!("CONNECT {host}: unknown account pin");
                     let mut r = error_response(StatusCode::PROXY_AUTHENTICATION_REQUIRED, "authentication_error", "unknown account pin");
-                    r.headers_mut().insert("proxy-authenticate", HeaderValue::from_static("Basic realm=\"teamclaude\""));
+                    r.headers_mut().insert("proxy-authenticate", HeaderValue::from_static("Basic realm=\"corrall\""));
                     return r;
                 }
             }
@@ -697,7 +697,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let svc = service_fn(|_req: Request<Incoming>| async move {
-        let body = format!("TeamClaude MITM proxy is working (v{}).\n", env!("CARGO_PKG_VERSION"));
+        let body = format!("Corrall MITM proxy is working (v{}).\n", env!("CARGO_PKG_VERSION"));
         let mut r = Response::new(Full::new(Bytes::from(body)).map_err(|e| match e {}).boxed());
         r.headers_mut().insert("content-type", HeaderValue::from_static("text/plain"));
         Ok::<Response<BoxBody>, hyper::Error>(r)

@@ -4,7 +4,7 @@
 //! per-pool `match` rules is that a single shell wrapper —
 //!
 //! ```sh
-//! eval "$(teamclaude env)"; exec claude "$@"
+//! eval "$(corrall env)"; exec claude "$@"
 //! ```
 //!
 //! — lands in the right fleet on its own, based on where it was started.
@@ -42,7 +42,7 @@ impl LaunchEnv {
     }
 
     /// Like [`LaunchEnv::live`], but matching against a given directory. Used
-    /// by `teamclaude env --cwd DIR`, which lets a wrapper resolve the pool for
+    /// by `corrall env --cwd DIR`, which lets a wrapper resolve the pool for
     /// a project it is about to `cd` into.
     pub fn at(cwd: impl Into<PathBuf>) -> Self {
         Self { cwd: cwd.into(), getenv: Box::new(|k| std::env::var(k).ok()), remote: Box::new(git_remote) }

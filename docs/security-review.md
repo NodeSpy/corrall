@@ -30,7 +30,7 @@ items below are the gaps.
 | # | Severity | Finding (original) | Disposition here |
 | --- | --- | --- | --- |
 | 1 | Medium | Config and state written with truncate-in-place; a crash mid-write leaves an unparsable file holding every refresh token. | Fixed. `security::write_private_atomic`: temp file, fsync, rename, 0600. |
-| 2 | Medium | Cross-process lost update: a CLI `login` running while the server refreshed a token could overwrite the rotated refresh token with a stale one. | Fixed. `Config::update` takes a cross-process `flock` on `teamclaude.lock`, re-reads under it, then writes atomically; every CLI mutation does its network work first and mutates inside the lock. |
+| 2 | Medium | Cross-process lost update: a CLI `login` running while the server refreshed a token could overwrite the rotated refresh token with a stale one. | Fixed. `Config::update` takes a cross-process `flock` on `corrall.lock`, re-reads under it, then writes atomically; every CLI mutation does its network work first and mutates inside the lock. |
 | 3 | Medium | An OAuth account with a third-party `upstream` sends its Anthropic bearer token to that host. | Fixed. `Account::upstream_for` refuses non-Anthropic hosts for subscription accounts; the account is skipped and the reason logged. |
 | 4 | Low | Anthropic OAuth callback listener bound all interfaces; the `error` parameter was honoured before the `state` check, so a LAN host could abort a login. | Fixed. Binds 127.0.0.1, ignores non-loopback peers, checks `state` first. |
 | 5 | Low | Session map keyed on an unbounded, attacker-controlled header. | Fixed. Ids validated (charset, ≤128), map capped at 10 000 with idle eviction. |
@@ -44,7 +44,7 @@ and state output.
 
 | # | Severity | Finding (original) | Disposition here |
 | --- | --- | --- | --- |
-| 1 | High (headless) | Daily unattended `npm install -g` from the registry with no provenance check, no `--ignore-scripts`, no major-version fence. | Fixed. Nothing installs unattended: the server only *reports* a newer release. `teamclaude update` is operator-invoked, fetches through authenticated `gh`, verifies the archive against `SHA256SUMS` and its Sigstore signature, refuses downgrades and silent major jumps, and rolls the binary back if the restarted server is not healthy. |
+| 1 | High (headless) | Daily unattended `npm install -g` from the registry with no provenance check, no `--ignore-scripts`, no major-version fence. | Fixed. Nothing installs unattended: the server only *reports* a newer release. `corrall update` is operator-invoked, fetches through authenticated `gh`, verifies the archive against `SHA256SUMS` and its Sigstore signature, refuses downgrades and silent major jumps, and rolls the binary back if the restarted server is not healthy. |
 | 2 | Medium | `TC_ACCT` + MITM put the proxy master key into `HTTPS_PROXY` for every subprocess Claude Code spawns. | Fixed. `env`/`run` include the key only when the proxy is bound off-loopback; on loopback the pin travels alone. |
 | 3 | Medium | Client-controlled `model`, path and session id reached the TUI unsanitised (terminal escape injection). | Fixed. Everything shown in the TUI or logged goes through `security::safe_text`; session ids are validated on ingest. |
 | 4 | Low | Terminal title stripped C0 but not C1/format characters. | Title setting not ported; `safe_text` strips all control and C1 characters. |
@@ -60,7 +60,7 @@ and state output.
 - Non-loopback bind without a key of at least 16 characters fails config
   validation; so does a plaintext `upstream` to a non-loopback host.
 - Failed authentication is delayed 250 ms and counted in
-  `teamclaude_auth_failures_total`.
+  `corrall_auth_failures_total`.
 - Upstream redirects are never followed with a credential attached.
 - Request-log files redact `authorization`/`x-api-key` and are swept by age.
 - Memory safety and no `unsafe` in the crate.

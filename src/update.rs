@@ -1,6 +1,6 @@
 //! Updating an installed release in place, and the notify-only check that
 //! tells the operator a release exists. Nothing here ever runs unattended:
-//! `teamclaude update` installs only when invoked, and the background check
+//! `corrall update` installs only when invoked, and the background check
 //! only records the latest tag for `status` and the TUI to show.
 //!
 //! Adapted from draft PR #3 by @danielcbaldwin, with a version fence, a
@@ -23,7 +23,7 @@ use sha2::{Digest, Sha256};
 
 use crate::security::safe_text;
 
-const UNIT: &str = "teamclaude.service";
+const UNIT: &str = "corrall.service";
 const GH_HINT: &str = "the GitHub CLI (gh) is required: the repository is private, so its releases cannot be downloaded anonymously. Install gh and run `gh auth login`, or set GH_TOKEN";
 
 #[derive(Args, Debug, Default)]
@@ -56,7 +56,7 @@ pub fn current_version() -> &'static str {
 /// `owner/repo` to update from. Overridable so a fork — or a test — can point
 /// the updater somewhere else, the same knob `scripts/install.sh` offers.
 pub fn repo() -> String {
-    std::env::var("TEAMCLAUDE_REPO").ok().filter(|s| !s.trim().is_empty()).unwrap_or_else(|| "NodeSpy/teamclaude".to_string())
+    std::env::var("CORRALL_REPO").ok().filter(|s| !s.trim().is_empty()).unwrap_or_else(|| "NodeSpy/corrall".to_string())
 }
 
 pub fn run(args: &UpdateArgs) -> Result<()> {
@@ -78,7 +78,7 @@ pub fn run(args: &UpdateArgs) -> Result<()> {
         if same_version(current, &latest) {
             println!("Up to date ({current}).");
         } else {
-            println!("Update available: {current} → {latest}\nRun `teamclaude update` to install it.");
+            println!("Update available: {current} → {latest}\nRun `corrall update` to install it.");
         }
         return Ok(());
     }
@@ -168,7 +168,7 @@ pub fn compare(current: &str, candidate: &str) -> Ordering {
 /// Poll the local proxy's health endpoint until it answers with a version.
 fn wait_healthy() -> Result<String> {
     let port = crate::config::Config::load().ok().flatten().map(|c| c.proxy.port).unwrap_or(crate::config::DEFAULT_PORT);
-    let url = format!("http://127.0.0.1:{port}/teamclaude/health");
+    let url = format!("http://127.0.0.1:{port}/corrall/health");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     let mut last = String::new();
     while std::time::Instant::now() < deadline {
@@ -192,7 +192,7 @@ fn wait_healthy() -> Result<String> {
 /// The latest release tag, or None when it cannot be determined (no gh, no
 /// network, no access). Used by the passive check; never fails loudly.
 pub fn latest_tag_quiet() -> Option<String> {
-    if std::env::var_os("TEAMCLAUDE_DISABLE_UPDATE_CHECK").is_some() {
+    if std::env::var_os("CORRALL_DISABLE_UPDATE_CHECK").is_some() {
         return None;
     }
     latest_tag(&repo()).ok()
@@ -214,7 +214,7 @@ fn latest_tag(repo: &str) -> Result<String> {
 fn apply(repo: &str, tag: &str, target: &Path) -> Result<Option<PathBuf>> {
     let triple = target_triple(std::env::consts::OS, std::env::consts::ARCH)?;
     let asset = asset_name(tag, triple);
-    let work = tempfile::Builder::new().prefix("teamclaude-update-").tempdir().context("creating a temporary directory")?;
+    let work = tempfile::Builder::new().prefix("corrall-update-").tempdir().context("creating a temporary directory")?;
     let dir = work.path();
 
     println!("Downloading {asset} from {repo} {tag}");
@@ -236,9 +236,9 @@ fn apply(repo: &str, tag: &str, target: &Path) -> Result<Option<PathBuf>> {
     if !st.success() {
         bail!("tar could not extract {asset}");
     }
-    let new_bin = dir.join(asset.trim_end_matches(".tar.gz")).join("teamclaude");
+    let new_bin = dir.join(asset.trim_end_matches(".tar.gz")).join("corrall");
     if !new_bin.is_file() {
-        bail!("{asset} does not contain a teamclaude binary");
+        bail!("{asset} does not contain a corrall binary");
     }
     // A binary that will not run here is not worth swapping in.
     let v = Command::new(&new_bin).arg("--version").stdin(Stdio::null()).output().context("running the downloaded binary")?;
@@ -289,7 +289,7 @@ fn verify_signature(repo: &str, dir: &Path) -> Result<()> {
 
 fn replace(new_bin: &Path, target: &Path) -> Result<()> {
     let dir = target.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
-    let tmp = dir.join(format!(".teamclaude-update-{}", crate::security::random_key(6)));
+    let tmp = dir.join(format!(".corrall-update-{}", crate::security::random_key(6)));
     std::fs::copy(new_bin, &tmp).map_err(|e| write_err(dir, e))?;
     #[cfg(unix)]
     {
@@ -364,7 +364,7 @@ pub fn target_triple(os: &str, arch: &str) -> Result<&'static str> {
 
 /// Must match the `Package` step of `.github/workflows/release.yml`.
 pub fn asset_name(tag: &str, triple: &str) -> String {
-    format!("teamclaude-{tag}-{triple}.tar.gz")
+    format!("corrall-{tag}-{triple}.tar.gz")
 }
 
 /// Tags carry a leading `v`, `CARGO_PKG_VERSION` does not.
@@ -424,7 +424,7 @@ mod tests {
 
     #[test]
     fn asset_names_match_the_release_workflow() {
-        assert_eq!(asset_name("v2.1.0", "x86_64-unknown-linux-musl"), "teamclaude-v2.1.0-x86_64-unknown-linux-musl.tar.gz");
+        assert_eq!(asset_name("v2.1.0", "x86_64-unknown-linux-musl"), "corrall-v2.1.0-x86_64-unknown-linux-musl.tar.gz");
         assert_eq!(target_triple("linux", "x86_64").unwrap(), "x86_64-unknown-linux-musl");
         assert_eq!(target_triple("macos", "aarch64").unwrap(), "aarch64-apple-darwin");
         assert!(target_triple("windows", "x86_64").is_err());
@@ -455,25 +455,25 @@ mod tests {
         let h = "a".repeat(64);
         let other = "b".repeat(64);
         let sums = format!(
-            "{h}  teamclaude-v2.1.0-x86_64-unknown-linux-musl.tar.gz\n\
-             {other} *teamclaude-v2.1.0-aarch64-apple-darwin.tar.gz\n"
+            "{h}  corrall-v2.1.0-x86_64-unknown-linux-musl.tar.gz\n\
+             {other} *corrall-v2.1.0-aarch64-apple-darwin.tar.gz\n"
         );
-        assert_eq!(expected_sha256(&sums, "teamclaude-v2.1.0-x86_64-unknown-linux-musl.tar.gz"), Some(h.as_str()));
-        assert_eq!(expected_sha256(&sums, "teamclaude-v2.1.0-aarch64-apple-darwin.tar.gz"), Some(other.as_str()));
+        assert_eq!(expected_sha256(&sums, "corrall-v2.1.0-x86_64-unknown-linux-musl.tar.gz"), Some(h.as_str()));
+        assert_eq!(expected_sha256(&sums, "corrall-v2.1.0-aarch64-apple-darwin.tar.gz"), Some(other.as_str()));
         // A suffix must not satisfy a different asset.
         assert_eq!(expected_sha256(&sums, "unknown-linux-musl.tar.gz"), None);
-        assert_eq!(expected_sha256(&sums, "teamclaude-v2.2.0-x86_64-unknown-linux-musl.tar.gz"), None);
+        assert_eq!(expected_sha256(&sums, "corrall-v2.2.0-x86_64-unknown-linux-musl.tar.gz"), None);
         // A truncated hash is not a hash.
-        assert_eq!(expected_sha256("abc  teamclaude-v1.tar.gz", "teamclaude-v1.tar.gz"), None);
+        assert_eq!(expected_sha256("abc  corrall-v1.tar.gz", "corrall-v1.tar.gz"), None);
     }
 
     #[test]
     fn a_file_hashes_to_its_sha256() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("a.bin");
-        std::fs::write(&p, b"teamclaude").unwrap();
-        // printf teamclaude | sha256sum
-        assert_eq!(sha256_file(&p).unwrap(), "2539f24a38fcd8c6ed1d89e908d35b16411772fc36e4cab62b02b555d92b1a95");
+        std::fs::write(&p, b"corrall").unwrap();
+        // printf corrall | sha256sum
+        assert_eq!(sha256_file(&p).unwrap(), "9332178735a64a58e3b50e997960586b5b9fecf121685cd3f2304a2df31fabcf");
         // Larger than one read buffer, to exercise the loop.
         let big = dir.path().join("b.bin");
         std::fs::write(&big, vec![7u8; 200 * 1024]).unwrap();
@@ -482,17 +482,17 @@ mod tests {
 
     #[test]
     fn a_cargo_built_binary_is_recognised() {
-        assert!(in_cargo_target(Path::new("/home/u/src/teamclaude/target/release/teamclaude")));
-        assert!(in_cargo_target(Path::new("/home/u/src/teamclaude/target/debug/teamclaude")));
-        assert!(!in_cargo_target(Path::new("/home/u/.local/bin/teamclaude")));
-        assert!(!in_cargo_target(Path::new("/usr/local/bin/teamclaude")));
-        assert!(!in_cargo_target(Path::new("teamclaude")));
+        assert!(in_cargo_target(Path::new("/home/u/src/corrall/target/release/corrall")));
+        assert!(in_cargo_target(Path::new("/home/u/src/corrall/target/debug/corrall")));
+        assert!(!in_cargo_target(Path::new("/home/u/.local/bin/corrall")));
+        assert!(!in_cargo_target(Path::new("/usr/local/bin/corrall")));
+        assert!(!in_cargo_target(Path::new("corrall")));
     }
 
     #[test]
     fn the_binary_is_swapped_by_rename() {
         let dir = tempfile::tempdir().unwrap();
-        let (old, new) = (dir.path().join("teamclaude"), dir.path().join("new"));
+        let (old, new) = (dir.path().join("corrall"), dir.path().join("new"));
         std::fs::write(&old, b"old").unwrap();
         std::fs::write(&new, b"new").unwrap();
         replace(&new, &old).unwrap();

@@ -1,21 +1,21 @@
 [package]
-name = "teamclaude"
+name = "corrall"
 version = "2.2.0"
 edition = "2021"
 rust-version = "1.80"
 description = "Multi-account Claude proxy with automatic quota-based rotation for Claude Code, rewritten in Rust"
 license = "MIT"
-repository = "https://github.com/NodeSpy/teamclaude"
+repository = "https://github.com/NodeSpy/corrall"
 readme = "README.md"
 keywords = ["claude", "anthropic", "proxy", "load-balancer", "multi-account"]
 categories = ["command-line-utilities", "network-programming"]
 
 [lib]
-name = "teamclaude"
+name = "corrall"
 path = "src/lib.rs"
 
 [[bin]]
-name = "teamclaude"
+name = "corrall"
 path = "src/main.rs"
 
 [dependencies]

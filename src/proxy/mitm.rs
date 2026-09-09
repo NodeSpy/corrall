@@ -16,9 +16,9 @@ use tokio_rustls::rustls::ServerConfig;
 use crate::config::config_dir;
 use crate::security::write_private_atomic;
 
-pub const CA_CERT: &str = "teamclaude-ca.pem";
-const LEAF_CERT: &str = "teamclaude-leaf.pem";
-const LEAF_KEY: &str = "teamclaude-leaf.key";
+pub const CA_CERT: &str = "corrall-ca.pem";
+const LEAF_CERT: &str = "corrall-leaf.pem";
+const LEAF_KEY: &str = "corrall-leaf.key";
 pub const TEST_HOST: &str = "www.example.org";
 
 pub fn ca_cert_path() -> PathBuf {
@@ -66,8 +66,8 @@ fn generate(hosts: &[String]) -> Result<Certs> {
     ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign, KeyUsagePurpose::DigitalSignature];
     let mut dn = DistinguishedName::new();
-    dn.push(DnType::CommonName, "TeamClaude Local CA");
-    dn.push(DnType::OrganizationName, "TeamClaude (local MITM, not a public CA)");
+    dn.push(DnType::CommonName, "Corrall Local CA");
+    dn.push(DnType::OrganizationName, "Corrall (local MITM, not a public CA)");
     ca_params.distinguished_name = dn;
     ca_params.not_before = rcgen::date_time_ymd(2025, 1, 1);
     ca_params.not_after = time_after_days(3650);

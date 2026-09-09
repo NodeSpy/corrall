@@ -1,9 +1,11 @@
 # Configuration
 
-Path: `$TEAMCLAUDE_CONFIG`, else `$XDG_CONFIG_HOME/teamclaude.json`, else
-`~/.config/teamclaude.json`. Written `0600`, atomically. Unknown keys are kept.
+Path: `$CORRALL_CONFIG`, else `$XDG_CONFIG_HOME/corrall.json`, else
+`~/.config/corrall.json`. Written `0600`, atomically. Unknown keys are kept.
+A pre-rename `teamclaude.json` beside a missing `corrall.json` is an error, not
+a fresh start: `scripts/install.sh` renames it (see the README).
 
-Runtime state (observed quota, usage counters) goes to `teamclaude.state.json`
+Runtime state (observed quota, usage counters) goes to `corrall.state.json`
 beside it. Safe to delete; quota is re-learned from traffic.
 
 ## Pools
@@ -61,13 +63,13 @@ HTTPS_PROXY=http://alice~work:@127.0.0.1:3456
 HTTPS_PROXY=http://~work:@127.0.0.1:3456
 ```
 
-`teamclaude env --pool work` emits the right form for whichever mode is
+`corrall env --pool work` emits the right form for whichever mode is
 configured. The default pool is never named in either form, so a one-pool
 install emits byte-for-byte what it emitted before pools existed.
 
 ### Auto-selecting a pool
 
-A pool can carry a `match` block, and then `teamclaude env` / `teamclaude run`
+A pool can carry a `match` block, and then `corrall env` / `corrall run`
 picks it from the launch context — no per-project wrapper needed:
 
 ```json
@@ -100,23 +102,23 @@ fire, the chosen pool and the reason go to **stderr** while the exports still
 go to stdout:
 
 ```
-$ eval "$(teamclaude env)"
-[TeamClaude] pool "work" (path ~/Projects/acme)
+$ eval "$(corrall env)"
+[Corrall] pool "work" (path ~/Projects/acme)
 ```
 
-`teamclaude env --cwd DIR` matches against `DIR` instead of the current
+`corrall env --cwd DIR` matches against `DIR` instead of the current
 directory, for a wrapper resolving a project it has not entered yet.
 
 ## Top level
 
 | Field | Default | Description |
 | --- | --- | --- |
-| `proxy.port` | `3456` | Local port. `teamclaude server --port N` overrides it for one run |
-| `proxy.host` | `127.0.0.1` | Bind address. Anything non-loopback requires `proxy.apiKey` of at least 16 chars; the server refuses to start otherwise. `TEAMCLAUDE_HOST` overrides, as does `teamclaude server --listen HOST:PORT` for one run. `teamclaude env`/`run` and the CLI's own control calls dial loopback when this is a wildcard (`0.0.0.0`, `::`) — nothing can connect to a wildcard — and dial the host itself when it is specific |
+| `proxy.port` | `3456` | Local port. `corrall server --port N` overrides it for one run |
+| `proxy.host` | `127.0.0.1` | Bind address. Anything non-loopback requires `proxy.apiKey` of at least 16 chars; the server refuses to start otherwise. `CORRALL_HOST` overrides, as does `corrall server --listen HOST:PORT` for one run. `corrall env`/`run` and the CLI's own control calls dial loopback when this is a wildcard (`0.0.0.0`, `::`) — nothing can connect to a wildcard — and dial the host itself when it is specific |
 | `proxy.apiKey` | generated | Key clients present via `x-api-key` (or `Authorization: Bearer tc-…`, or the Basic password on CONNECT). Generated once as `tc-…` and written back if the file has none; a key you set is never touched |
 | `proxy.clientKeys` | `[]` | `[{ "name", "key" }]`; usage is attributed to `name` |
 | `proxy.requireKeyOnLoopback` | `false` | Require the key even from 127.0.0.1. Recommended on shared hosts |
-| `proxy.sessionDetail` | `false` | Include a per-session breakdown in `/teamclaude/status` |
+| `proxy.sessionDetail` | `false` | Include a per-session breakdown in `/corrall/status` |
 | `proxy.usageDimensions` | `[]` | `[{ "name", "header" }]`: request headers consumed by the proxy for attribution (not forwarded) |
 | `proxy.maxBodyBytes` | `67108864` | Largest client request body accepted |
 | `upstream` | `https://api.anthropic.com` | Upstream base URL. Must be https unless loopback |
@@ -168,22 +170,22 @@ Bucket keys: `unified5h`, `unified7d`, `unified7dFable`, `unified7dSonnet`,
 
 | Variable | Effect |
 | --- | --- |
-| `TC_ACCT` | Pin `teamclaude run` / `env` to one account (uuid, org uuid, `uuid/org`, name or email). Removed from the child environment |
-| `TC_POOL` | Send `teamclaude run` / `env` to one pool, the same way `TC_ACCT` chooses an account. `--pool` wins over it, and either skips `match` rules. Removed from the child environment |
-| `TEAMCLAUDE_CONFIG` | Config path |
-| `TEAMCLAUDE_HOST` | Override `proxy.host` |
-| `TEAMCLAUDE_LOG` | `tracing` filter, e.g. `debug` |
-| `TEAMCLAUDE_UPSTREAM_HEADERS_TIMEOUT_MS` | Time to first byte, default 120000 |
-| `TEAMCLAUDE_UPSTREAM_BODY_TIMEOUT_MS` | Idle gap between body chunks, default 120000 |
-| `TEAMCLAUDE_UPSTREAM_MAX_SOCKETS` | Idle pooled connections per host, default 256 |
-| `TEAMCLAUDE_REFRESH_TIMEOUT_MS` | OAuth refresh timeout, default 30000 |
-| `TEAMCLAUDE_RATE_LIMIT_ABSORB_MAX_SECONDS` | Longest `retry-after` absorbed inline when holding, default 60 |
-| `TEAMCLAUDE_FAMILY_STALE_MS` | How long a spent family (Fable/Sonnet) reading is trusted before revalidation, default 1800000 |
-| `TEAMCLAUDE_REPO` | `owner/repo` `teamclaude update` fetches releases from, default `NodeSpy/teamclaude` (the same knob `scripts/install.sh` reads) |
+| `TC_ACCT` | Pin `corrall run` / `env` to one account (uuid, org uuid, `uuid/org`, name or email). Removed from the child environment |
+| `TC_POOL` | Send `corrall run` / `env` to one pool, the same way `TC_ACCT` chooses an account. `--pool` wins over it, and either skips `match` rules. Removed from the child environment |
+| `CORRALL_CONFIG` | Config path |
+| `CORRALL_HOST` | Override `proxy.host` |
+| `CORRALL_LOG` | `tracing` filter, e.g. `debug` |
+| `CORRALL_UPSTREAM_HEADERS_TIMEOUT_MS` | Time to first byte, default 120000 |
+| `CORRALL_UPSTREAM_BODY_TIMEOUT_MS` | Idle gap between body chunks, default 120000 |
+| `CORRALL_UPSTREAM_MAX_SOCKETS` | Idle pooled connections per host, default 256 |
+| `CORRALL_REFRESH_TIMEOUT_MS` | OAuth refresh timeout, default 30000 |
+| `CORRALL_RATE_LIMIT_ABSORB_MAX_SECONDS` | Longest `retry-after` absorbed inline when holding, default 60 |
+| `CORRALL_FAMILY_STALE_MS` | How long a spent family (Fable/Sonnet) reading is trusted before revalidation, default 1800000 |
+| `CORRALL_REPO` | `owner/repo` `corrall update` fetches releases from, default `NodeSpy/corrall` (the same knob `scripts/install.sh` reads) |
 
 ## Control endpoints
 
-All under `http://127.0.0.1:<port>/teamclaude/`, authenticated like any other
+All under `http://127.0.0.1:<port>/corrall/`, authenticated like any other
 request. `POST` bodies are capped at 64 KiB. Browser-originated requests are
 refused.
 
@@ -199,7 +201,7 @@ refused.
 | `POST route-pin` `{ "route": "…", "account": "…", "pool"? }` | Pin a route (omit `account` to clear) |
 
 A `/pool/<name>` prefix on the control path selects the pool too, so
-`/pool/work/teamclaude/quota` reads the `work` fleet.
+`/pool/work/corrall/quota` reads the `work` fleet.
 
 ## Passthrough paths
 
@@ -210,16 +212,16 @@ proxy key are stripped.
 
 ## Importing from claudeacrobat
 
-`teamclaude import-claudeacrobat` reads the account files of a
+`corrall import-claudeacrobat` reads the account files of a
 [claudeacrobat](https://github.com/EdnitionCode/claudeacrobat) install and
 writes them into this config. It is a read: claudeacrobat's own files are never
 touched, so both proxies keep working (on their own ports) afterwards.
 
 ```bash
-teamclaude import-claudeacrobat --dry-run          # what would land where
-teamclaude import-claudeacrobat                    # keep its pool layout
-teamclaude import-claudeacrobat --pool work        # put everything in one pool
-teamclaude import-claudeacrobat --from /srv/acrobat-state
+corrall import-claudeacrobat --dry-run          # what would land where
+corrall import-claudeacrobat                    # keep its pool layout
+corrall import-claudeacrobat --pool work        # put everything in one pool
+corrall import-claudeacrobat --from /srv/acrobat-state
 ```
 
 | Flag | Effect |
@@ -230,7 +232,7 @@ teamclaude import-claudeacrobat --from /srv/acrobat-state
 
 Mapping, the inverse of claudeacrobat's own `import-teamclaude`:
 
-| claudeacrobat | teamclaude |
+| claudeacrobat | corrall |
 | --- | --- |
 | `kind: owned` (it holds and refreshes the tokens) | `type: oauth` with `accessToken` / `refreshToken` / `expiresAt` |
 | `kind: linked` (tokens read live from Claude Code) | `type: oauth` with `importFrom` set to that credentials file |
@@ -243,10 +245,10 @@ fleets it kept apart stay apart, because merging them would have both rotations
 spending one account's quota without either knowing.
 
 Re-running is safe. An account is matched by `accountUuid` (then by name) and
-refreshed in place, keeping whatever teamclaude-only settings it had — a route,
-a `modelMap`, its own `upstream`. Anything with no teamclaude equivalent is
+refreshed in place, keeping whatever corrall-only settings it had — a route,
+a `modelMap`, its own `upstream`. Anything with no corrall equivalent is
 reported rather than guessed at: an account with no token, a pool whose name is
-outside [teamclaude's charset](#pools), an API-key or Codex account that already
+outside [corrall's charset](#pools), an API-key or Codex account that already
 holds the same name.
 
 ## Codex
@@ -254,33 +256,33 @@ holds the same name.
 Point the Codex CLI at the proxy in `~/.codex/config.toml`:
 
 ```toml
-model_provider = "teamclaude"
+model_provider = "corrall"
 
-[model_providers.teamclaude]
-name = "teamclaude"
+[model_providers.corrall]
+name = "corrall"
 base_url = "http://127.0.0.1:3456/backend-api/codex"
 wire_api = "responses"
 ```
 
-or launch it behind the MITM proxy (`eval "$(teamclaude env)"`), which
+or launch it behind the MITM proxy (`eval "$(corrall env)"`), which
 intercepts `chatgpt.com` as soon as one Codex account is configured
 (`ab.chatgpt.com`, OpenAI's telemetry host, is never intercepted). Codex and
 Anthropic accounts rotate independently on one port.
 
 ## Updating
 
-`teamclaude update --check` compares this binary with the latest GitHub
-release. `teamclaude update` downloads the archive for this OS/arch through
+`corrall update --check` compares this binary with the latest GitHub
+release. `corrall update` downloads the archive for this OS/arch through
 the GitHub CLI (the repository is private), verifies it against `SHA256SUMS`
 and the Sigstore signature (when `cosign` is installed), swaps the binary
-atomically beside the old one (kept as `teamclaude.prev`), restarts the
-`systemd --user` unit if it was running, and waits for `/teamclaude/health`.
+atomically beside the old one (kept as `corrall.prev`), restarts the
+`systemd --user` unit if it was running, and waits for `/corrall/health`.
 If the new binary does not come up healthy the previous one is restored and
 restarted. The implicit "latest" path never downgrades and refuses a new major
 version without `--allow-major`; `--version vX.Y.Z` installs a specific tag on
 purpose.
 
 The server checks once a day (`updateCheck`, default on; or
-`TEAMCLAUDE_DISABLE_UPDATE_CHECK=1`) and only *reports* a newer release in
-`teamclaude status`, the TUI header and `/teamclaude/status` (`updateAvailable`).
+`CORRALL_DISABLE_UPDATE_CHECK=1`) and only *reports* a newer release in
+`corrall status`, the TUI header and `/corrall/status` (`updateAvailable`).
 Nothing is ever installed unattended.

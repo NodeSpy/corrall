@@ -176,7 +176,7 @@ impl Tui {
 
         let sessions = st.get("sessions");
         let header = format!(
-            " TeamClaude v{}   current: {}   sessions: {} active / {} known   threshold: {}   probe: {}",
+            " Corrall v{}   current: {}   sessions: {} active / {} known   threshold: {}   probe: {}",
             st.get("version").and_then(Value::as_str).unwrap_or("?"),
             st.get("current").and_then(Value::as_str).unwrap_or("-"),
             sessions.and_then(|s| s.get("active")).and_then(Value::as_u64).unwrap_or(0),
@@ -190,7 +190,7 @@ impl Tui {
         // The release check is daemon-wide and records itself on the default
         // pool, which is what the status document's top level carries.
         let header = match st.get("updateAvailable").and_then(Value::as_str) {
-            Some(tag) => format!("{header}   UPDATE {tag} available (teamclaude update)"),
+            Some(tag) => format!("{header}   UPDATE {tag} available (corrall update)"),
             None => header,
         };
         f.render_widget(Paragraph::new(header).style(Style::default().bold()), chunks[0]);
