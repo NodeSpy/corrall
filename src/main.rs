@@ -154,6 +154,7 @@ async fn server(args: ServerArgs, interactive: bool) -> Result<()> {
         metrics: Metrics::default(),
         tls: RwLock::new(None),
         titles: titles.clone(),
+        oauth_flows: Default::default(),
     }));
     *ctx_cell.lock() = Some(ctx.clone());
 

@@ -684,6 +684,30 @@ impl Config {
         Ok(self.pools.entry(name.to_string()).or_default())
     }
 
+    /// Move a pool's configuration under a new name. The `defaultPool` pointer
+    /// follows the rename so an unprefixed request still resolves. Fails if the
+    /// old name is unknown or the new name already exists; the config is left
+    /// untouched on failure. Live runtime state (sessions, quota observations)
+    /// is re-keyed separately — see [`crate::pools::Pools::rename_pool`] — so it
+    /// survives the reload rather than being dropped and rebuilt.
+    pub fn rename_pool(&mut self, old: &str, new: &str) -> Result<()> {
+        if old == new {
+            return Ok(());
+        }
+        validate_pool_name(new)?;
+        if self.pools.contains_key(new) {
+            bail!("a pool named {new:?} already exists");
+        }
+        let Some(pool) = self.pools.remove(old) else {
+            bail!("no pool named {old:?}");
+        };
+        self.pools.insert(new.to_string(), pool);
+        if self.default_pool == old {
+            self.default_pool = new.to_string();
+        }
+        Ok(())
+    }
+
     /// Every account in the file with the pool that owns it.
     pub fn all_accounts(&self) -> impl Iterator<Item = (&str, &AccountConfig)> {
         self.pools.iter().flat_map(|(name, p)| p.accounts.iter().map(move |a| (name.as_str(), a)))
@@ -1149,5 +1173,36 @@ mod tests {
         let out = serde_json::to_value(&st).unwrap();
         assert!(out.pointer("/accounts/id-1").is_some(), "default pool stays flattened");
         assert!(out.pointer("/pools/work/accounts/id-2").is_some());
+    }
+
+    #[test]
+    fn rename_pool_moves_config_and_follows_the_default_pointer() {
+        let mut c = Config::default();
+        c.pools.insert("work".into(), PoolConfig { hold_seconds: 42, ..Default::default() });
+
+        // Renaming a non-default pool moves its config under the new key.
+        c.rename_pool("work", "clients").unwrap();
+        assert!(!c.pools.contains_key("work"));
+        assert_eq!(c.pool("clients").unwrap().hold_seconds, 42);
+        assert_eq!(c.default_pool, DEFAULT_POOL, "an unrelated rename leaves the default alone");
+
+        // Renaming the default pool carries the defaultPool pointer along.
+        c.rename_pool(DEFAULT_POOL, "primary").unwrap();
+        assert_eq!(c.default_pool, "primary");
+        assert!(c.pools.contains_key("primary"));
+    }
+
+    #[test]
+    fn rename_pool_rejects_collisions_unknowns_and_bad_names() {
+        let mut c = Config::default();
+        c.pools.insert("work".into(), PoolConfig::default());
+
+        assert!(c.rename_pool("work", DEFAULT_POOL).is_err(), "cannot rename onto an existing pool");
+        assert!(c.pools.contains_key("work"), "a rejected rename leaves the config untouched");
+        assert!(c.rename_pool("nope", "elsewhere").is_err(), "cannot rename a pool that is not there");
+        assert!(c.rename_pool("work", "Work").is_err(), "the new name is charset-checked");
+        // A no-op rename to the same name is fine.
+        c.rename_pool("work", "work").unwrap();
+        assert!(c.pools.contains_key("work"));
     }
 }

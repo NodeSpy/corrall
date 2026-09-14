@@ -1,6 +1,6 @@
 [package]
 name = "corrall"
-version = "3.0.0"
+version = "3.1.0"
 edition = "2021"
 rust-version = "1.80"
 description = "Multi-account Claude proxy with automatic quota-based rotation for Claude Code, rewritten in Rust"
