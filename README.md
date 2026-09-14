@@ -349,6 +349,105 @@ integration, the egress-IP guard, the remote TUI (`attach`), shell alias
 installation, the launchd service file, warm-up wall-clock schedules (interval
 mode only), and the Nix packaging.
 
+## Paseo plugin
+
+`paseo-plugin/` is a [Paseo](https://paseo.sh) plugin (Paseo ≥ 0.8) that shows
+the same account usage as the TUI inside the Paseo app — one card per account
+with gradient `Session (5h)` / `Weekly (7d)` / per-family bars, `F✓ S✓ O✓`
+family flags, a spend line, plus per-account and per-pool controls.
+
+### Install
+
+Enable plugins in Paseo first — **Settings → Plugins → Enable plugins**, or set
+`pluginsEnabled: true` in Paseo's `config.json` and run `paseo reload --json` —
+then install from this repo:
+
+```sh
+paseo plugin add NodeSpy/corrall:paseo-plugin
+```
+
+The `:paseo-plugin` suffix points at the plugin's subdirectory. The repo is
+private, so the machine running `paseo plugin add` needs Git access to
+`NodeSpy/corrall` (an SSH key, or `gh auth login`) — the same requirement as the
+binary installer. Paseo clones the repo, runs the plugin's build step
+(`npm ci`, which pulls its one bundled dependency), and loads it. Watch the
+daemon-side log with `paseo plugin logs corrall`.
+
+To develop against a local checkout instead of the Git source:
+
+```sh
+cd paseo-plugin
+npm install && npm run typecheck
+paseo plugin install "$PWD"          # trust & load this directory
+paseo plugin reload corrall          # after each edit
+```
+
+There is nothing else to configure: the plugin's daemon-side handler reads
+Corrall's own `corrall.json` (`$XDG_CONFIG_HOME/corrall.json`, or
+`$CORRALL_CONFIG` — the same file the CLI and TUI use) for the proxy `port` and
+`apiKey`, then polls `GET /corrall/status` with the key in `x-api-key`. If
+`corrall server` is running locally, the plugin finds it.
+
+### Update
+
+Pull the newest version and rebuild it in place with:
+
+```sh
+paseo plugin update corrall
+```
+
+That fetches the latest commit, re-runs the build step and reloads the plugin
+(`paseo plugin logs corrall` shows the reload; `paseo plugin ls` shows the
+commit it is on). If you installed from a **local checkout** instead, `git pull`
+and then `paseo plugin reload corrall` (run `npm install` first if dependencies
+changed).
+
+Updating the **plugin** and updating the **daemon** are separate steps: the
+plugin ships the app UI, while account and pool **management** also needs the
+`corrall` binary to carry the matching control routes. Update the daemon with
+`corrall update` (see [Updating](#updating)).
+
+> **Daemon version.** The usage view works against any daemon that serves
+> `GET /corrall/status`. The management actions — enable / disable / priority,
+> create / edit pools, and add / re-login accounts — need a daemon built with
+> the newer control routes (`/corrall/pools…`, `/corrall/login/…`); if those
+> actions return 404, update the daemon (`corrall update`, or rebuild from
+> source) and restart it.
+
+- **Settings** — a "Corrall" screen under Paseo → Settings listing every pool
+  and account with the TUI's colour rules (green→yellow→red bars; solid red when
+  a window is exhausted). Also opened by the composer pill, the `/corrall`
+  command and the command centre.
+- **Actions** — Enable / Disable and priority up/down on each account, wired to
+  `POST /corrall/pools/{pool}/accounts/{id}/…`. Changes are written to
+  `corrall.json` and the running fleet is re-synced, exactly as the CLI's
+  `corrall enable` / `disable` / `priority` do.
+- **Add / re-login accounts** — "Add account" on each pool header, and
+  "Re-login" on each account (highlighted when it needs a fresh login), run the
+  same OAuth flow as `corrall login --token`, over the control routes
+  (`POST /corrall/login/{start,submit,cancel}`). Because the app is usually
+  remote from the daemon, it uses the **manual** flow: the plugin gives you a
+  sign-in link to open, and you paste the `code#state` the redirect page shows
+  back into the modal. Tokens are exchanged daemon-side and never pass through
+  the app.
+- **Create & edit pools** — "New pool" and each pool's **Edit** button post to
+  `POST /corrall/pools` / `POST /corrall/pools/{name}`. Corrall has no single
+  "balancing strategy": a pool's rotation is its **switch threshold** plus
+  whether **sessions are distributed** (and per-account priority), so the forms
+  edit those directly. Renaming a pool moves its config and re-keys its live
+  fleet; it resets that pool's in-flight sessions and quota history, so update
+  any `ANTHROPIC_BASE_URL` that pins `/pool/<name>`. Full pool tuning (match
+  rules, probe interval) stays a CLI job (`corrall pool set`).
+- **Composer pill** — a "corrall" pill (gauge icon) sits on every agent's
+  composer. Tapping it opens a compact popover tabulating each account's 5h / 7d
+  usage with a **Manage accounts & pools** button that jumps to the Settings
+  screen. `/corrall` also opens the surface.
+- **States** — the surface shows "not configured" when no config file exists and
+  "not reachable" when the daemon is down, instead of erroring.
+
+The plugin is unsandboxed and trusted, like every Paseo plugin: its server code
+runs in the Paseo daemon and its client code in the app.
+
 ## Testing
 
 `cargo test` runs the unit tests and an integration suite (`tests/proxy.rs`)

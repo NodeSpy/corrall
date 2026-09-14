@@ -257,6 +257,7 @@ async fn spawn_proxy(mut cfg: Config) -> Proxy {
         metrics: Metrics::default(),
         tls: parking_lot::RwLock::new(None),
         titles: corrall::titles::Titles::new(&cfg.session_titles),
+        oauth_flows: Default::default(),
     }));
     let (_stx, srx) = tokio::sync::watch::channel(false);
     let bind: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
@@ -784,4 +785,87 @@ async fn mitm_connect_intercepts_with_local_ca_and_refuses_blind_tunnels() {
     assert_eq!(v["served_by"], "tok-a", "intercepted CONNECT went through account selection");
     let blind = client.get("https://example.com/").send().await;
     assert!(blind.is_err(), "blind tunnels are off by default");
+}
+
+// The management control routes: per-account enable/disable/priority, pool
+// create/edit(+rename), and the manual OAuth login flow registry. These mutate
+// the on-disk config the way the CLI does, so the test seeds that file first
+// (spawn_proxy uses reload: None, so `reconcile` applies each change to the live
+// ctx in place).
+#[tokio::test]
+async fn control_routes_manage_accounts_and_pools() {
+    test_env();
+    let mut seed = cfg_with(vec![account("a", "tok-a", 0, "http://127.0.0.1:1"), account("b", "tok-b", 1, "http://127.0.0.1:1")]);
+    seed.proxy.api_key = KEY.into();
+    seed.ensure_account_ids();
+    // Seed the file the mutating routes read/write.
+    Config::update(|c| {
+        *c = seed.clone();
+        Ok(())
+    })
+    .unwrap();
+    let p = spawn_proxy(seed).await;
+
+    let acct = |c: &Config, name: &str| c.pool(DEFAULT_POOL).unwrap().accounts.iter().find(|a| a.name == name).cloned().unwrap();
+
+    // Disable, then re-enable — the account is addressed by name (find_account_mut
+    // accepts it) and the change persists onto the on-disk AccountConfig.
+    let (st, v, _) = post(&p, "/corrall/pools/default/accounts/a/disable", json!({})).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(v["ok"].as_bool().unwrap());
+    assert!(acct(&p.ctx.config(), "a").disabled, "disable persisted");
+
+    let (st, _, _) = post(&p, "/corrall/pools/default/accounts/a/enable", json!({})).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(!acct(&p.ctx.config(), "a").disabled, "enable persisted");
+
+    // Priority.
+    let (st, _, _) = post(&p, "/corrall/pools/default/accounts/a/priority", json!({ "priority": 7 })).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(acct(&p.ctx.config(), "a").priority, 7, "priority persisted");
+    let (st, _, _) = post(&p, "/corrall/pools/default/accounts/a/priority", json!({})).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "priority needs a value");
+
+    // Unknown account / pool 404s rather than mutating.
+    let (st, _, _) = post(&p, "/corrall/pools/default/accounts/nope/disable", json!({})).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, _, _) = post(&p, "/corrall/pools/ghost/accounts/a/disable", json!({})).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+
+    // Create a pool with the corrall knobs (threshold + distribute).
+    let (st, v, _) = post(&p, "/corrall/pools", json!({ "name": "clients", "switchThreshold": 0.8, "distributeSessions": true })).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    {
+        let c = p.ctx.config();
+        let pc = c.pool("clients").expect("pool created");
+        assert_eq!(pc.switch_threshold, corrall::config::Threshold::Single(0.8));
+        assert!(pc.distribute_sessions);
+    }
+    assert!(p.ctx.pools.get("clients").is_some(), "the live registry gained the pool");
+
+    // Creating over an existing name is a conflict, not a silent edit.
+    let (st, _, _) = post(&p, "/corrall/pools", json!({ "name": "clients" })).await;
+    assert_eq!(st, StatusCode::CONFLICT);
+
+    // Rename a pool: config moves and the live manager is re-keyed (not rebuilt).
+    let (st, v, _) = post(&p, "/corrall/pools/clients", json!({ "newName": "vip" })).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["pool"], "vip");
+    assert!(p.ctx.config().pool("clients").is_none());
+    assert!(p.ctx.config().pool("vip").is_some());
+    assert!(p.ctx.pools.get("vip").is_some());
+
+    // Manual login registry: start hands back a flow + URL; cancel and a bogus
+    // submit exercise the one-shot lifecycle without any network exchange.
+    let (st, v, _) = post(&p, "/corrall/login/start", json!({ "pool": "vip" })).await;
+    assert_eq!(st, StatusCode::OK);
+    let flow = v["flow_id"].as_str().unwrap().to_string();
+    assert!(v["authorize_url"].as_str().unwrap().contains("code_challenge"));
+    let (st, _, _) = post(&p, "/corrall/login/cancel", json!({ "flow_id": flow })).await;
+    assert_eq!(st, StatusCode::OK);
+    // A submit against an unknown/cancelled flow is gone, not a 500.
+    let (st, _, _) = post(&p, "/corrall/login/submit", json!({ "flow_id": flow, "code": "x#y" })).await;
+    assert_eq!(st, StatusCode::GONE);
+    let (st, _, _) = post(&p, "/corrall/login/submit", json!({ "code": "x" })).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "submit needs a flow_id");
 }

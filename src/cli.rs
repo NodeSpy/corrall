@@ -399,7 +399,7 @@ fn pool_name(cfg: &Config, pool: Option<&str>) -> Result<String> {
 /// The pool an account-adding command should write to. Unlike [`pool_name`],
 /// `--pool` may name a pool that does not exist yet: `login --pool work` is how
 /// you create one.
-fn target_pool(cfg: &mut Config, pool: Option<&str>) -> Result<String> {
+pub(crate) fn target_pool(cfg: &mut Config, pool: Option<&str>) -> Result<String> {
     let Some(p) = pool else { return Ok(cfg.default_pool.clone()) };
     let fresh = !cfg.pools.contains_key(p);
     cfg.ensure_pool(p)?;
@@ -496,14 +496,14 @@ fn locate(cfg: &Config, pool: Option<&str>, needle: &str) -> Result<(String, usi
     })
 }
 
-fn find_account_mut<'a>(cfg: &'a mut Config, pool: Option<&str>, name: &str) -> Result<&'a mut AccountConfig> {
+pub(crate) fn find_account_mut<'a>(cfg: &'a mut Config, pool: Option<&str>, name: &str) -> Result<&'a mut AccountConfig> {
     let (p, i) = locate(cfg, pool, name)?;
     Ok(&mut cfg.pool_mut(&p).expect("locate returns a configured pool").accounts[i])
 }
 
 /// The first account in the file matching `pred`, with the pool holding it.
 /// Pools are searched in display order, so the default pool wins a tie.
-fn locate_by(cfg: &Config, mut pred: impl FnMut(&AccountConfig) -> bool) -> Option<(String, usize)> {
+pub(crate) fn locate_by(cfg: &Config, mut pred: impl FnMut(&AccountConfig) -> bool) -> Option<(String, usize)> {
     cfg.pool_names().into_iter().find_map(|p| cfg.pool(&p).and_then(|pc| pc.accounts.iter().position(&mut pred)).map(|i| (p, i)))
 }
 
@@ -514,7 +514,12 @@ fn locate_by(cfg: &Config, mut pred: impl FnMut(&AccountConfig) -> bool) -> Opti
 ///
 /// `pool` must already be a valid name — callers go through
 /// [`Config::ensure_pool`], which is what checks the charset.
-fn entry_at<'a>(cfg: &'a mut Config, pool: &str, found: Option<(String, usize)>, new: impl FnOnce() -> AccountConfig) -> (&'a mut AccountConfig, bool) {
+pub(crate) fn entry_at<'a>(
+    cfg: &'a mut Config,
+    pool: &str,
+    found: Option<(String, usize)>,
+    new: impl FnOnce() -> AccountConfig,
+) -> (&'a mut AccountConfig, bool) {
     match found {
         Some((from, i)) if from == pool => (&mut cfg.pool_mut(&from).expect("located pool exists").accounts[i], true),
         Some((from, i)) => {
@@ -531,7 +536,7 @@ fn entry_at<'a>(cfg: &'a mut Config, pool: &str, found: Option<(String, usize)>,
     }
 }
 
-fn upsert_oauth(cfg: &mut Config, pool: &str, name: &str, tokens: &oauth::Tokens, profile: Option<&oauth::Profile>) -> bool {
+pub(crate) fn upsert_oauth(cfg: &mut Config, pool: &str, name: &str, tokens: &oauth::Tokens, profile: Option<&oauth::Profile>) -> bool {
     // Identify by uuid when the profile gave us one, and only fall back to the
     // display name — an account first added with `--name` (no profile) has no
     // uuid to match on yet.
@@ -560,7 +565,7 @@ fn upsert_oauth(cfg: &mut Config, pool: &str, name: &str, tokens: &oauth::Tokens
     updated
 }
 
-fn display_name(profile: &oauth::Profile, cfg: &Config) -> String {
+pub(crate) fn display_name(profile: &oauth::Profile, cfg: &Config) -> String {
     let email = profile.email.clone().or(profile.display_name.clone()).unwrap_or_else(|| "account".into());
     let same_email_other_org =
         cfg.all_accounts().any(|(_, a)| a.email.as_deref() == Some(email.as_str()) && a.org_uuid.is_some() && a.org_uuid != profile.org_uuid);

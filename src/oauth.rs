@@ -334,16 +334,39 @@ pub async fn login_browser(open_browser: bool) -> Result<Tokens> {
     exchange_code(&code, &p.state, &p.verifier, &redirect_uri).await
 }
 
-/// Copy/paste login for headless machines: no local listener at all.
-pub async fn login_paste() -> Result<Tokens> {
+/// PKCE material for a manual (copy/paste) login that is carried across two
+/// separate calls — the `authorize_url` is handed out first, then the pasted
+/// code is exchanged later. Used by both `login_paste` (stdin) and the control
+/// API's two-step `/corrall/login/{start,submit}` flow, where the two halves
+/// happen on different HTTP connections.
+pub struct ManualLogin {
+    pub verifier: String,
+    pub state: String,
+}
+
+/// Begin a manual login: returns the URL the user opens in a browser plus the
+/// PKCE material needed to later exchange the code it hands back. No network I/O.
+pub fn start_manual_login() -> (String, ManualLogin) {
     let p = pkce();
     let url = authorize_url(&p, MANUAL_REDIRECT_URI);
+    (url, ManualLogin { verifier: p.verifier, state: p.state })
+}
+
+/// Finish a manual login: parse the pasted `code#state` / URL / bare code and
+/// exchange it for tokens against the fixed manual redirect URI.
+pub async fn finish_manual_login(pending: &ManualLogin, pasted: &str) -> Result<Tokens> {
+    let (code, state) = parse_auth_code(pasted, &pending.state)?;
+    exchange_code(&code, &state, &pending.verifier, MANUAL_REDIRECT_URI).await
+}
+
+/// Copy/paste login for headless machines: no local listener at all.
+pub async fn login_paste() -> Result<Tokens> {
+    let (url, pending) = start_manual_login();
     eprintln!("Open this URL in any browser, log in, then paste the code shown:\n  {url}\n");
     eprint!("Code: ");
     let mut line = String::new();
     tokio::io::BufReader::new(tokio::io::stdin()).read_line(&mut line).await?;
-    let (code, state) = parse_auth_code(&line, &p.state)?;
-    exchange_code(&code, &state, &p.verifier, MANUAL_REDIRECT_URI).await
+    finish_manual_login(&pending, &line).await
 }
 
 async fn callback_server(listener: TcpListener, expected_state: String) -> Result<String> {
@@ -474,5 +497,22 @@ mod tests {
         assert!(is_anthropic_host("api.anthropic.com"));
         assert!(!is_anthropic_host("api.deepseek.com"));
         assert!(!is_anthropic_host("anthropic.com.evil.example"));
+    }
+
+    #[test]
+    fn manual_login_url_carries_pkce_and_round_trips_state() {
+        let (url, pending) = start_manual_login();
+        let u = url::Url::parse(&url).unwrap();
+        let q: std::collections::HashMap<_, _> = u.query_pairs().into_owned().collect();
+        // The authorize URL targets the manual redirect and carries the PKCE
+        // challenge + the very state the pending flow will verify against.
+        assert_eq!(q.get("redirect_uri").map(String::as_str), Some(MANUAL_REDIRECT_URI));
+        assert_eq!(q.get("code_challenge_method").map(String::as_str), Some("S256"));
+        assert_eq!(q.get("state"), Some(&pending.state));
+        assert!(q.contains_key("code_challenge"));
+        // The state the redirect page hands back is accepted; a forged one is not.
+        let (code, state) = parse_auth_code(&format!("thecode#{}", pending.state), &pending.state).unwrap();
+        assert_eq!((code.as_str(), state.as_str()), ("thecode", pending.state.as_str()));
+        assert!(parse_auth_code("thecode#forged", &pending.state).is_err());
     }
 }

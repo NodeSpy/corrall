@@ -241,6 +241,30 @@ impl Pools {
         added
     }
 
+    /// Re-key a live pool so its manager — and with it the pool's sessions,
+    /// tokens, quota observations and route pins — survives a rename instead of
+    /// being dropped and rebuilt from config by [`Self::sync_config`]. Call this
+    /// after persisting the renamed config but before the reconciling
+    /// `sync_config`, so the survivor is matched under its new name. A no-op if
+    /// `old` is absent or `new` is already taken; `sync_config` reconciles
+    /// either way. The persisted state file re-keys itself on the next
+    /// [`Self::export_state`], which reads the current registry names.
+    pub fn rename_pool(&self, old: &str, new: &str) {
+        if old == new {
+            return;
+        }
+        let mut g = self.inner.write();
+        if g.map.contains_key(new) {
+            return;
+        }
+        if let Some(m) = g.map.remove(old) {
+            g.map.insert(new.to_string(), m);
+            if g.default == old {
+                g.default = new.to_string();
+            }
+        }
+    }
+
     /// The merged status document.
     ///
     /// The default pool's fields sit at the top level — the exact shape every
@@ -362,5 +386,28 @@ mod tests {
         assert_eq!(s("me@example.com"), ("me@example.com".into(), String::new()));
         // A trailing separator names no pool; do not invent one.
         assert_eq!(s("acct1~"), ("acct1".into(), String::new()));
+    }
+
+    #[test]
+    fn rename_pool_rekeys_the_live_manager() {
+        let mut cfg = Config::default();
+        cfg.pools.insert("work".into(), crate::config::PoolConfig::default());
+        let pools = Pools::new(&cfg);
+
+        // A non-default pool moves under the new key; the old key is gone and the
+        // manager survives (rather than being dropped and rebuilt).
+        pools.rename_pool("work", "clients");
+        assert!(pools.get("work").is_none());
+        assert!(pools.get("clients").is_some());
+        assert_eq!(pools.default_name(), "default", "an unrelated rename leaves the default alone");
+
+        // Renaming the default pool carries the default pointer with it.
+        pools.rename_pool("default", "primary");
+        assert_eq!(pools.default_name(), "primary");
+        assert!(pools.get("primary").is_some());
+
+        // Renaming onto an existing name is a no-op, leaving both in place.
+        pools.rename_pool("clients", "primary");
+        assert!(pools.get("clients").is_some());
     }
 }
