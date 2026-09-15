@@ -85,6 +85,17 @@ async fn mock_handler(mock: Mock, req: Request<Incoming>) -> Result<Response<Moc
     let path = req.uri().path_and_query().map(|p| p.to_string()).unwrap_or_default();
     let is_upgrade = req.headers().get("upgrade").is_some();
     let headers: HashMap<String, String> = req.headers().iter().map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string())).collect();
+    // Cloudflare fronts the real upstream and rejects a request that carries
+    // `content-length` twice with a bare HTML 400, even when the values agree.
+    // hyper would quietly accept that here, so refuse it the same way.
+    if req.headers().get_all("content-length").iter().count() > 1 {
+        let r = Response::builder()
+            .status(400)
+            .header("content-type", "text/html")
+            .body(Full::new(Bytes::from_static(b"<html><head><title>400 Bad Request</title></head><body><center><h1>400 Bad Request</h1></center><hr><center>cloudflare</center></body></html>")).boxed())
+            .unwrap();
+        return Ok(r);
+    }
     if is_upgrade {
         // Answer a WebSocket-style 101; the test then talks raw bytes.
         tokio::spawn(async move {

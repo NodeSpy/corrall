@@ -21,8 +21,26 @@ const MAX_ATTEMPTS: usize = 6;
 const INLINE_RETRY_AFTER_MAX_SECONDS: u64 = 15;
 const ERROR_BODY_INSPECTION_LIMIT: usize = 64 * 1024;
 
-pub const HOP_BY_HOP: &[&str] =
-    &["host", "connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade", "proxy-authorization", "proxy-authenticate", "proxy-connection"];
+/// Headers that never cross the proxy as received. Besides the RFC 7230
+/// hop-by-hop set, `content-length` is here because the proxy re-frames every
+/// body it sends and sets its own: copying the client's as well produced two
+/// `content-length` lines whenever the rewritten body kept its size (an OAuth
+/// login's 36-char `account_uuid` swapped for another, or no rewrite at all),
+/// and Cloudflare answers a duplicated `content-length` with a bare 400 before
+/// the request reaches Anthropic.
+pub const HOP_BY_HOP: &[&str] = &[
+    "host",
+    "connection",
+    "keep-alive",
+    "transfer-encoding",
+    "content-length",
+    "te",
+    "trailer",
+    "upgrade",
+    "proxy-authorization",
+    "proxy-authenticate",
+    "proxy-connection",
+];
 /// Client credentials never travel upstream; the proxy is the credential authority.
 pub const CLIENT_CREDENTIAL_HEADERS: &[&str] = &["x-api-key", "authorization", "chatgpt-account-id", "cookie"];
 
