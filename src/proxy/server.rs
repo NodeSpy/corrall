@@ -551,19 +551,19 @@ async fn control(ctx: &Ctx, req: Request<Incoming>, auth: &Auth, asked_pool: Opt
         }
         (Method::POST, "/corrall/pools") => match control_body(req).await {
             Ok(v) => pool_create(ctx, &v),
-            Err(r) => r,
+            Err(r) => *r,
         },
         (Method::POST, "/corrall/login/start") => match control_body(req).await {
             Ok(v) => login_start(ctx, &v),
-            Err(r) => r,
+            Err(r) => *r,
         },
         (Method::POST, "/corrall/login/submit") => match control_body(req).await {
             Ok(v) => login_submit(ctx, &v).await,
-            Err(r) => r,
+            Err(r) => *r,
         },
         (Method::POST, "/corrall/login/cancel") => match control_body(req).await {
             Ok(v) => login_cancel(ctx, &v),
-            Err(r) => r,
+            Err(r) => *r,
         },
         // Parameterised account/pool routes: the arms above match literal paths,
         // so these are dispatched by prefix here.
@@ -571,7 +571,7 @@ async fn control(ctx: &Ctx, req: Request<Incoming>, auth: &Auth, asked_pool: Opt
             let sub = path.trim_start_matches("/corrall/pools/").to_string();
             match control_body(req).await {
                 Ok(v) => pools_param(ctx, &sub, &v),
-                Err(r) => r,
+                Err(r) => *r,
             }
         }
         _ => json_response(StatusCode::NOT_FOUND, json!({ "ok": false, "error": "not found" })),
@@ -580,12 +580,13 @@ async fn control(ctx: &Ctx, req: Request<Incoming>, auth: &Auth, asked_pool: Opt
 
 /// Read a control-route request body and parse it as JSON, defaulting to `{}`
 /// on an empty/absent body. Returns a ready error response on an oversized or
-/// unreadable body, matching the other control routes' conventions.
-async fn control_body(req: Request<Incoming>) -> std::result::Result<Value, Response<BoxBody>> {
+/// unreadable body, matching the other control routes' conventions. The error
+/// is boxed so the `Ok` path does not carry a full `Response` in its size.
+async fn control_body(req: Request<Incoming>) -> std::result::Result<Value, Box<Response<BoxBody>>> {
     match read_body(req.into_body(), CONTROL_BODY_LIMIT).await {
         Ok(b) => Ok(serde_json::from_slice(&b).unwrap_or(json!({}))),
-        Err(true) => Err(json_response(StatusCode::PAYLOAD_TOO_LARGE, json!({ "ok": false, "error": "request body too large" }))),
-        Err(false) => Err(json_response(StatusCode::BAD_REQUEST, json!({ "ok": false, "error": "invalid request body" }))),
+        Err(true) => Err(Box::new(json_response(StatusCode::PAYLOAD_TOO_LARGE, json!({ "ok": false, "error": "request body too large" })))),
+        Err(false) => Err(Box::new(json_response(StatusCode::BAD_REQUEST, json!({ "ok": false, "error": "invalid request body" })))),
     }
 }
 

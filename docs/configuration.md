@@ -175,7 +175,7 @@ Bucket keys: `unified5h`, `unified7d`, `unified7dFable`, `unified7dSonnet`,
 | `CORRALL_CONFIG` | Config path |
 | `CORRALL_HOST` | Override `proxy.host` |
 | `CORRALL_LOG` | `tracing` filter, e.g. `debug` |
-| `CORRALL_UPSTREAM_HEADERS_TIMEOUT_MS` | Time to first byte, default 120000 |
+| `CORRALL_UPSTREAM_HEADERS_TIMEOUT_MS` | Time to response headers, default 120000. Not a total deadline: a streamed response runs as long as chunks keep arriving |
 | `CORRALL_UPSTREAM_BODY_TIMEOUT_MS` | Idle gap between body chunks, default 120000 |
 | `CORRALL_UPSTREAM_MAX_SOCKETS` | Idle pooled connections per host, default 256 |
 | `CORRALL_REFRESH_TIMEOUT_MS` | OAuth refresh timeout, default 30000 |

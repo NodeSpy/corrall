@@ -86,11 +86,21 @@ pub async fn forward(ctx: &Ctx, mgr: &Manager, info: &ReqInfo, mut headers: Head
     let mut attempts = 0usize;
     let mut same_account_retries = 0usize;
     let mut last_exhausted: Option<(u64, String)> = None;
+    let started = std::time::Instant::now();
+    let mut last_account = String::new();
+    // A served response reports its own completion once the body ends. Every
+    // other exit reports here, so a request the proxy gave up on still gets
+    // its ✗ line and leaves the in-flight list.
+    let fail = |r: Response<BoxBody>, account: &str| {
+        let account = if account.is_empty() { "-" } else { account };
+        ctx.notify_end(info, account, r.status().as_u16(), started.elapsed(), false);
+        r
+    };
 
     loop {
         attempts += 1;
         if attempts > MAX_ATTEMPTS * 3 {
-            return error_response(StatusCode::BAD_GATEWAY, "api_error", "No account could serve the request after repeated attempts");
+            return fail(error_response(StatusCode::BAD_GATEWAY, "api_error", "No account could serve the request after repeated attempts"), &last_account);
         }
         let sel = mgr.select(&SelectRequest {
             model,
@@ -104,7 +114,7 @@ pub async fn forward(ctx: &Ctx, mgr: &Manager, info: &ReqInfo, mut headers: Head
         let account = match sel {
             Selection::Account(a) => a,
             Selection::PinUnknown => {
-                return error_response(StatusCode::NOT_FOUND, "not_found_error", "Pinned account is not configured on this proxy");
+                return fail(error_response(StatusCode::NOT_FOUND, "not_found_error", "Pinned account is not configured on this proxy"), &last_account);
             }
             Selection::PinUnavailable { name, reason } => {
                 let msg = format!(
@@ -112,7 +122,7 @@ pub async fn forward(ctx: &Ctx, mgr: &Manager, info: &ReqInfo, mut headers: Head
                     crate::security::safe_text(&name, 80),
                     crate::security::safe_text(&reason, 120)
                 );
-                return with_retry_after(error_response(StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", &msg), 30);
+                return fail(with_retry_after(error_response(StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", &msg), 30), &name);
             }
             Selection::Exhausted { retry_after_secs, reason } => {
                 last_exhausted = Some((retry_after_secs, reason.clone()));
@@ -131,17 +141,18 @@ pub async fn forward(ctx: &Ctx, mgr: &Manager, info: &ReqInfo, mut headers: Head
                 } else {
                     format!("No account could serve the request ({} tried).", tried.len())
                 };
-                return with_retry_after(error_response(StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", &msg), retry_after_secs);
+                return fail(with_retry_after(error_response(StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", &msg), retry_after_secs), &last_account);
             }
         };
 
+        last_account = account.name.clone();
         ctx.notify_account(info, &account.name);
         match attempt(ctx, mgr, info, &account, &headers, &body).await {
             Attempt::Done(r) => {
                 mgr.record_session(session, &account.id, model);
                 return r;
             }
-            Attempt::Abort(r) => return r,
+            Attempt::Abort(r) => return fail(r, &account.name),
             Attempt::Failover { reason, transient } => {
                 tried.insert(account.id.clone());
                 if transient {
@@ -150,19 +161,25 @@ pub async fn forward(ctx: &Ctx, mgr: &Manager, info: &ReqInfo, mut headers: Head
                 tracing::info!("failover off \"{}\": {reason}", account.name);
                 if info.pin.is_some() {
                     // A pin never fails over.
-                    return error_response(StatusCode::BAD_GATEWAY, "api_error", "Pinned account failed to serve the request");
+                    return fail(error_response(StatusCode::BAD_GATEWAY, "api_error", "Pinned account failed to serve the request"), &account.name);
                 }
                 if tried.len() >= MAX_ATTEMPTS {
                     let (ra, _) = last_exhausted.clone().unwrap_or((30, String::new()));
-                    return with_retry_after(error_response(StatusCode::BAD_GATEWAY, "api_error", "Every eligible account failed to serve the request"), ra);
+                    return fail(
+                        with_retry_after(error_response(StatusCode::BAD_GATEWAY, "api_error", "Every eligible account failed to serve the request"), ra),
+                        &account.name,
+                    );
                 }
             }
             Attempt::RetrySame { wait } => {
                 same_account_retries += 1;
                 if same_account_retries > 4 {
-                    return with_retry_after(
-                        error_response(StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", "Upstream rate limit persisted across retries"),
-                        wait.as_secs().max(1),
+                    return fail(
+                        with_retry_after(
+                            error_response(StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", "Upstream rate limit persisted across retries"),
+                            wait.as_secs().max(1),
+                        ),
+                        &account.name,
                     );
                 }
                 if !wait.is_zero() {
@@ -211,7 +228,7 @@ async fn attempt(ctx: &Ctx, mgr: &Manager, info: &ReqInfo, account: &Selected, h
 
     let url = format!("{}{}", account.upstream.trim_end_matches('/'), info.path_and_query);
     let method = reqwest::Method::from_bytes(info.method.as_bytes()).unwrap_or(reqwest::Method::POST);
-    let mut req = client().request(method.clone(), &url).timeout(headers_timeout());
+    let mut req = client().request(method.clone(), &url);
     let mut out_headers: Vec<(String, String)> = Vec::new();
     for (k, v) in headers {
         if let Ok(s) = v.to_str() {
@@ -247,18 +264,24 @@ async fn attempt(ctx: &Ctx, mgr: &Manager, info: &ReqInfo, account: &Selected, h
         return Attempt::Failover { reason: "oauth not allowed for organization (cooldown)".into(), transient: false };
     }
     let started = std::time::Instant::now();
-    let res = req.send().await;
+    // The headers budget covers connect through response headers only. It is
+    // applied around `send()` rather than with `RequestBuilder::timeout`,
+    // which in reqwest is a total deadline that keeps running while the body
+    // streams and would cut every response longer than the budget mid-stream.
+    // The body has its own idle-gap timer below.
+    let res = tokio::time::timeout(headers_timeout(), req.send()).await;
     mgr.release(&account.id);
 
     let res = match res {
-        Ok(r) => r,
-        Err(e) => {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
             let reason = describe_reqwest(&e);
             tracing::warn!("upstream error on \"{}\": {reason}", account.name);
-            if e.is_timeout() || e.is_connect() || e.is_request() {
-                return Attempt::Failover { reason, transient: true };
-            }
             return Attempt::Failover { reason, transient: true };
+        }
+        Err(_) => {
+            tracing::warn!("upstream error on \"{}\": no response headers within {:.0}s", account.name, headers_timeout().as_secs_f64());
+            return Attempt::Failover { reason: "timeout".into(), transient: true };
         }
     };
 

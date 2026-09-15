@@ -11,8 +11,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
-use hyper::body::Incoming;
+use http_body_util::{BodyExt, Full, StreamBody};
+use hyper::body::{Frame, Incoming};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
@@ -50,7 +50,11 @@ enum Behaviour {
     Unauthorized,
     ServerError,
     EntitlementDenied,
+    SlowStream { chunks: u32, gap_ms: u64 },
+    Hang { ms: u64 },
 }
+
+type MockBody = http_body_util::combinators::BoxBody<Bytes, std::convert::Infallible>;
 
 #[derive(Clone)]
 struct Mock {
@@ -77,7 +81,7 @@ fn token_of(h: &HashMap<String, String>) -> String {
     h.get("authorization").map(|a| a.trim_start_matches("Bearer ").to_string()).or_else(|| h.get("x-api-key").cloned()).unwrap_or_default()
 }
 
-async fn mock_handler(mock: Mock, req: Request<Incoming>) -> Result<Response<Full<Bytes>>, hyper::Error> {
+async fn mock_handler(mock: Mock, req: Request<Incoming>) -> Result<Response<MockBody>, hyper::Error> {
     let path = req.uri().path_and_query().map(|p| p.to_string()).unwrap_or_default();
     let is_upgrade = req.headers().get("upgrade").is_some();
     let headers: HashMap<String, String> = req.headers().iter().map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string())).collect();
@@ -99,7 +103,7 @@ async fn mock_handler(mock: Mock, req: Request<Incoming>) -> Result<Response<Ful
             .header("upgrade", "websocket")
             .header("connection", "Upgrade")
             .header("sec-websocket-accept", "x")
-            .body(Full::new(Bytes::new()))
+            .body(Full::new(Bytes::new()).boxed())
             .unwrap();
         return Ok(r);
     }
@@ -126,6 +130,24 @@ async fn mock_handler(mock: Mock, req: Request<Incoming>) -> Result<Response<Ful
             .header("anthropic-ratelimit-unified-7d-utilization", "0.20")
             .header("anthropic-ratelimit-unified-7d-reset", (now + 86_400).to_string())
             .header("anthropic-ratelimit-unified-status", "allowed")
+    };
+    let behaviour = match behaviour {
+        Behaviour::SlowStream { chunks, gap_ms } => {
+            let stream = futures_util::stream::unfold(0u32, move |i| async move {
+                if i >= chunks {
+                    return None;
+                }
+                tokio::time::sleep(Duration::from_millis(gap_ms)).await;
+                let ev = format!("event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"delta\":{{\"text\":\"chunk{i}\"}}}}\n\n");
+                Some((Ok::<_, std::convert::Infallible>(Frame::data(Bytes::from(ev))), i + 1))
+            });
+            return Ok(base(200).header("content-type", "text/event-stream").body(StreamBody::new(stream).boxed()).unwrap());
+        }
+        Behaviour::Hang { ms } => {
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+            Behaviour::Ok
+        }
+        other => other,
     };
     let resp = match behaviour {
         Behaviour::Ok => {
@@ -170,8 +192,9 @@ async fn mock_handler(mock: Mock, req: Request<Incoming>) -> Result<Response<Ful
                 r#"{"type":"error","error":{"type":"permission_error","message":"no","details":{"error_code":"oauth_not_allowed_for_organization"}}}"#,
             )))
             .unwrap(),
+        Behaviour::SlowStream { .. } | Behaviour::Hang { .. } => unreachable!("handled above"),
     };
-    Ok(resp)
+    Ok(resp.map(BodyExt::boxed))
 }
 
 async fn spawn_mock() -> Mock {
@@ -203,6 +226,9 @@ fn test_env() {
         let dir = std::env::temp_dir().join(format!("corrall-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::env::set_var("CORRALL_CONFIG", dir.join("corrall.json"));
+        // Short time-to-headers budget so the timeout tests run in seconds.
+        // Every mock reply that is not deliberately hung answers well inside it.
+        std::env::set_var("CORRALL_UPSTREAM_HEADERS_TIMEOUT_MS", "1500");
         let cfg = Config { proxy: ProxyConfig { api_key: KEY.into(), ..Default::default() }, ..Default::default() };
         corrall::upstream::init(&cfg).unwrap();
     });
@@ -868,4 +894,61 @@ async fn control_routes_manage_accounts_and_pools() {
     assert_eq!(st, StatusCode::GONE);
     let (st, _, _) = post(&p, "/corrall/login/submit", json!({ "code": "x" })).await;
     assert_eq!(st, StatusCode::BAD_REQUEST, "submit needs a flow_id");
+}
+
+/// The headers budget is time-to-headers, not a total deadline. A stream that
+/// keeps producing chunks past that budget must still arrive whole; before
+/// this was fixed every response longer than the budget was cut mid-stream.
+#[tokio::test]
+async fn long_stream_is_not_cut_by_the_headers_timeout() {
+    let mock = spawn_mock().await;
+    let p = spawn_proxy(cfg_with(vec![account("a", "tok-a", 0, &mock.url())])).await;
+    // Six chunks 500ms apart: three seconds of streaming against a 1.5s budget.
+    mock.queue("tok-a", Behaviour::SlowStream { chunks: 6, gap_ms: 500 });
+    let mut body = msg("claude-sonnet-4-6");
+    body["stream"] = json!(true);
+    let started = std::time::Instant::now();
+    let r = http().post(p.url("/v1/messages")).json(&body).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let text = r.text().await.expect("stream must run to completion");
+    assert!(started.elapsed() >= Duration::from_millis(2_500), "stream ended early after {:?}", started.elapsed());
+    for i in 0..6 {
+        assert!(text.contains(&format!("chunk{i}")), "missing chunk{i} in {text:?}");
+    }
+}
+
+/// No response headers within the budget is a transient failure on that
+/// account: the request moves to a sibling instead of waiting on it.
+#[tokio::test]
+async fn first_byte_timeout_fails_over_to_a_sibling() {
+    let mock = spawn_mock().await;
+    let p = spawn_proxy(cfg_with(vec![account("a", "tok-a", 0, &mock.url()), account("b", "tok-b", 1, &mock.url())])).await;
+    mock.queue("tok-a", Behaviour::Hang { ms: 6_000 });
+    let started = std::time::Instant::now();
+    let (st, v, _) = post(&p, "/v1/messages", msg("claude-sonnet-4-6")).await;
+    let took = started.elapsed();
+    assert_eq!(st, 200);
+    assert_eq!(v["served_by"], "tok-b");
+    assert!(took >= Duration::from_millis(1_400) && took < Duration::from_millis(5_000), "took {took:?}");
+    let status = p.manager.status(true);
+    assert_eq!(status["accounts"][0]["usage"]["failedRequests"], 1);
+}
+
+/// A request the proxy gives up on still reports a completion, so it leaves
+/// the in-flight list and shows up as ✗ in the log rather than vanishing.
+#[tokio::test]
+async fn abandoned_requests_report_completion() {
+    let mock = spawn_mock().await;
+    let p = spawn_proxy(cfg_with(vec![account("a", "tok-a", 0, &mock.url())])).await;
+    mock.queue("tok-a", Behaviour::Hang { ms: 6_000 });
+    let mut rx = p.ctx.activity.subscribe();
+    let (st, _, _) = post(&p, "/v1/messages", msg("claude-sonnet-4-6")).await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "the only account timed out and nothing else could serve it");
+    let mut ended = None;
+    while let Ok(a) = rx.try_recv() {
+        if let corrall::proxy::server::Activity::End { account, status, ok, .. } = a {
+            ended = Some((account, status, ok));
+        }
+    }
+    assert_eq!(ended, Some(("a".to_string(), 429, false)));
 }
