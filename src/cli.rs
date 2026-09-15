@@ -954,7 +954,18 @@ pub fn accounts(verbose: bool, pool: Option<String>) -> Result<()> {
 pub async fn status(json_out: bool, color: &str) -> Result<()> {
     let cfg = Config::load()?.ok_or_else(|| anyhow!("no config yet"))?;
     crate::upstream::init(&cfg)?;
-    let st = control_get(&cfg, "/corrall/status").await?;
+    let mut st = control_get(&cfg, "/corrall/status").await?;
+    // If the daemon has not yet finished its own release check (e.g. it started
+    // moments ago), do one on demand so `status` still surfaces an available
+    // update. Governed by the same `updateCheck` config flag as the daemon's
+    // check, and by CORRALL_DISABLE_UPDATE_CHECK (honoured in latest_tag_cached).
+    if cfg.update_check && st.get("updateCheckedAt").and_then(Value::as_i64).is_none() {
+        if let Ok(Some(tag)) = tokio::task::spawn_blocking(crate::update::latest_tag_cached).await {
+            if matches!(crate::update::compare(crate::update::current_version(), &tag), crate::update::Ordering::Upgrade | crate::update::Ordering::Major) {
+                st["updateAvailable"] = Value::String(tag);
+            }
+        }
+    }
     if json_out {
         println!("{}", serde_json::to_string_pretty(&st)?);
     } else {

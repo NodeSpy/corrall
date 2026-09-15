@@ -322,6 +322,9 @@ pub struct Fleet {
     pub probe: ProbeState,
     pub warmup_secs: u64,
     pub update_available: Option<String>,
+    /// When the daemon last completed a release check (ms). `None` until the
+    /// first check finishes, which lets `status` do one on demand meanwhile.
+    pub update_checked_at: Option<i64>,
     refresh_locks: HashMap<String, Arc<tokio::sync::Mutex<()>>>,
 }
 
@@ -388,6 +391,7 @@ impl Manager {
             probe: ProbeState { interval_secs: p.quota_probe_seconds, ..Default::default() },
             warmup_secs: cfg.warmup_seconds,
             update_available: None,
+            update_checked_at: None,
             refresh_locks: HashMap::new(),
         };
         let m = Manager { inner: Arc::new(Mutex::new(fleet)), events: tx };
@@ -994,6 +998,7 @@ impl Manager {
         let announce = self.with(|f| {
             let changed = f.update_available != tag;
             f.update_available = tag.clone();
+            f.update_checked_at = Some(now_ms());
             changed && tag.is_some()
         });
         if announce {
@@ -1773,6 +1778,7 @@ impl Fleet {
             },
             "warm": { "enabled": self.warmup_secs > 0, "intervalSeconds": self.warmup_secs },
             "updateAvailable": self.update_available,
+            "updateCheckedAt": self.update_checked_at,
             "switchThreshold": self.threshold,
             "distributeSessions": self.distribute_sessions,
             "holdSeconds": self.hold_seconds,

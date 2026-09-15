@@ -782,6 +782,22 @@ mod tests {
     }
 
     #[test]
+    fn update_available_shows_in_status() {
+        let now = 1_000_000_000_000;
+        let st = json!({
+            "currentAccount": "a@x.com", "switchThreshold": 0.98,
+            "probe": { "enabled": false }, "server": { "uptimeSeconds": 125 },
+            "updateAvailable": "v2.2.0", "accounts": [], "routes": [],
+        });
+        let out = render(&st, false, now);
+        assert!(out.contains("Update       v2.2.0 available — run: corrall update"), "got:\n{out}");
+        // Absent field → no Update row.
+        let mut st2 = st.clone();
+        st2["updateAvailable"] = json!(null);
+        assert!(!render(&st2, false, now).contains("Update"));
+    }
+
+    #[test]
     fn bars() {
         let p = Paint { on: false };
         assert_eq!(usage_bar(None, p, None), format!("[{}]", "?".repeat(18)));
