@@ -150,12 +150,29 @@ pub enum HostMode {
     Refuse(&'static str),
 }
 
+/// Anthropic hosts a Claude Code session dials for its own login rather than
+/// for inference: the OAuth token endpoint, the claude.ai connector MCP proxy
+/// and the first-party connector hosts under `mcp.claude.com`. They carry the
+/// client's own token and nothing the proxy would rotate, so they get a blind
+/// tunnel whatever `mitm.allowTunnel` says. Refusing them left the session
+/// unable to refresh its token or reach the connectors authorised on claude.ai,
+/// and a tunnel to an Anthropic host cannot turn the proxy into an open relay.
+pub const SESSION_TUNNEL_HOSTS: &[&str] = &["platform.claude.com", "mcp-proxy.anthropic.com"];
+
+pub fn is_session_tunnel_host(host: &str) -> bool {
+    let h = host.to_ascii_lowercase();
+    SESSION_TUNNEL_HOSTS.contains(&h.as_str()) || h.ends_with(".mcp.claude.com")
+}
+
 pub fn host_mode(host: &str, port: u16, intercept_hosts: &[String], mitm: &crate::config::MitmConfig) -> HostMode {
     if host.eq_ignore_ascii_case(TEST_HOST) {
         return HostMode::Test;
     }
     if intercept_hosts.iter().any(|h| h.eq_ignore_ascii_case(host)) && port == 443 {
         return HostMode::Intercept;
+    }
+    if is_session_tunnel_host(host) && port == 443 {
+        return HostMode::Tunnel;
     }
     if !mitm.allow_tunnel {
         return HostMode::Refuse("blind tunnels are disabled (mitm.allowTunnel)");
@@ -202,6 +219,21 @@ mod tests {
         assert!(matches!(host_mode("github.com", 22, &hosts, &m), HostMode::Refuse(_)));
         assert!(matches!(host_mode("10.0.0.1", 443, &hosts, &m), HostMode::Refuse(_)));
         assert!(matches!(host_mode("localhost", 443, &hosts, &m), HostMode::Refuse(_)));
+    }
+
+    #[test]
+    fn session_hosts_tunnel_without_allow_tunnel() {
+        let hosts = vec!["api.anthropic.com".to_string()];
+        let m = crate::config::MitmConfig::default();
+        assert!(!m.allow_tunnel);
+        assert_eq!(host_mode("platform.claude.com", 443, &hosts, &m), HostMode::Tunnel);
+        assert_eq!(host_mode("mcp-proxy.anthropic.com", 443, &hosts, &m), HostMode::Tunnel);
+        assert_eq!(host_mode("MCP-Proxy.Anthropic.com", 443, &hosts, &m), HostMode::Tunnel);
+        assert_eq!(host_mode("slack.mcp.claude.com", 443, &hosts, &m), HostMode::Tunnel);
+        assert!(matches!(host_mode("mcp-proxy.anthropic.com", 8443, &hosts, &m), HostMode::Refuse(_)), "port 443 only");
+        assert!(matches!(host_mode("mcp.claude.com", 443, &hosts, &m), HostMode::Refuse(_)), "the apex is not a connector host");
+        assert!(matches!(host_mode("evil-mcp.claude.com", 443, &hosts, &m), HostMode::Refuse(_)));
+        assert!(matches!(host_mode("downloads.claude.ai", 443, &hosts, &m), HostMode::Refuse(_)), "unrelated Anthropic hosts still need allowTunnel");
     }
 
     #[test]

@@ -1514,7 +1514,9 @@ pub fn env_lines(cfg: &Config, use_mitm: bool, pin: Option<&str>, pool: Option<&
     // listener binds: a wildcard bind is reached over loopback.
     let authority = cfg.dial_authority();
     let mut lines = Vec::new();
-    let loopback = crate::security::is_loopback_host(&cfg.bind_host());
+    // The server exempts loopback peers, and a wildcard bind is dialled over
+    // loopback, so the key only travels when the client will not be one.
+    let loopback = crate::security::is_loopback_host(&cfg.dial_host());
     let key = if loopback && !cfg.proxy.require_key_on_loopback { "" } else { cfg.proxy.api_key.as_str() };
     let named = pool.filter(|p| *p != cfg.default_pool);
     if use_mitm {
@@ -1540,8 +1542,12 @@ pub fn env_lines(cfg: &Config, use_mitm: bool, pin: Option<&str>, pool: Option<&
         let pin_prefix = pin.map(|p| format!("/tc-acct/{}", pin_component(p))).unwrap_or_default();
         lines.push(format!("export ANTHROPIC_BASE_URL=http://{authority}{pool_prefix}{pin_prefix}"));
         if !key.is_empty() {
+            // Not `ANTHROPIC_API_KEY`: an API key in the environment makes
+            // Claude Code drop its claude.ai login, and with it the connectors
+            // authorised there. A header of our own leaves the login in charge
+            // and is stripped before anything goes upstream.
             lines.push("unset ANTHROPIC_AUTH_TOKEN".into());
-            lines.push(format!("export ANTHROPIC_API_KEY={}", shell_quote(key)));
+            lines.push(format!("export ANTHROPIC_CUSTOM_HEADERS={}", shell_quote(&format!("{}: {key}", crate::proxy::auth::PROXY_KEY_HEADER))));
         }
     }
     if pin.is_some() {
@@ -1780,9 +1786,23 @@ mod tests {
         assert!(lines.contains("HTTPS_PROXY='http://127.0.0.1:3456'"));
         let lines = env_lines(&cfg, true, Some("me@example.com (Acme)"), None).join("\n");
         assert!(lines.contains("me%40example%2Ecom%20%28Acme%29:@127.0.0.1"));
+        // A wildcard bind is dialled over loopback, where no key is needed.
         cfg.proxy.host = Some("0.0.0.0".into());
         let lines = env_lines(&cfg, false, None, None).join("\n");
-        assert!(lines.contains("ANTHROPIC_API_KEY='tc-secret-0123456789abcdef'"));
+        assert!(!lines.contains("tc-secret"));
+        assert!(lines.contains("ANTHROPIC_BASE_URL=http://127.0.0.1:3456"));
+        // A specific address is dialled as itself, so the key travels: in its
+        // own header, never as ANTHROPIC_API_KEY, which would switch off the
+        // claude.ai connectors in Claude Code.
+        cfg.proxy.host = Some("192.168.1.10".into());
+        let lines = env_lines(&cfg, false, None, None).join("\n");
+        assert!(lines.contains("export ANTHROPIC_CUSTOM_HEADERS='x-corrall-key: tc-secret-0123456789abcdef'"));
+        assert!(lines.contains("unset ANTHROPIC_AUTH_TOKEN"));
+        assert!(!lines.contains("ANTHROPIC_API_KEY"));
+        cfg.proxy.host = Some("127.0.0.1".into());
+        cfg.proxy.require_key_on_loopback = true;
+        let lines = env_lines(&cfg, false, None, None).join("\n");
+        assert!(lines.contains("ANTHROPIC_CUSTOM_HEADERS='x-corrall-key: tc-secret"));
     }
 
     /// The re-login shape that bit claudeacrobat: a profile lookup that comes

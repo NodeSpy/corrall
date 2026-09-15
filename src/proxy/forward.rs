@@ -42,7 +42,7 @@ pub const HOP_BY_HOP: &[&str] = &[
     "proxy-connection",
 ];
 /// Client credentials never travel upstream; the proxy is the credential authority.
-pub const CLIENT_CREDENTIAL_HEADERS: &[&str] = &["x-api-key", "authorization", "chatgpt-account-id", "cookie"];
+pub const CLIENT_CREDENTIAL_HEADERS: &[&str] = &["x-api-key", "authorization", super::auth::PROXY_KEY_HEADER, "chatgpt-account-id", "cookie"];
 
 fn rate_limit_absorb_max() -> u64 {
     std::env::var("CORRALL_RATE_LIMIT_ABSORB_MAX_SECONDS").ok().and_then(|v| v.parse().ok()).unwrap_or(60)

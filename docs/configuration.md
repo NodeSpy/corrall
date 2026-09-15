@@ -115,7 +115,7 @@ directory, for a wrapper resolving a project it has not entered yet.
 | --- | --- | --- |
 | `proxy.port` | `3456` | Local port. `corrall server --port N` overrides it for one run |
 | `proxy.host` | `127.0.0.1` | Bind address. Anything non-loopback requires `proxy.apiKey` of at least 16 chars; the server refuses to start otherwise. `CORRALL_HOST` overrides, as does `corrall server --listen HOST:PORT` for one run. `corrall env`/`run` and the CLI's own control calls dial loopback when this is a wildcard (`0.0.0.0`, `::`) — nothing can connect to a wildcard — and dial the host itself when it is specific |
-| `proxy.apiKey` | generated | Key clients present via `x-api-key` (or `Authorization: Bearer tc-…`, or the Basic password on CONNECT). Generated once as `tc-…` and written back if the file has none; a key you set is never touched |
+| `proxy.apiKey` | generated | Key clients present via `x-corrall-key` (the form `corrall env` emits, through `ANTHROPIC_CUSTOM_HEADERS`), `x-api-key`, `Authorization: Bearer tc-…`, or the Basic password on CONNECT. Generated once as `tc-…` and written back if the file has none; a key you set is never touched |
 | `proxy.clientKeys` | `[]` | `[{ "name", "key" }]`; usage is attributed to `name` |
 | `proxy.requireKeyOnLoopback` | `false` | Require the key even from 127.0.0.1. Recommended on shared hosts |
 | `proxy.sessionDetail` | `false` | Include a per-session breakdown in `/corrall/status` |
@@ -134,7 +134,7 @@ directory, for a wrapper resolving a project it has not entered yet.
 | `warmupSeconds` | `0` | Keep-warm interval (min 60). Spawns `claude -p --bare --model haiku` per idle account through this proxy; spends a little quota |
 | `sessionTitles` | off | `{ "enabled", "width": 18, "projectsDir"? }`: label activity rows with the Claude Code session title read from `~/.claude/projects` |
 | `mitm.http1Only` | `true` | Offer only HTTP/1.1 inside the intercepted tunnel (needed for WebSocket / Remote Control) |
-| `mitm.allowTunnel` | `false` | Allow blind CONNECT tunnels to non-intercepted hosts (port 443, public addresses only) |
+| `mitm.allowTunnel` | `false` | Allow blind CONNECT tunnels to non-intercepted hosts (port 443, public addresses only). `platform.claude.com`, `mcp-proxy.anthropic.com` and `*.mcp.claude.com` are tunnelled regardless, see [claude.ai connectors](#claudeai-connectors) |
 | `mitm.tunnelAllow` | `[]` | Explicit `host` or `host:port` allow-list for blind tunnels |
 | `logDir` | unset | One file per request. Directory 0700, files 0600 |
 | `logLevel` | `body` | `body`, `headers`, or `off` |
@@ -205,10 +205,59 @@ A `/pool/<name>` prefix on the control path selects the pool too, so
 
 ## Passthrough paths
 
-`/v1/oauth/token`, `/api/oauth/*` and `/v1/code/*` (Remote Control, including
-its WebSocket upgrade) are relayed to the Anthropic upstream with the client's
-own `authorization` header and no account selection. Hop-by-hop headers and the
-proxy key are stripped.
+`/v1/oauth/token`, `/api/oauth/*`, `/v1/code/*` (Remote Control, including
+its WebSocket upgrade), `/v1/mcp_servers` and `/api/organizations/*/mcp/*`
+(the claude.ai connectors, see below) are relayed to the Anthropic upstream
+with the client's own `authorization` header and no account selection.
+Hop-by-hop headers and the proxy key are stripped.
+
+## claude.ai connectors
+
+Claude Code loads the MCP connectors a user authorised on claude.ai only while
+its own claude.ai login is the auth source. As soon as `ANTHROPIC_API_KEY` (or
+`ANTHROPIC_AUTH_TOKEN`, or an `apiKeyHelper`) is set, Claude Code switches to
+that and drops the connectors with a note that they "are disabled because
+ANTHROPIC_API_KEY or another auth source is set". That is Claude Code's
+behaviour, not the proxy's, but a `settings.json` that hands the proxy key over
+as `ANTHROPIC_API_KEY` triggers it.
+
+Three things make connectors work through Corrall:
+
+1. **Stay logged in to Claude Code** (`/login` there, once) and do not set
+   `ANTHROPIC_API_KEY`. When the proxy is dialled over loopback no key is
+   needed at all. When it is (`requireKeyOnLoopback`, or a proxy on another
+   machine), pass it in Corrall's own header instead, which Claude Code adds
+   to every request and the proxy strips before anything goes upstream:
+
+   ```json
+   {
+     "env": {
+       "ANTHROPIC_BASE_URL": "http://127.0.0.1:3456",
+       "ANTHROPIC_CUSTOM_HEADERS": "x-corrall-key: tc-…"
+     }
+   }
+   ```
+
+   `corrall env` and `corrall run` emit exactly this (and never
+   `ANTHROPIC_API_KEY`).
+2. **The connector list is relayed with the client's own login.**
+   `/v1/mcp_servers` and `/api/organizations/*/mcp/*` are passthrough paths:
+   the connectors belong to the login that authorised them, and an injected
+   account token would answer with another user's list, whose ids the connector
+   proxy then refuses for the client's token. In base-URL mode Claude Code
+   dials `api.anthropic.com` for these directly; in MITM mode they arrive
+   through the intercepted tunnel, which is where the passthrough matters.
+3. **The connector MCP proxy is reachable in MITM mode.** Connector traffic goes
+   to `mcp-proxy.anthropic.com`, and Claude Code refreshes its login at
+   `platform.claude.com`; the first-party connectors live under
+   `*.mcp.claude.com`. These hosts get a blind CONNECT tunnel on port 443
+   whatever `mitm.allowTunnel` says, since they carry the client's own token
+   and nothing the proxy would rotate. Other hosts still need `allowTunnel`
+   or `tunnelAllow`.
+
+MCP servers configured in Claude Code itself (`claude mcp add`, `.mcp.json`)
+are not affected by any of this: stdio servers never touch the proxy, and
+remote ones only do in MITM mode, where their hosts need a tunnel.
 
 ## Importing from claudeacrobat
 

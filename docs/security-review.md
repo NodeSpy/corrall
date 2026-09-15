@@ -65,6 +65,16 @@ and state output.
 - Request-log files redact `authorization`/`x-api-key` and are swept by age.
 - Memory safety and no `unsafe` in the crate.
 
+## Changes for claude.ai connectors (2026-09-15)
+
+| Change | Surface | Disposition |
+| --- | --- | --- |
+| `content-length` is no longer copied from the client (`forward.rs::HOP_BY_HOP`, also used by `relay.rs`). | Two `content-length` lines went upstream whenever the rewritten body kept its size; Cloudflare answered 400. Duplicate framing headers are also the classic request-smuggling ambiguity. | Fixed; the proxy sends only the length of the body it actually writes. |
+| `/v1/mcp_servers` and `/api/organizations/*/mcp/*` join the passthrough list (`relay.rs::is_connector_path`). | Relayed with the client's own `authorization`, no fleet token. Same trust as the existing OAuth-refresh and Remote Control passthroughs: an authenticated (or loopback-exempt) client can reach these upstream paths through the proxy with its own credentials only. Bodies capped at 1 MiB; proxy key stripped. | Accepted. Nothing of the fleet is exposed; the `org` segment must be non-empty and only the `mcp` subtree matches. |
+| `platform.claude.com`, `mcp-proxy.anthropic.com` and `*.mcp.claude.com` get a blind tunnel on 443 regardless of `mitm.allowTunnel` (`mitm.rs::is_session_tunnel_host`). | Widens the open-relay question by three Anthropic-owned names. CONNECT authentication still runs first; other ports and every other host keep the old rules. The suffix match is anchored to `.mcp.claude.com`, so `evil-mcp.claude.com` does not match. The tunnel dials the name as given, so a DNS answer from Anthropic's zone is trusted, as it is for the intercepted host. | Accepted. The alternative (refusing) broke token refresh and connectors for every MITM-mode session. |
+| The proxy key is accepted in `x-corrall-key` (`auth.rs::PROXY_KEY_HEADER`), added to `CLIENT_CREDENTIAL_HEADERS` and to the relay's drop list. | One more header that carries the key. Stripped on every path before anything goes upstream; never written to request logs (those record the upstream-bound header set). `corrall env`/`run` now emit it through `ANTHROPIC_CUSTOM_HEADERS` instead of `ANTHROPIC_API_KEY`, and only when the client will not be a loopback peer. | Accepted. Residual: Claude Code applies `ANTHROPIC_CUSTOM_HEADERS` to its SDK client, whose base URL is the proxy in base-URL mode and which is intercepted in MITM mode, so the key does not leave the box in either launch mode Corrall configures. A hand-written `settings.json` that sets the header while pointing the SDK elsewhere would send the key there. |
+| `corrall env` decides whether a key is needed from the dial address rather than the bind address (`cli.rs::env_lines`). | A wildcard bind is reached over loopback, where the server exempts the peer anyway, so the emitted key was redundant and switched off Claude Code's login. A specific non-loopback bind still emits the key. | Fixed. |
+
 ## Residual risks
 
 - The listener is plain HTTP. Off-box use needs a TLS terminator in front, and

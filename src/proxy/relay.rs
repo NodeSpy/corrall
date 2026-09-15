@@ -1,8 +1,10 @@
 //! Passthrough paths that must not receive an injected credential: the
-//! client's own OAuth token refresh (`/v1/oauth/token`), `/api/oauth/*`, and
-//! Remote Control (`/v1/code/*`, including its WebSocket upgrade). Hop-by-hop
-//! headers and the proxy key are stripped; the client's `authorization` is
-//! kept because it is the client's own session with upstream.
+//! client's own OAuth token refresh (`/v1/oauth/token`), `/api/oauth/*`,
+//! Remote Control (`/v1/code/*`, including its WebSocket upgrade) and the
+//! claude.ai connectors (`/v1/mcp_servers`, `/api/organizations/*/mcp/*`).
+//! Hop-by-hop headers and the proxy key are stripped; the client's
+//! `authorization` is kept because it is the client's own session with
+//! upstream.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,16 +18,33 @@ use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+use super::auth::PROXY_KEY_HEADER;
 use super::forward::{error_response, HOP_BY_HOP};
 use super::server::BoxBody;
 use crate::upstream::{body_idle_timeout, client, headers_timeout};
 
 pub fn is_passthrough_path(path: &str) -> bool {
-    path == "/v1/oauth/token" || path.starts_with("/api/oauth/") || path.starts_with("/v1/code/")
+    path == "/v1/oauth/token" || path.starts_with("/api/oauth/") || path.starts_with("/v1/code/") || is_connector_path(path)
+}
+
+/// claude.ai connectors: the MCP servers a user authorised on claude.ai. Claude
+/// Code lists them (`/v1/mcp_servers`) and kicks off a connector's own OAuth
+/// (`/api/organizations/<org>/mcp/start-auth/<id>`) with its login token, and
+/// the list belongs to that login, not to whichever account the proxy would
+/// rotate onto. An injected token would answer with another user's connectors,
+/// whose ids the connector proxy then refuses for the client's own token.
+fn is_connector_path(path: &str) -> bool {
+    if path == "/v1/mcp_servers" || path.starts_with("/v1/mcp_servers/") {
+        return true;
+    }
+    match path.strip_prefix("/api/organizations/") {
+        Some(rest) => matches!(rest.split_once('/'), Some((org, tail)) if !org.is_empty() && (tail == "mcp" || tail.starts_with("mcp/"))),
+        None => false,
+    }
 }
 
 fn keep_header(name: &str) -> bool {
-    !HOP_BY_HOP.contains(&name) && name != "x-api-key" && name != "accept-encoding" && !name.starts_with(':')
+    !HOP_BY_HOP.contains(&name) && name != "x-api-key" && name != PROXY_KEY_HEADER && name != "accept-encoding" && !name.starts_with(':')
 }
 
 /// Relay a plain request to `upstream` with the client's own headers.
@@ -244,5 +263,25 @@ mod tests {
         assert!(is_passthrough_path("/v1/code/sessions/x/ws"));
         assert!(is_passthrough_path("/api/oauth/usage"));
         assert!(!is_passthrough_path("/v1/messages"));
+    }
+
+    #[test]
+    fn connector_paths_are_passthrough() {
+        assert!(is_passthrough_path("/v1/mcp_servers"));
+        assert!(is_passthrough_path("/v1/mcp_servers/srv_123"));
+        assert!(is_passthrough_path("/api/organizations/org_1/mcp/start-auth/srv_123"));
+        assert!(is_passthrough_path("/api/organizations/org_1/mcp"));
+        assert!(!is_passthrough_path("/v1/mcp_serversx"));
+        assert!(!is_passthrough_path("/api/organizations/org_1/members"));
+        assert!(!is_passthrough_path("/api/organizations//mcp/x"));
+        assert!(!is_passthrough_path("/v1/messages"));
+    }
+
+    #[test]
+    fn passthrough_drops_every_proxy_key_carrier() {
+        assert!(!keep_header("x-api-key"));
+        assert!(!keep_header(PROXY_KEY_HEADER));
+        assert!(keep_header("authorization"));
+        assert!(keep_header("anthropic-beta"));
     }
 }

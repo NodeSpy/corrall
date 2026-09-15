@@ -536,6 +536,65 @@ async fn oauth_token_refresh_passthrough_keeps_client_credentials() {
 }
 
 #[tokio::test]
+async fn connector_list_is_passthrough_with_the_clients_own_login() {
+    let mock = spawn_mock().await;
+    let mut cfg = cfg_with(vec![account("a", "tok-a", 0, &mock.url())]);
+    cfg.upstream = mock.url();
+    let p = spawn_proxy(cfg).await;
+    // Claude Code lists the connectors authorised on claude.ai with its own
+    // login token. Rotating that onto an account would answer with someone
+    // else's connectors, so the request goes through untouched.
+    for path in ["/v1/mcp_servers?limit=1000", "/api/organizations/org_1/mcp/start-auth/srv_1"] {
+        let r = http()
+            .get(p.url(path))
+            .header("authorization", "Bearer CLIENT-OWN")
+            .header("x-corrall-key", KEY)
+            .header("anthropic-beta", "mcp-client-2025-04-04")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "{path}");
+    }
+    let seen = mock.seen();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[0].path, "/v1/mcp_servers?limit=1000", "the query survives");
+    for s in &seen {
+        assert_eq!(s.headers.get("authorization").unwrap(), "Bearer CLIENT-OWN", "{}", s.path);
+        assert_eq!(s.headers.get("anthropic-beta").unwrap(), "mcp-client-2025-04-04");
+        assert!(!s.headers.contains_key("x-corrall-key"), "the proxy key never leaves");
+    }
+}
+
+#[tokio::test]
+async fn proxy_key_header_authenticates_and_is_stripped() {
+    let mock = spawn_mock().await;
+    let p = spawn_proxy(cfg_with(vec![account("a", "tok-a", 0, &mock.url())])).await;
+    let c = http();
+    // The header form of the key: what `corrall env` hands Claude Code through
+    // ANTHROPIC_CUSTOM_HEADERS so ANTHROPIC_API_KEY can stay unset.
+    let keyed = c.get(p.url("/corrall/status")).header("host", "attacker.example").header("x-corrall-key", KEY).send().await.unwrap();
+    assert_eq!(keyed.status(), 200, "the header key works regardless of Host");
+    let wrong = c.get(p.url("/corrall/status")).header("host", "attacker.example").header("x-corrall-key", "nope").send().await.unwrap();
+    assert_eq!(wrong.status(), 401);
+    mock.queue("tok-a", Behaviour::Ok);
+    let r = c
+        .post(p.url("/v1/messages"))
+        .header("host", "attacker.example")
+        .header("x-corrall-key", KEY)
+        .header("authorization", "Bearer sk-ant-oat01-CLIENT-LOGIN")
+        .json(&msg("claude-opus-5"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let seen = mock.seen();
+    let last = seen.last().unwrap();
+    assert_eq!(last.path, "/v1/messages");
+    assert_eq!(token_of(&last.headers), "tok-a", "the account token is injected");
+    assert!(!last.headers.contains_key("x-corrall-key"), "the proxy key never leaves");
+}
+
+#[tokio::test]
 async fn websocket_upgrade_is_relayed() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mock = spawn_mock().await;

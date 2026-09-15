@@ -4,6 +4,12 @@
 //! loopback `Host` header (DNS-rebinding defence), browser-originated requests
 //! are refused on every path, and `x-api-key`/`authorization` from the client
 //! never travel upstream.
+//!
+//! The key may also arrive in [`PROXY_KEY_HEADER`]. Claude Code drops its
+//! claude.ai login (and with it the connectors authorised there) as soon as
+//! `ANTHROPIC_API_KEY` is set, so `corrall env` hands the key over in a header
+//! of its own through `ANTHROPIC_CUSTOM_HEADERS` instead. Stripped upstream
+//! like the other credential headers.
 
 use std::net::IpAddr;
 
@@ -12,6 +18,10 @@ use hyper::header::HeaderMap;
 
 use crate::config::ProxyConfig;
 use crate::security::{ct_eq, is_loopback_host, is_loopback_ip};
+
+/// Header a client may carry the proxy key in without touching the
+/// `x-api-key` / `authorization` slots its own upstream login uses.
+pub const PROXY_KEY_HEADER: &str = "x-corrall-key";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Auth {
@@ -68,8 +78,9 @@ pub fn is_browser_initiated(h: &HeaderMap) -> bool {
 /// Authenticate an HTTP request. `host_header` is the request's `Host`.
 pub fn authenticate(cfg: &ProxyConfig, peer: IpAddr, headers: &HeaderMap, host_header: Option<&str>) -> Auth {
     let presented = headers
-        .get("x-api-key")
+        .get(PROXY_KEY_HEADER)
         .and_then(|v| v.to_str().ok())
+        .or_else(|| headers.get("x-api-key").and_then(|v| v.to_str().ok()))
         .or_else(|| headers.get("authorization").and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer tc-").map(|_| &v[7..])));
     if let Some(a) = check_key(cfg, presented) {
         return a;

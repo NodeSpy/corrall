@@ -115,6 +115,11 @@ rather than create an empty config beside your accounts.
   account is spent (`holdSeconds`, off by default).
 - Refreshes OAuth tokens before they expire, coalescing concurrent refreshes,
   and writes them back to the config atomically.
+- Keeps the claude.ai connectors working: the connector list is relayed with
+  Claude Code's own login, the connector hosts are tunnelled in MITM mode, and
+  the proxy key travels in a header of its own rather than as
+  `ANTHROPIC_API_KEY`, which would switch the connectors off. See
+  [docs/configuration.md](docs/configuration.md#claudeai-connectors).
 - Session affinity: with `distributeSessions` on, each Claude Code session is
   pinned per weekly bucket so its prompt cache stays warm while new sessions
   spread across equal-priority accounts.
