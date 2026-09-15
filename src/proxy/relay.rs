@@ -33,7 +33,7 @@ pub async fn passthrough(upstream: &str, parts: hyper::http::request::Parts, bod
     let path = parts.uri.path_and_query().map(|p| p.to_string()).unwrap_or_else(|| "/".into());
     let url = format!("{}{}", upstream.trim_end_matches('/'), path);
     let method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes()).unwrap_or(reqwest::Method::GET);
-    let mut req = client().request(method.clone(), &url).timeout(headers_timeout());
+    let mut req = client().request(method.clone(), &url);
     for (k, v) in &parts.headers {
         if keep_header(k.as_str()) {
             if let Ok(s) = v.to_str() {
@@ -44,9 +44,15 @@ pub async fn passthrough(upstream: &str, parts: hyper::http::request::Parts, bod
     if method != reqwest::Method::GET && method != reqwest::Method::HEAD {
         req = req.header("content-length", body.len().to_string()).body(body);
     }
-    let res = match req.send().await {
-        Ok(r) => r,
-        Err(e) => {
+    // Headers budget around `send()` only; the body below is bounded by its
+    // idle gap, not by a total deadline (see forward.rs).
+    let res = match tokio::time::timeout(headers_timeout(), req.send()).await {
+        Ok(Ok(r)) => r,
+        Err(_) => {
+            tracing::warn!("passthrough {path}: no response headers within {:.0}s", headers_timeout().as_secs_f64());
+            return error_response(StatusCode::GATEWAY_TIMEOUT, "api_error", "Upstream did not respond in time");
+        }
+        Ok(Err(e)) => {
             tracing::warn!("passthrough {path}: {e}");
             return error_response(StatusCode::BAD_GATEWAY, "api_error", "Upstream unreachable");
         }
