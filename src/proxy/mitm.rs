@@ -4,8 +4,10 @@
 //!
 //! The CA private key is generated in memory and discarded; only the leaf key
 //! is persisted (0600). Blind tunnels to other hosts are OFF by default and,
-//! when enabled, refuse private/loopback destinations and non-443 ports.
+//! when enabled, refuse private/loopback destinations (by literal and by what
+//! the name resolves to) and non-443 ports.
 
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -196,9 +198,68 @@ pub fn host_mode(host: &str, port: u16, intercept_hosts: &[String], mitm: &crate
     HostMode::Tunnel
 }
 
+/// The addresses a blind tunnel may dial. Every resolved address must be
+/// public: one private answer among public ones is refused too, since the
+/// dialler picks whichever connects first. Empty means the name did not
+/// resolve.
+pub fn vet_tunnel_addrs(addrs: impl IntoIterator<Item = SocketAddr>) -> Result<Vec<SocketAddr>, &'static str> {
+    let addrs: Vec<SocketAddr> = addrs.into_iter().collect();
+    if addrs.is_empty() {
+        return Err("tunnel host did not resolve");
+    }
+    if addrs.iter().any(|a| crate::security::is_loopback_ip(a.ip())) {
+        return Err("tunnel to loopback refused");
+    }
+    if addrs.iter().any(|a| crate::security::is_private_ip(a.ip())) {
+        return Err("tunnel to private address refused");
+    }
+    Ok(addrs)
+}
+
+/// Resolve a tunnel target to the vetted addresses to dial. A literal IP
+/// skips DNS; a name is looked up once, here, and the caller connects to the
+/// answer rather than to the name, so what was checked is what is dialled.
+pub async fn resolve_tunnel_target(host: &str, port: u16) -> Result<Vec<SocketAddr>, &'static str> {
+    let bare = host.trim().trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = bare.parse::<IpAddr>() {
+        return vet_tunnel_addrs([SocketAddr::new(ip, port)]);
+    }
+    let addrs = tokio::net::lookup_host((bare, port)).await.map_err(|_| "tunnel host did not resolve")?;
+    vet_tunnel_addrs(addrs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tunnel_addresses_are_vetted_as_a_set() {
+        let sa = |s: &str| -> SocketAddr { s.parse().unwrap() };
+        assert_eq!(vet_tunnel_addrs([sa("93.184.216.34:443")]).unwrap().len(), 1);
+        assert_eq!(vet_tunnel_addrs([sa("[2606:2800:220:1:248:1893:25c8:1946]:443")]).unwrap().len(), 1);
+        assert_eq!(vet_tunnel_addrs([]), Err("tunnel host did not resolve"));
+        assert!(vet_tunnel_addrs([sa("127.0.0.1:443")]).is_err(), "loopback");
+        assert!(vet_tunnel_addrs([sa("[::1]:443")]).is_err(), "v6 loopback");
+        assert!(vet_tunnel_addrs([sa("[::ffff:127.0.0.1]:443")]).is_err(), "mapped loopback");
+        assert!(vet_tunnel_addrs([sa("10.0.0.5:443")]).is_err(), "RFC1918");
+        assert!(vet_tunnel_addrs([sa("192.168.1.1:443")]).is_err(), "RFC1918");
+        assert!(vet_tunnel_addrs([sa("169.254.169.254:443")]).is_err(), "metadata");
+        assert!(vet_tunnel_addrs([sa("100.64.0.1:443")]).is_err(), "CGNAT");
+        assert!(vet_tunnel_addrs([sa("0.0.0.0:443")]).is_err(), "unspecified");
+        assert!(vet_tunnel_addrs([sa("[fd00::1]:443")]).is_err(), "ULA");
+        assert!(vet_tunnel_addrs([sa("[fe80::1]:443")]).is_err(), "link-local");
+        // A name answering with one public and one private address is refused
+        // as a whole, and the split-horizon trick of 127.0.0.1 behind a public
+        // name does not get through.
+        assert!(vet_tunnel_addrs([sa("93.184.216.34:443"), sa("127.0.0.1:443")]).is_err());
+    }
+
+    #[tokio::test]
+    async fn literal_tunnel_targets_skip_dns() {
+        assert_eq!(resolve_tunnel_target("93.184.216.34", 443).await.unwrap(), vec!["93.184.216.34:443".parse::<SocketAddr>().unwrap()]);
+        assert_eq!(resolve_tunnel_target("[::1]", 443).await, Err("tunnel to loopback refused"));
+        assert_eq!(resolve_tunnel_target("10.1.2.3", 443).await, Err("tunnel to private address refused"));
+    }
 
     #[test]
     fn authority_parsing() {

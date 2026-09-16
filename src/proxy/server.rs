@@ -902,11 +902,23 @@ async fn handle_connect(ctx: Ctx, req: Request<Incoming>, peer: IpAddr) -> Respo
             return error_response(StatusCode::FORBIDDEN, "permission_error", why);
         }
         HostMode::Tunnel => {
+            // Resolve first and dial only what was vetted: a name that answers
+            // with a loopback, RFC1918, link-local or metadata address is
+            // refused like the literal would be, and there is no second lookup
+            // for a rebinding answer to slip through.
+            let addrs = match tokio::time::timeout(Duration::from_secs(10), mitm::resolve_tunnel_target(&host, port)).await {
+                Ok(Ok(a)) => a,
+                Ok(Err(why)) => {
+                    tracing::warn!("CONNECT {host}:{port} refused: {why}");
+                    return error_response(StatusCode::FORBIDDEN, "permission_error", why);
+                }
+                Err(_) => return error_response(StatusCode::BAD_GATEWAY, "api_error", "tunnel host did not resolve in time"),
+            };
             tokio::spawn(async move {
                 match hyper::upgrade::on(req).await {
                     Ok(upgraded) => {
                         let mut client = TokioIo::new(upgraded);
-                        match tokio::time::timeout(Duration::from_secs(30), tokio::net::TcpStream::connect((host.as_str(), port))).await {
+                        match tokio::time::timeout(Duration::from_secs(30), tokio::net::TcpStream::connect(&addrs[..])).await {
                             Ok(Ok(mut up)) => {
                                 let _ = tokio::io::copy_bidirectional(&mut client, &mut up).await;
                             }
