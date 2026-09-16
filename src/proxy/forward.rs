@@ -539,12 +539,13 @@ async fn attempt(ctx: &Ctx, mgr: &Manager, info: &ReqInfo, account: &Selected, h
     }
 
     // Non-streaming: buffer (bounded by upstream), record usage, relay.
+    // A failed read is a failover like any other: the loop in `forward`
+    // reports the request's end once, either from the account that finally
+    // serves it or from `fail`. Reporting here as well counted the request
+    // twice in `requests_total`/`requests_failed` and logged two ✗ lines.
     let bytes = match tokio::time::timeout(body_idle_timeout() * 4, res.bytes()).await {
         Ok(Ok(b)) => b,
-        _ => {
-            ctx.notify_end(info, &account.name, 502, started.elapsed(), false);
-            return Attempt::Failover { reason: "upstream body read failed".into(), transient: true };
-        }
+        _ => return Attempt::Failover { reason: "upstream body read failed".into(), transient: true },
     };
     if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
         if let Some(u) = v.get("usage") {
