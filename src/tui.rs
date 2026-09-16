@@ -13,7 +13,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 use serde_json::Value;
 
-use crate::prober::Prober;
+use crate::prober::{ManualProbe, Prober};
 use crate::proxy::server::{Activity, Ctx};
 use crate::security::safe_text;
 use crate::status::{bar, countdown};
@@ -158,9 +158,11 @@ impl Tui {
                             }
                             KeyCode::Char('s') => self.selecting = Some(0),
                             KeyCode::Char('p') => {
-                                let p = self.prober.clone();
-                                tokio::spawn(async move { p.probe_all().await });
-                                self.message = Some("probing all OAuth accounts…".into());
+                                self.message = Some(match self.prober.request_manual() {
+                                    ManualProbe::Started => "probing all OAuth accounts…".into(),
+                                    ManualProbe::AlreadyRunning => "probe already running".into(),
+                                    ManualProbe::TooSoon { wait_secs } => format!("probed moments ago; try again in {wait_secs}s"),
+                                });
                             }
                             _ => {}
                         }

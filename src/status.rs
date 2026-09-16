@@ -546,6 +546,7 @@ fn format_account_probe(account: &Value, probe_enabled: bool, now: i64, paint: P
     let colored = match status {
         "ok" => paint.green("ok"),
         "running" => paint.yellow("running"),
+        "skipped" => paint.gray("skipped"),
         other => paint.red(other),
     };
     let when = ts(row.get("lastProbedAt").or_else(|| row.get("startedAt"))).map(|t| format!(" {}", format_ago(t, now))).unwrap_or_default();
