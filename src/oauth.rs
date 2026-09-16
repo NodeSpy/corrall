@@ -171,6 +171,9 @@ pub async fn fetch_profile(access_token: &str) -> Result<Profile> {
 pub enum UsageResult {
     Ok(Box<UsagePayload>),
     Unauthorized,
+    /// HTTP 429 from the usage endpoint. Seen for every account of a fleet at
+    /// once, so it is a limit on the caller, not on the account's quota.
+    RateLimited(String),
     Error(String),
 }
 
@@ -186,6 +189,10 @@ pub async fn fetch_usage(access_token: &str) -> UsageResult {
     match r {
         Err(e) => UsageResult::Error(e.to_string()),
         Ok(r) if r.status().as_u16() == 401 => UsageResult::Unauthorized,
+        Ok(r) if r.status().as_u16() == 429 => {
+            let body = r.text().await.unwrap_or_default();
+            UsageResult::RateLimited(crate::security::safe_text(&body, 160))
+        }
         Ok(r) if !r.status().is_success() => {
             let st = r.status();
             let body = r.text().await.unwrap_or_default();

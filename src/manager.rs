@@ -1027,10 +1027,15 @@ impl Manager {
         });
     }
 
-    pub fn probe_run_finished(&self, now: i64) {
+    /// `next` overrides the due time recorded at start, for a run that ended
+    /// in a backoff.
+    pub fn probe_run_finished(&self, now: i64, next: Option<i64>) {
         self.with(|f| {
             f.probe.running = false;
             f.probe.last_run_finished_at = Some(now);
+            if next.is_some() {
+                f.probe.next_run_at = next;
+            }
         });
     }
 

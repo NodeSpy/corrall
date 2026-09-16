@@ -125,7 +125,7 @@ directory, for a wrapper resolving a project it has not entered yet.
 | `switchThreshold` | `0.98` | Number, or table `{ "default": 0.98, "unified7d": 0.9, … }` keyed by bucket |
 | `holdSeconds` | `0` | Hold a request this long when no account can take it, instead of answering at once (429 when the fleet is spent, 502/504 when every account failed; see [When nothing can serve](#when-nothing-can-serve)) |
 | `distributeSessions` | `false` | Spread new sessions across equal-priority accounts, pinned per weekly bucket |
-| `quotaProbeSeconds` | `0` | Background zero-spend usage probe interval (min 30) |
+| `quotaProbeSeconds` | `0` | Background zero-spend usage probe interval (min 30). A run that draws HTTP 429 from the usage endpoint stops early and the next one waits twice the interval |
 | `eventLogging` | `hide` | Claude Code telemetry: `hide` (forward, not shown), `block` (answer 200 locally), `show` |
 | `blockedModels` | `[]` | Globs of models rejected with a fast 400 |
 | `routes` | `[]` | `[{ "name", "match": [globs], "accounts": [names], "bucket"?, "color"? }]`, first match wins |
