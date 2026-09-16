@@ -549,13 +549,19 @@ impl Default for Config {
 
 impl Config {
     pub fn load() -> Result<Option<Config>> {
-        let path = config_path();
-        let raw = match std::fs::read(&path) {
+        Self::load_from(&config_path())
+    }
+
+    /// [`Self::load`] for an explicit path. Anything the load had to fill in
+    /// (the pools shape, a proxy key, account ids) is written straight back so
+    /// the next load reads the same file this one returned.
+    pub fn load_from(path: &Path) -> Result<Option<Config>> {
+        let raw = match std::fs::read(path) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 // Never start a fresh, empty config next to a pre-rename one:
                 // the accounts in it would silently stop being served.
-                if let Some(legacy) = legacy_config_path(&path) {
+                if let Some(legacy) = legacy_config_path(path) {
                     bail!(
                         "{} does not exist but the pre-rename {} does; run scripts/install.sh to migrate it, or move it (with its .state.json and the teamclaude-*.pem certificates) to the corrall.* names yourself",
                         path.display(),
@@ -579,17 +585,29 @@ impl Config {
             cfg.proxy.api_key = new_api_key();
         }
         cfg.ensure_pools();
-        cfg.ensure_account_ids();
+        // An id issued here and not written back is a different id on the
+        // next load, and everything downstream — reload, state restore, the
+        // token-refresh write — keys accounts by id. A hand-written account
+        // would churn ids forever and never have its rotated refresh token
+        // persisted, so a freshly issued id is as much a reason to rewrite
+        // the file as a migration is.
+        let ids_issued = cfg.ensure_account_ids();
         cfg.validate()?;
-        warn_if_permissive(&path);
-        if migrated || keyless {
-            // Rewrite once so a pre-pools install lands on the new shape, and a
-            // keyless one on a stable key, without any manual migration.
-            // Failure is not fatal: we already hold a usable config in memory.
-            if let Err(e) = cfg.save() {
+        warn_if_permissive(path);
+        if migrated || keyless || ids_issued {
+            // Rewrite once so a pre-pools install lands on the new shape, a
+            // keyless one on a stable key and an id-less account on a stable
+            // id, without any manual migration. Failure is not fatal: we
+            // already hold a usable config in memory.
+            if let Err(e) = cfg.save_to(path) {
                 tracing::warn!("could not rewrite {}: {e:#}", path.display());
-            } else if keyless {
-                tracing::info!("generated proxy.apiKey in {}", path.display());
+            } else {
+                if keyless {
+                    tracing::info!("generated proxy.apiKey in {}", path.display());
+                }
+                if ids_issued {
+                    tracing::info!("assigned ids to accounts without one in {}", path.display());
+                }
             }
         }
         Ok(Some(cfg))
@@ -606,10 +624,13 @@ impl Config {
     }
 
     pub fn save(&self) -> Result<()> {
-        let path = config_path();
+        self.save_to(&config_path())
+    }
+
+    pub fn save_to(&self, path: &Path) -> Result<()> {
         let mut json = serde_json::to_vec_pretty(self)?;
         json.push(b'\n');
-        write_private_atomic(&path, &json).with_context(|| format!("writing {}", path.display()))
+        write_private_atomic(path, &json).with_context(|| format!("writing {}", path.display()))
     }
 
     /// Re-read from disk, apply `f`, and save. Serialised process-wide so two
@@ -624,19 +645,24 @@ impl Config {
         Ok(cfg)
     }
 
-    pub fn ensure_account_ids(&mut self) {
+    /// Give every account a unique id. Returns whether any id was issued or
+    /// replaced, so the caller knows the file on disk no longer matches.
+    pub fn ensure_account_ids(&mut self) -> bool {
         // Ids must be unique across the whole file, not just within a pool:
         // state, session affinity and pins are all keyed by id alone.
         let mut seen = std::collections::HashSet::new();
+        let mut changed = false;
         for p in self.pools.values_mut() {
             for a in &mut p.accounts {
                 let fresh = !matches!(&a.id, Some(id) if !id.is_empty() && !seen.contains(id));
                 if fresh {
                     a.id = Some(uuid::Uuid::new_v4().to_string());
+                    changed = true;
                 }
                 seen.insert(a.id.clone().unwrap());
             }
         }
+        changed
     }
 
     /// Guarantee the invariant the router depends on: at least one pool exists
@@ -1162,6 +1188,45 @@ mod tests {
         assert_eq!(c.find_account("a"), Some((DEFAULT_POOL.to_string(), 0)));
         assert_eq!(c.find_account("b"), Some(("work".to_string(), 0)));
         assert_eq!(c.find_account("missing"), None);
+    }
+
+    /// An account written by hand has no id. The id issued on load has to
+    /// reach the disk, or the next load issues another one and every id-keyed
+    /// consumer — reload, state restore, the refresh-token write — misses.
+    #[test]
+    fn ids_issued_on_load_are_persisted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corrall.json");
+        std::fs::write(&path, r#"{"proxy":{"apiKey":"tc-0123456789abcdef0123"},"pools":{"default":{"accounts":[{"name":"hand-written","type":"oauth"}]}}}"#)
+            .unwrap();
+
+        let first = Config::load_from(&path).unwrap().expect("file exists");
+        let id = first.pools[DEFAULT_POOL].accounts[0].id.clone().expect("load issues an id");
+        assert!(!id.is_empty());
+
+        let on_disk: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(on_disk.pointer("/pools/default/accounts/0/id").and_then(Value::as_str), Some(id.as_str()), "the issued id is written back");
+
+        let second = Config::load_from(&path).unwrap().unwrap();
+        assert_eq!(second.pools[DEFAULT_POOL].accounts[0].id.as_deref(), Some(id.as_str()), "a second load reads the same id");
+
+        // A file whose accounts all carry ids is not rewritten at all.
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        Config::load_from(&path).unwrap().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), mtime);
+    }
+
+    #[test]
+    fn ensure_account_ids_reports_whether_it_changed_anything() {
+        let mut c = Config::default();
+        assert!(!c.ensure_account_ids(), "nothing to do on an empty config");
+        c.pools.get_mut(DEFAULT_POOL).unwrap().accounts.push(AccountConfig { name: "a".into(), ..Default::default() });
+        assert!(c.ensure_account_ids(), "a missing id is issued");
+        assert!(!c.ensure_account_ids(), "and a second pass leaves it alone");
+        c.pools.get_mut(DEFAULT_POOL).unwrap().accounts.push(AccountConfig { name: "b".into(), id: Some(String::new()), ..Default::default() });
+        assert!(c.ensure_account_ids(), "an empty id counts as missing");
     }
 
     #[test]
