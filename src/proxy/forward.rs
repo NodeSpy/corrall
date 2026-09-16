@@ -265,6 +265,19 @@ pub async fn forward(ctx: &Ctx, mgr: &Manager, info: &ReqInfo, mut headers: Head
     }
 }
 
+/// Seconds to wait from a `retry-after` value: either delta-seconds or an
+/// HTTP-date (RFC 7231 IMF-fixdate, which RFC 2822 parsing covers). A date in
+/// the past still means "retry", so it clamps to one second. Anything else is
+/// `None` and the caller falls back to its default.
+fn parse_retry_after(v: &str, now: chrono::DateTime<chrono::Utc>) -> Option<i64> {
+    let v = v.trim();
+    if let Ok(secs) = v.parse::<i64>() {
+        return Some(secs);
+    }
+    let at = chrono::DateTime::parse_from_rfc2822(v).ok()?;
+    Some((at.with_timezone(&chrono::Utc) - now).num_seconds().max(1))
+}
+
 fn is_entitlement_denied(body: &[u8]) -> bool {
     serde_json::from_slice::<Value>(body)
         .ok()
@@ -369,7 +382,8 @@ async fn attempt(ctx: &Ctx, mgr: &Manager, info: &ReqInfo, account: &Selected, h
         429 => {
             let hdr = |n: &str| res.headers().get(n).and_then(|v| v.to_str().ok()).map(str::to_string);
             let retry_after_hdr = hdr("retry-after");
-            let retry_after = retry_after_hdr.as_deref().and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(60);
+            let retry_after_parsed = retry_after_hdr.as_deref().and_then(|v| parse_retry_after(v, chrono::Utc::now()));
+            let retry_after = retry_after_parsed.unwrap_or(60);
             let (ctype, cf_ray, req_id) = (hdr("content-type"), hdr("cf-ray"), hdr("request-id"));
             let body_snip = {
                 let b = read_limited(res).await;
@@ -403,7 +417,7 @@ async fn attempt(ctx: &Ctx, mgr: &Manager, info: &ReqInfo, account: &Selected, h
                 rl,
                 body_snip
             );
-            let ra = match retry_after_hdr.as_deref().and_then(|v| v.trim().parse::<i64>().ok()) {
+            let ra = match retry_after_parsed {
                 Some(v) => v.clamp(1, 300) as u64,
                 None => HEADERLESS_429_PAUSE_SECONDS,
             };
@@ -649,6 +663,17 @@ fn find_double_newline(buf: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retry_after_seconds_or_http_date() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-09-15T10:00:00Z").unwrap().with_timezone(&chrono::Utc);
+        assert_eq!(parse_retry_after("42", now), Some(42));
+        assert_eq!(parse_retry_after(" 7 ", now), Some(7));
+        assert_eq!(parse_retry_after("Tue, 15 Sep 2026 10:01:30 GMT", now), Some(90));
+        assert_eq!(parse_retry_after("Tue, 15 Sep 2026 09:00:00 GMT", now), Some(1), "a date in the past still means retry");
+        assert_eq!(parse_retry_after("soon", now), None);
+        assert_eq!(parse_retry_after("", now), None);
+    }
 
     #[test]
     fn usage_merge() {
