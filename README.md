@@ -489,7 +489,8 @@ corrall update             # verify, swap, restart, health-check (rolls back on 
 `update` fetches the release through the GitHub CLI, verifies the archive
 against `SHA256SUMS` and its Sigstore signature, replaces the binary with an
 atomic rename (keeping the old one as `corrall.prev`), restarts the
-`systemd --user` unit if it was running, and waits for the health endpoint. It
+`systemd --user` unit if it was running, and waits for the health endpoint on
+the configured listener address (no `curl` needed). It
 never downgrades or crosses a major version unless told to (`--version`,
 `--allow-major`), refuses to overwrite a `cargo build` in a checkout, and never
 runs unattended. The server checks daily and only *tells* you a release exists

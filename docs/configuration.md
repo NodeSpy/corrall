@@ -356,9 +356,10 @@ release. `corrall update` downloads the archive for this OS/arch through
 the GitHub CLI (the repository is private), verifies it against `SHA256SUMS`
 and the Sigstore signature (when `cosign` is installed), swaps the binary
 atomically beside the old one (kept as `corrall.prev`), restarts the
-`systemd --user` unit if it was running, and waits for `/corrall/health`.
-If the new binary does not come up healthy the previous one is restored and
-restarted. The implicit "latest" path never downgrades and refuses a new major
+`systemd --user` unit if it was running, and waits for `/corrall/health` on
+the address `proxy.host` actually answers on (loopback for a wildcard bind);
+the check is made by the binary itself, so `curl` is not required. If the new
+binary does not come up healthy the previous one is restored and restarted. The implicit "latest" path never downgrades and refuses a new major
 version without `--allow-major`; `--version vX.Y.Z` installs a specific tag on
 purpose.
 

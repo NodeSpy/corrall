@@ -59,7 +59,7 @@ pub fn repo() -> String {
     std::env::var("CORRALL_REPO").ok().filter(|s| !s.trim().is_empty()).unwrap_or_else(|| "NodeSpy/corrall".to_string())
 }
 
-pub fn run(args: &UpdateArgs) -> Result<()> {
+pub async fn run(args: &UpdateArgs) -> Result<()> {
     let repo = repo();
     let current = current_version();
     let target = match &args.binary {
@@ -120,7 +120,7 @@ pub fn run(args: &UpdateArgs) -> Result<()> {
     if args.no_health_check {
         return Ok(());
     }
-    match wait_healthy() {
+    match wait_healthy().await {
         Ok(v) => println!("Health check passed (server reports {v})."),
         Err(e) => {
             eprintln!("warning: the new binary did not come up healthy: {e}");
@@ -165,28 +165,55 @@ pub fn compare(current: &str, candidate: &str) -> Ordering {
     }
 }
 
-/// Poll the local proxy's health endpoint until it answers with a version.
-fn wait_healthy() -> Result<String> {
-    let port = crate::config::Config::load().ok().flatten().map(|c| c.proxy.port).unwrap_or(crate::config::DEFAULT_PORT);
-    let url = format!("http://127.0.0.1:{port}/corrall/health");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+/// The health endpoint of the listener this config describes, at the address
+/// a client on this machine can actually reach: loopback for a wildcard bind,
+/// the bound host itself otherwise — a server listening only on
+/// `192.168.1.10` or `::1` never answers on `127.0.0.1`.
+fn health_url(cfg: Option<&crate::config::Config>) -> String {
+    let authority = match cfg {
+        Some(c) => c.dial_authority(),
+        None => format!("127.0.0.1:{}", crate::config::DEFAULT_PORT),
+    };
+    format!("http://{authority}/corrall/health")
+}
+
+/// Poll the proxy's health endpoint until it answers with a version. Done
+/// in-process: a host without `curl` must not read as an unhealthy server and
+/// roll a good update back.
+async fn wait_healthy() -> Result<String> {
+    let cfg = crate::config::Config::load().ok().flatten();
+    wait_healthy_at(&health_url(cfg.as_ref()), std::time::Duration::from_secs(20)).await
+}
+
+async fn wait_healthy_at(url: &str, budget: std::time::Duration) -> Result<String> {
+    // The listener is on this machine; an HTTP(S)_PROXY in the environment
+    // must not sit between us and it.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+        .context("building the health-check client")?;
+    let deadline = std::time::Instant::now() + budget;
     let mut last = String::new();
     while std::time::Instant::now() < deadline {
-        match std::process::Command::new("curl").args(["-fsS", "--max-time", "2", &url]).stdin(Stdio::null()).output() {
-            Ok(o) if o.status.success() => {
-                let body = String::from_utf8_lossy(&o.stdout);
-                let v = serde_json::from_str::<serde_json::Value>(&body)
+        match client.get(url).send().await {
+            Ok(r) if r.status().is_success() => {
+                let v = r
+                    .json::<serde_json::Value>()
+                    .await
                     .ok()
                     .and_then(|j| j.get("version").and_then(|v| v.as_str()).map(str::to_string))
                     .unwrap_or_else(|| "ok".into());
                 return Ok(v);
             }
-            Ok(o) => last = safe_text(String::from_utf8_lossy(&o.stderr).trim(), 120),
-            Err(e) => last = e.to_string(),
+            Ok(r) => last = format!("HTTP {}", r.status()),
+            Err(e) => last = safe_text(&e.to_string(), 120),
         }
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
-    bail!("no healthy answer from {url} within 20s ({last})")
+    bail!("no healthy answer from {url} within {}s ({last})", budget.as_secs())
 }
 
 /// The latest release tag, or None when it cannot be determined (no gh, no
@@ -458,6 +485,60 @@ fn is_source_build(exe: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The post-restart health check dials the address the listener actually
+    /// answers on, not a hard-wired loopback.
+    #[test]
+    fn the_health_check_dials_the_configured_listener() {
+        use crate::config::Config;
+        let mut cfg = Config::default();
+        cfg.proxy.port = 4567;
+        for wildcard in ["0.0.0.0", "::", "[::]", "localhost"] {
+            cfg.proxy.host = Some(wildcard.into());
+            assert_eq!(health_url(Some(&cfg)), "http://127.0.0.1:4567/corrall/health", "{wildcard}");
+        }
+        cfg.proxy.host = Some("192.168.1.10".into());
+        assert_eq!(health_url(Some(&cfg)), "http://192.168.1.10:4567/corrall/health");
+        cfg.proxy.host = Some("::1".into());
+        assert_eq!(health_url(Some(&cfg)), "http://[::1]:4567/corrall/health");
+        cfg.proxy.host = Some("[::1]".into());
+        assert_eq!(health_url(Some(&cfg)), "http://[::1]:4567/corrall/health");
+        // No readable config: the stock port over loopback, as before.
+        assert_eq!(health_url(None), format!("http://127.0.0.1:{}/corrall/health", crate::config::DEFAULT_PORT));
+    }
+
+    /// The poll itself needs nothing outside the binary: a listener that
+    /// answers `/corrall/health` is found without `curl` on the PATH, and one
+    /// that never answers healthy is reported, not hung on.
+    #[tokio::test]
+    async fn the_health_check_needs_no_external_tool() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            // First poll: not ready yet. Second poll: healthy.
+            for (i, body) in [(503, r#"{"ok":false}"#), (200, r#"{"ok":true,"version":"9.9.9"}"#)].into_iter().enumerate() {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let reason = if i == 0 { "Service Unavailable" } else { "OK" };
+                let resp = format!(
+                    "HTTP/1.1 {} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.0,
+                    body.1.len(),
+                    body.1
+                );
+                sock.write_all(resp.as_bytes()).await.unwrap();
+            }
+        });
+        let v = wait_healthy_at(&format!("http://{addr}/corrall/health"), std::time::Duration::from_secs(10)).await.unwrap();
+        assert_eq!(v, "9.9.9");
+
+        // Nothing listening: the budget runs out and says so.
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap();
+        let err = wait_healthy_at(&format!("http://{closed}/corrall/health"), std::time::Duration::from_millis(700)).await.unwrap_err();
+        assert!(err.to_string().contains("no healthy answer"), "{err}");
+    }
 
     #[test]
     fn asset_names_match_the_release_workflow() {
