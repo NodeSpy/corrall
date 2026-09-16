@@ -930,6 +930,30 @@ async fn codex_requests_use_codex_pool_only() {
     assert_eq!(v["served_by"], "tok-a", "Anthropic requests never land on the Codex account");
 }
 
+/// The `/tc-acct/<pin>/` prefix was stripped from the query string the proxy
+/// forwards but not from the path it routes on, so a pinned Codex request
+/// looked like an Anthropic one and the Codex account was refused as "other
+/// provider".
+#[tokio::test]
+async fn path_pin_is_stripped_before_provider_routing() {
+    let mock = spawn_mock().await;
+    let mut codex = account("cx", "tok-cx", 0, &mock.url());
+    codex.provider = Some("codex".into());
+    codex.account_id = Some("acct_9".into());
+    let p = spawn_proxy(cfg_with(vec![account("a", "tok-a", 0, &mock.url()), codex])).await;
+    let (st, v, _) = post(&p, "/tc-acct/cx/backend-api/codex/responses", json!({ "model": "gpt-5", "input": "hi" })).await;
+    assert_eq!(st, 200, "{v}");
+    let seen = mock.seen();
+    let last = seen.last().unwrap();
+    assert_eq!(last.headers.get("authorization").unwrap(), "Bearer tok-cx", "the pinned Codex account served it");
+    assert_eq!(last.path, "/backend-api/codex/responses", "upstream never sees the pin");
+    // The Anthropic pin still works and keeps its query string.
+    let (st, v, _) = post(&p, "/tc-acct/a/v1/messages?beta=true", msg("claude-opus-5")).await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(v["served_by"], "tok-a");
+    assert_eq!(mock.seen().last().unwrap().path, "/v1/messages?beta=true");
+}
+
 #[tokio::test]
 async fn usage_dimensions_are_consumed_and_attributed() {
     let mock = spawn_mock().await;

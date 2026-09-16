@@ -271,6 +271,22 @@ async fn handle(ctx: Ctx, req: Request<Incoming>, peer: IpAddr, tunnel: Option<&
     // comes from the CONNECT username instead. An explicit keyword still wins.
     let asked_pool = asked_pool.or_else(|| tunnel.and_then(|t| t.pool.clone()));
 
+    // Deprecated path pin, stripped here too so that `path` is the upstream
+    // path for everything below: provider detection, the passthrough list,
+    // the telemetry checks and the activity log. Stripping only
+    // `path_and_query` left `/tc-acct/<pin>/backend-api/codex/...` looking
+    // like an Anthropic path, and the pinned Codex account was refused as
+    // "other provider".
+    let (pin, path, path_and_query) = match path_and_query.strip_prefix(PIN_PREFIX).and_then(|rest| rest.split_once('/')) {
+        Some((token, tail)) => {
+            let tok = percent_encoding::percent_decode_str(token).decode_utf8_lossy().to_string();
+            let rest = format!("/{tail}");
+            let path = rest.split(['?', '#']).next().unwrap_or("/").to_string();
+            (Some(tok), path, rest)
+        }
+        None => (tunnel.and_then(|t| t.pin.clone()), path, path_and_query),
+    };
+
     // The dashboard page is a static asset with no data in it; everything it
     // shows is fetched with the key. Serving it unauthenticated lets a browser
     // load it, which an address bar cannot do with a header.
@@ -326,19 +342,6 @@ async fn handle(ctx: Ctx, req: Request<Incoming>, peer: IpAddr, tunnel: Option<&
         };
         return super::relay::passthrough(&upstream, parts, body).await;
     }
-
-    // Deprecated path pin.
-    let (pin, path_and_query) = if let Some(rest) = path_and_query.strip_prefix(PIN_PREFIX) {
-        match rest.split_once('/') {
-            Some((token, tail)) => {
-                let tok = percent_encoding::percent_decode_str(token).decode_utf8_lossy().to_string();
-                (Some(tok), format!("/{tail}"))
-            }
-            None => (None, path_and_query),
-        }
-    } else {
-        (tunnel.and_then(|t| t.pin.clone()), path_and_query)
-    };
 
     // Telemetry noise.
     if path.starts_with("/api/event_logging") && cfg.event_logging == EventLogging::Block {
