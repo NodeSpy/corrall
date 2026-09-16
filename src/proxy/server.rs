@@ -15,7 +15,8 @@ use hyper::header::{HeaderMap, HeaderValue};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::server::conn::auto;
 use parking_lot::{Mutex, RwLock};
 use serde_json::{json, Value};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -204,8 +205,12 @@ pub async fn run(ctx: Ctx, bind: SocketAddr, mut shutdown: tokio::sync::watch::R
     Ok(())
 }
 
-/// Serve HTTP/1.1 on any stream (the raw TCP socket, or a terminated TLS
-/// tunnel). `forced_pin` carries a CONNECT-level account pin into the tunnel.
+/// Serve HTTP on any stream (the raw TCP socket, or a terminated TLS tunnel),
+/// HTTP/1.1 or HTTP/2 by what the client speaks. Inside a tunnel the ALPN
+/// choice made in `mitm::tls_config` decides: with `mitm.http1Only` off the
+/// client negotiates `h2` and this must actually serve it, or every
+/// intercepted request dies on the first frame. `tunnel` carries the
+/// CONNECT-level authentication, pin and pool into the tunnel.
 pub fn serve_connection<S>(ctx: Ctx, stream: S, peer: IpAddr, tunnel: Option<TunnelCtx>) -> futures_util::future::BoxFuture<'static, ()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -218,7 +223,9 @@ where
             let tunnel = tunnel.clone();
             async move { Ok::<_, hyper::Error>(handle(ctx, req, peer, tunnel.as_ref().as_ref()).await) }
         });
-        let conn = http1::Builder::new().keep_alive(true).preserve_header_case(true).max_buf_size(1024 * 1024).serve_connection(io, svc).with_upgrades();
+        let mut builder = auto::Builder::new(TokioExecutor::new());
+        builder.http1().keep_alive(true).preserve_header_case(true).max_buf_size(1024 * 1024);
+        let conn = builder.serve_connection_with_upgrades(io, svc);
         if let Err(e) = conn.await {
             let s = e.to_string();
             if !s.contains("connection closed") && !s.contains("reset") && !s.contains("broken pipe") {

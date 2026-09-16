@@ -1012,6 +1012,21 @@ async fn mitm_connect_intercepts_with_local_ca_and_refuses_blind_tunnels() {
     assert_eq!(v["served_by"], "tok-a", "intercepted CONNECT went through account selection");
     let blind = client.get("https://example.com/").send().await;
     assert!(blind.is_err(), "blind tunnels are off by default");
+
+    // With `mitm.http1Only` off the tunnel offers `h2` in ALPN; an h2-capable
+    // client takes it, and the proxy has to actually serve HTTP/2 on that
+    // stream rather than answer the first frame with an HTTP/1.1 parse error.
+    let mut cfg2 = cfg_with(vec![account("a", "tok-a", 0, &mock.url())]);
+    cfg2.upstream = mock.url();
+    cfg2.mitm.http1_only = false;
+    let p2 = spawn_proxy(cfg2).await;
+    let cert = reqwest::Certificate::from_pem(&ca).unwrap();
+    let h2 = reqwest::Client::builder().proxy(reqwest::Proxy::all(p2.url("")).unwrap()).add_root_certificate(cert).use_rustls_tls().build().unwrap();
+    let r = h2.post("https://api.anthropic.com/v1/messages").json(&msg("claude-opus-5")).send().await.unwrap();
+    assert_eq!(r.version(), reqwest::Version::HTTP_2, "the client negotiated h2 inside the tunnel");
+    assert_eq!(r.status(), 200);
+    let v: Value = r.json().await.unwrap();
+    assert_eq!(v["served_by"], "tok-a", "an h2 request inside the tunnel is served");
 }
 
 // The management control routes: per-account enable/disable/priority, pool
