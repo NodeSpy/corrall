@@ -185,7 +185,9 @@ also `POST /corrall/reload`.
 
 Every account command takes `--pool <name>` (or `TC_POOL` in the environment)
 and defaults to the pool named by `defaultPool`, so nothing has to change until
-a second pool exists. `corrall pool rm` refuses a pool that still holds
+a second pool exists. `<name>` may also be an account's id, e-mail or uuid; a
+handle that fits more than one account (two orgs sharing an e-mail) is refused
+rather than guessed, so give the full name or the id. `corrall pool rm` refuses a pool that still holds
 accounts unless `--force` is given.
 
 With `--match-path` / `--match-remote` / `--match-env` rules in place, the

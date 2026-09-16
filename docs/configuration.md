@@ -170,7 +170,7 @@ Bucket keys: `unified5h`, `unified7d`, `unified7dFable`, `unified7dSonnet`,
 
 | Variable | Effect |
 | --- | --- |
-| `TC_ACCT` | Pin `corrall run` / `env` to one account (uuid, org uuid, `uuid/org`, name or email). Removed from the child environment |
+| `TC_ACCT` | Pin `corrall run` / `env` to one account (uuid, org uuid, `uuid/org`, name or email). A handle that fits several accounts (an e-mail shared by two orgs, say) is refused; use the full name or id. Removed from the child environment |
 | `TC_POOL` | Send `corrall run` / `env` to one pool, the same way `TC_ACCT` chooses an account. `--pool` wins over it, and either skips `match` rules. Removed from the child environment |
 | `CORRALL_CONFIG` | Config path |
 | `CORRALL_HOST` | Override `proxy.host` |

@@ -839,35 +839,85 @@ impl Config {
         Ok(())
     }
 
-    /// Locate an account by name, id, email or uuid within one pool.
-    pub fn find_account_idx_in(&self, pool: &str, needle: &str) -> Option<usize> {
-        let accounts = &self.pools.get(pool)?.accounts;
+    /// Resolve a user-supplied account handle within one pool.
+    ///
+    /// The full name or the id names exactly one account and wins outright.
+    /// Otherwise the handle is matched loosely — `accountUuid/orgUuid`, either
+    /// uuid alone, the e-mail, or the name's prefix before ` (` — and a loose
+    /// handle that fits more than one account is [`AccountMatch::Ambiguous`]
+    /// rather than whichever sibling happens to come first: the same user in
+    /// two orgs shares an e-mail, and `remove me@x.com` must not pick one.
+    pub fn match_account_in(&self, pool: &str, needle: &str) -> AccountMatch {
+        let Some(accounts) = self.pools.get(pool).map(|p| &p.accounts) else { return AccountMatch::None };
         let n = needle.trim();
         if n.is_empty() {
-            return None;
+            return AccountMatch::None;
+        }
+        if let Some(i) = accounts.iter().position(|a| a.name == n || a.id.as_deref() == Some(n)) {
+            return AccountMatch::One(i);
         }
         // accountUuid/orgUuid
         if let Some((au, ou)) = n.split_once('/') {
             if let Some(i) = accounts.iter().position(|a| a.account_uuid.as_deref() == Some(au) && a.org_uuid.as_deref() == Some(ou)) {
-                return Some(i);
+                return AccountMatch::One(i);
             }
         }
-        accounts.iter().position(|a| {
-            a.account_uuid.as_deref() == Some(n)
-                || a.org_uuid.as_deref() == Some(n)
-                || a.id.as_deref() == Some(n)
-                || a.name == n
-                || a.email.as_deref() == Some(n)
-                || a.name.split(" (").next() == Some(n)
-        })
+        let hits: Vec<usize> = accounts
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| {
+                a.account_uuid.as_deref() == Some(n)
+                    || a.org_uuid.as_deref() == Some(n)
+                    || a.email.as_deref() == Some(n)
+                    || a.name.split(" (").next() == Some(n)
+            })
+            .map(|(i, _)| i)
+            .collect();
+        match hits.as_slice() {
+            [] => AccountMatch::None,
+            [i] => AccountMatch::One(*i),
+            _ => AccountMatch::Ambiguous(hits),
+        }
+    }
+
+    /// Locate an account by name, id, email or uuid within one pool. An
+    /// ambiguous handle is an error naming the candidates, so no caller can
+    /// mistake it for "not found" and no command acts on the wrong sibling.
+    pub fn find_account_idx_in(&self, pool: &str, needle: &str) -> Result<Option<usize>> {
+        match self.match_account_in(pool, needle) {
+            AccountMatch::None => Ok(None),
+            AccountMatch::One(i) => Ok(Some(i)),
+            AccountMatch::Ambiguous(hits) => {
+                let accounts = &self.pools[pool].accounts;
+                let names: Vec<String> =
+                    hits.iter().map(|&i| format!("\"{}\" (id {})", accounts[i].name, accounts[i].id.as_deref().unwrap_or("none"))).collect();
+                bail!("\"{needle}\" is ambiguous in pool \"{pool}\": it matches {}; use the full name or the id", names.join(", "))
+            }
+        }
     }
 
     /// Locate an account anywhere in the file. The default pool is searched
     /// first so that a name duplicated across pools resolves the way it did
-    /// before pools existed.
-    pub fn find_account(&self, needle: &str) -> Option<(String, usize)> {
-        self.pool_names().into_iter().find_map(|p| self.find_account_idx_in(&p, needle).map(|i| (p, i)))
+    /// before pools existed. An ambiguous handle in a pool is an error, not a
+    /// cue to try the next pool.
+    pub fn find_account(&self, needle: &str) -> Result<Option<(String, usize)>> {
+        for p in self.pool_names() {
+            if let Some(i) = self.find_account_idx_in(&p, needle)? {
+                return Ok(Some((p, i)));
+            }
+        }
+        Ok(None)
     }
+}
+
+/// The outcome of resolving an account handle in one pool.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccountMatch {
+    None,
+    One(usize),
+    /// A loose handle (e-mail, uuid, name prefix) that fits several accounts
+    /// and is the exact name or id of none of them.
+    Ambiguous(Vec<usize>),
 }
 
 pub const RESERVED_DIMENSION_HEADERS: &[&str] = &[
@@ -1208,9 +1258,49 @@ mod tests {
         let ids: Vec<&str> = c.all_accounts().filter_map(|(_, a)| a.id.as_deref()).collect();
         assert_eq!(ids.len(), 2);
         assert_ne!(ids[0], ids[1]);
-        assert_eq!(c.find_account("a"), Some((DEFAULT_POOL.to_string(), 0)));
-        assert_eq!(c.find_account("b"), Some(("work".to_string(), 0)));
-        assert_eq!(c.find_account("missing"), None);
+        assert_eq!(c.find_account("a").unwrap(), Some((DEFAULT_POOL.to_string(), 0)));
+        assert_eq!(c.find_account("b").unwrap(), Some(("work".to_string(), 0)));
+        assert_eq!(c.find_account("missing").unwrap(), None);
+    }
+
+    /// Two accounts for the same user in different orgs share an e-mail and a
+    /// name prefix. A handle that fits both is refused, and the full name or
+    /// id still resolves each one.
+    #[test]
+    fn a_handle_fitting_two_accounts_is_refused_not_guessed() {
+        let mut c = Config::default();
+        let acct = |name: &str, id: &str, org: &str| AccountConfig {
+            name: name.into(),
+            id: Some(id.into()),
+            account_uuid: Some("u1".into()),
+            org_uuid: Some(org.into()),
+            email: Some("me@x.com".into()),
+            ..Default::default()
+        };
+        let pool = c.pools.get_mut(DEFAULT_POOL).unwrap();
+        pool.accounts.push(acct("me@x.com (Acme)", "id-acme", "org-acme"));
+        pool.accounts.push(acct("me@x.com (Other)", "id-other", "org-other"));
+
+        // Shared e-mail, shared name prefix, shared account uuid: all ambiguous.
+        for handle in ["me@x.com", "u1"] {
+            assert_eq!(c.match_account_in(DEFAULT_POOL, handle), AccountMatch::Ambiguous(vec![0, 1]), "{handle}");
+            let err = c.find_account_idx_in(DEFAULT_POOL, handle).unwrap_err().to_string();
+            assert!(err.contains("ambiguous") && err.contains("me@x.com (Acme)") && err.contains("id-other"), "{err}");
+            assert!(c.find_account(handle).is_err(), "{handle}: the file-wide lookup refuses too");
+        }
+        // Exact name, id, org uuid and uuid/org each name one account.
+        assert_eq!(c.find_account_idx_in(DEFAULT_POOL, "me@x.com (Other)").unwrap(), Some(1));
+        assert_eq!(c.find_account_idx_in(DEFAULT_POOL, "id-acme").unwrap(), Some(0));
+        assert_eq!(c.find_account_idx_in(DEFAULT_POOL, "org-other").unwrap(), Some(1));
+        assert_eq!(c.find_account_idx_in(DEFAULT_POOL, "u1/org-acme").unwrap(), Some(0));
+        assert_eq!(c.find_account(" id-other ").unwrap(), Some((DEFAULT_POOL.to_string(), 1)));
+        assert_eq!(c.find_account_idx_in(DEFAULT_POOL, "nobody").unwrap(), None);
+        assert_eq!(c.find_account_idx_in("no-such-pool", "id-acme").unwrap(), None);
+
+        // An exact name wins even when it is also a sibling's e-mail: adding
+        // a third account literally named "me@x.com" makes that handle exact.
+        c.pools.get_mut(DEFAULT_POOL).unwrap().accounts.push(AccountConfig { name: "me@x.com".into(), id: Some("id-bare".into()), ..Default::default() });
+        assert_eq!(c.find_account_idx_in(DEFAULT_POOL, "me@x.com").unwrap(), Some(2));
     }
 
     /// An account written by hand has no id. The id issued on load has to

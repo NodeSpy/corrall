@@ -489,12 +489,14 @@ fn pool_mut_of<'a>(cfg: &'a mut Config, pool: Option<&str>) -> Result<&'a mut Po
 /// anywhere in the file otherwise. Searching every pool by default keeps
 /// `corrall disable <name>` working exactly as it did before pools existed.
 fn locate(cfg: &Config, pool: Option<&str>, needle: &str) -> Result<(String, usize)> {
+    // An ambiguous handle is its own error here (naming the candidates), so
+    // the "no account matches" below is only ever the truth.
     let found = match pool {
         Some(p) => {
             let p = pool_name(cfg, Some(p))?;
-            cfg.find_account_idx_in(&p, needle).map(|i| (p, i))
+            cfg.find_account_idx_in(&p, needle)?.map(|i| (p, i))
         }
-        None => cfg.find_account(needle),
+        None => cfg.find_account(needle)?,
     };
     found.ok_or_else(|| match pool {
         Some(p) => anyhow!("no account in pool \"{p}\" matches \"{needle}\""),
@@ -1316,7 +1318,7 @@ pub async fn route(cmd: Option<RouteCmd>, pool: Option<String>) -> Result<()> {
                 // A route can only steer traffic to accounts in its own pool.
                 let owner = pool_name(c, pool.as_deref())?;
                 for a in &accounts {
-                    if c.find_account_idx_in(&owner, a).is_none() {
+                    if c.find_account_idx_in(&owner, a)?.is_none() {
                         bail!("no account in pool \"{owner}\" matches \"{a}\"");
                     }
                 }
@@ -1672,7 +1674,7 @@ fn launch_target(cfg: &Config, pool_flag: Option<&str>, cwd: Option<&str>) -> Re
     if let Some(p) = &pin {
         // A pin only resolves inside the pool serving the request.
         let scope = pool.clone().unwrap_or_else(|| cfg.default_pool.clone());
-        if cfg.find_account_idx_in(&scope, p).is_none() {
+        if cfg.find_account_idx_in(&scope, p).map_err(|e| anyhow!("TC_ACCT={p}: {e}"))?.is_none() {
             bail!("TC_ACCT={p} matches no account in pool \"{scope}\"");
         }
     }
