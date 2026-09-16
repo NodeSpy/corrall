@@ -30,7 +30,10 @@ const KEY: &str = "tc-test-key-0123456789abcdef";
 #[derive(Debug, Clone)]
 struct Seen {
     path: String,
+    /// Last value of each header; see `header_values` for repeated lines.
     headers: HashMap<String, String>,
+    /// Every value of every header, in wire order.
+    header_values: HashMap<String, Vec<String>>,
     body: Value,
 }
 
@@ -86,6 +89,10 @@ async fn mock_handler(mock: Mock, req: Request<Incoming>) -> Result<Response<Moc
     let path = req.uri().path_and_query().map(|p| p.to_string()).unwrap_or_default();
     let is_upgrade = req.headers().get("upgrade").is_some();
     let headers: HashMap<String, String> = req.headers().iter().map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string())).collect();
+    let mut header_values: HashMap<String, Vec<String>> = HashMap::new();
+    for (k, v) in req.headers().iter() {
+        header_values.entry(k.as_str().to_string()).or_default().push(v.to_str().unwrap_or("").to_string());
+    }
     // Cloudflare fronts the real upstream and rejects a request that carries
     // `content-length` twice with a bare HTML 400, even when the values agree.
     // hyper would quietly accept that here, so refuse it the same way.
@@ -124,7 +131,7 @@ async fn mock_handler(mock: Mock, req: Request<Incoming>) -> Result<Response<Moc
     let tok = token_of(&headers);
     let behaviour = {
         let mut st = mock.state.lock().unwrap();
-        st.seen.push(Seen { path: path.clone(), headers: headers.clone(), body: body_json.clone() });
+        st.seen.push(Seen { path: path.clone(), headers: headers.clone(), header_values, body: body_json.clone() });
         st.behaviours.get_mut(&tok).and_then(|v| if v.is_empty() { None } else { Some(v.remove(0)) }).unwrap_or(Behaviour::Ok)
     };
     let cur = mock.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
@@ -388,6 +395,28 @@ async fn client_credentials_are_stripped_and_account_token_injected() {
     assert!(!h.contains_key("cookie"));
     let user_id = seen[0].body["metadata"]["user_id"].as_str().unwrap();
     assert!(user_id.contains("00000001-0000-0000-0000-000000000000"), "account_uuid rewritten: {user_id}");
+}
+
+/// Claude Code sends `anthropic-beta` as several header lines. The forward
+/// path used to rebuild the header map from `into_iter()`, whose second and
+/// later values of a repeated name come with no name, and dropped them.
+#[tokio::test]
+async fn repeated_request_headers_all_reach_upstream() {
+    let mock = spawn_mock().await;
+    let p = spawn_proxy(cfg_with(vec![account("a", "tok-a", 0, &mock.url())])).await;
+    let r = http()
+        .post(p.url("/v1/messages"))
+        .header("anthropic-beta", "interleaved-thinking-2025-05-14")
+        .header("anthropic-beta", "context-management-2025-06-27")
+        .json(&msg("claude-opus-5"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let seen = mock.seen();
+    assert_eq!(seen.len(), 1);
+    let betas = seen[0].header_values.get("anthropic-beta").cloned().unwrap_or_default();
+    assert_eq!(betas, vec!["interleaved-thinking-2025-05-14".to_string(), "context-management-2025-06-27".to_string()], "both lines forwarded, in order");
 }
 
 #[tokio::test]

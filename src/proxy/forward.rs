@@ -64,6 +64,22 @@ pub fn json_response(status: StatusCode, body: Value) -> Response<BoxBody> {
     r
 }
 
+/// Drop hop-by-hop, client-credential, encoding and dimension headers, keeping
+/// every value of a multi-valued header. `HeaderMap::into_iter` yields the
+/// name only with the first value of each header (`None` for the rest), so a
+/// filter built on it silently kept just one `anthropic-beta` line.
+fn filter_request_headers(headers: &HeaderMap, strip: &HashSet<String>) -> HeaderMap {
+    let mut kept = HeaderMap::with_capacity(headers.len());
+    for (k, v) in headers.iter() {
+        let n = k.as_str();
+        if HOP_BY_HOP.contains(&n) || CLIENT_CREDENTIAL_HEADERS.contains(&n) || n == "accept-encoding" || n.starts_with(':') || strip.contains(n) {
+            continue;
+        }
+        kept.append(k.clone(), v.clone());
+    }
+    kept
+}
+
 pub fn error_response(status: StatusCode, kind: &str, message: &str) -> Response<BoxBody> {
     json_response(status, json!({ "type": "error", "error": { "type": kind, "message": message } }))
 }
@@ -100,14 +116,7 @@ pub async fn forward(ctx: &Ctx, mgr: &Manager, info: &ReqInfo, mut headers: Head
     // Strip hop-by-hop, client credentials, dimension headers, and encodings
     // we cannot faithfully relay.
     let strip: HashSet<String> = ctx.dimension_headers();
-    headers = headers
-        .into_iter()
-        .filter_map(|(k, v)| k.map(|k| (k, v)))
-        .filter(|(k, _)| {
-            let n = k.as_str();
-            !HOP_BY_HOP.contains(&n) && !CLIENT_CREDENTIAL_HEADERS.contains(&n) && n != "accept-encoding" && !n.starts_with(':') && !strip.contains(n)
-        })
-        .collect();
+    headers = filter_request_headers(&headers, &strip);
 
     let session = info.session_id.as_deref();
     let (model, advisor) = (info.model.as_deref(), info.advisor_model.as_deref());
@@ -650,6 +659,23 @@ mod tests {
         assert_eq!(m["input_tokens"], 10);
         assert_eq!(m["output_tokens"], 42);
         assert_eq!(m["cache_read_input_tokens"], 5);
+    }
+
+    #[test]
+    fn multi_valued_headers_survive_filtering() {
+        let mut h = HeaderMap::new();
+        h.append("anthropic-beta", HeaderValue::from_static("one"));
+        h.append("anthropic-beta", HeaderValue::from_static("two"));
+        h.append("authorization", HeaderValue::from_static("Bearer x"));
+        h.append("content-length", HeaderValue::from_static("3"));
+        h.append("x-project", HeaderValue::from_static("p"));
+        let strip: HashSet<String> = ["x-project".to_string()].into_iter().collect();
+        let out = filter_request_headers(&h, &strip);
+        let betas: Vec<&str> = out.get_all("anthropic-beta").iter().map(|v| v.to_str().unwrap()).collect();
+        assert_eq!(betas, vec!["one", "two"]);
+        assert!(out.get("authorization").is_none());
+        assert!(out.get("content-length").is_none());
+        assert!(out.get("x-project").is_none());
     }
 
     #[test]
