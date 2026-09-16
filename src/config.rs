@@ -958,11 +958,34 @@ impl State {
     }
 
     pub fn load() -> Result<Option<State>> {
-        let path = state_path();
-        match std::fs::read(&path) {
-            Ok(b) => Ok(Some(serde_json::from_slice(&b).unwrap_or_default())),
+        Self::load_from(&state_path())
+    }
+
+    /// Read the state file. A file that cannot be read is an error; one that
+    /// is there but does not parse is *reported* and replaced by an empty
+    /// state — the file only caches observed quota, so starting over is safe,
+    /// but doing so silently would hide a truncated or hand-edited file
+    /// behind accounts that merely look un-probed.
+    pub fn load_from(path: &Path) -> Result<Option<State>> {
+        match std::fs::read(path) {
+            Ok(b) => {
+                let (st, parse_error) = Self::parse_lenient(&b);
+                if let Some(e) = parse_error {
+                    tracing::warn!("{} is not a valid state file ({e}); starting with empty state", path.display());
+                }
+                Ok(Some(st))
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+        }
+    }
+
+    /// The state in `raw`, or the default plus the parse error when `raw` is
+    /// not one.
+    pub fn parse_lenient(raw: &[u8]) -> (State, Option<serde_json::Error>) {
+        match serde_json::from_slice(raw) {
+            Ok(st) => (st, None),
+            Err(e) => (State::default(), Some(e)),
         }
     }
 
@@ -1227,6 +1250,28 @@ mod tests {
         assert!(!c.ensure_account_ids(), "and a second pass leaves it alone");
         c.pools.get_mut(DEFAULT_POOL).unwrap().accounts.push(AccountConfig { name: "b".into(), id: Some(String::new()), ..Default::default() });
         assert!(c.ensure_account_ids(), "an empty id counts as missing");
+    }
+
+    #[test]
+    fn a_corrupt_state_file_starts_empty_and_says_so() {
+        let (st, err) = State::parse_lenient(b"{not json");
+        assert!(err.is_some(), "the parse failure is reported, not swallowed");
+        assert_eq!(st.version, 0);
+        assert!(st.default.accounts.is_empty());
+
+        let (st, err) = State::parse_lenient(br#"{"version":2,"accounts":{"id-1":{}}}"#);
+        assert!(err.is_none());
+        assert_eq!(st.version, 2);
+
+        // Through the file: corrupt loads as default, missing is None, and an
+        // unreadable path is still an error.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corrall.state.json");
+        std::fs::write(&path, b"{not json").unwrap();
+        let st = State::load_from(&path).unwrap().expect("the file exists");
+        assert!(st.default.accounts.is_empty());
+        assert!(State::load_from(&dir.path().join("absent.json")).unwrap().is_none());
+        assert!(State::load_from(dir.path()).is_err(), "a directory is a read error, not an empty state");
     }
 
     #[test]
