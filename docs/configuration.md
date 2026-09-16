@@ -170,7 +170,7 @@ Bucket keys: `unified5h`, `unified7d`, `unified7dFable`, `unified7dSonnet`,
 
 | Variable | Effect |
 | --- | --- |
-| `TC_ACCT` | Pin `corrall run` / `env` to one account (uuid, org uuid, `uuid/org`, name or email). Removed from the child environment |
+| `TC_ACCT` | Pin `corrall run` / `env` to one account (uuid, org uuid, `uuid/org`, name or email). A handle that fits several accounts (an e-mail shared by two orgs, say) is refused; use the full name or id. Removed from the child environment |
 | `TC_POOL` | Send `corrall run` / `env` to one pool, the same way `TC_ACCT` chooses an account. `--pool` wins over it, and either skips `match` rules. Removed from the child environment |
 | `CORRALL_CONFIG` | Config path |
 | `CORRALL_HOST` | Override `proxy.host` |
@@ -356,9 +356,10 @@ release. `corrall update` downloads the archive for this OS/arch through
 the GitHub CLI (the repository is private), verifies it against `SHA256SUMS`
 and the Sigstore signature (when `cosign` is installed), swaps the binary
 atomically beside the old one (kept as `corrall.prev`), restarts the
-`systemd --user` unit if it was running, and waits for `/corrall/health`.
-If the new binary does not come up healthy the previous one is restored and
-restarted. The implicit "latest" path never downgrades and refuses a new major
+`systemd --user` unit if it was running, and waits for `/corrall/health` on
+the address `proxy.host` actually answers on (loopback for a wildcard bind);
+the check is made by the binary itself, so `curl` is not required. If the new
+binary does not come up healthy the previous one is restored and restarted. The implicit "latest" path never downgrades and refuses a new major
 version without `--allow-major`; `--version vX.Y.Z` installs a specific tag on
 purpose.
 

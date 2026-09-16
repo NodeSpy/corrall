@@ -729,6 +729,8 @@ impl Manager {
                                 entry.refresh_token = Some(refresh);
                                 entry.expires_at = Some(exp);
                             }
+                        } else {
+                            tracing::warn!("account {id_owned} is not in pool \"{pool}\" on disk; the refreshed token was not persisted");
                         }
                         Ok(())
                     })

@@ -348,7 +348,15 @@ function AccountCard({
       ))}
 
       {spend ? (
-        <Text style={{ color: spend.billed ? EXHAUSTED_RED : theme.colors.statusWarning, fontSize: 12 }}>⚠ {spend.label}</Text>
+        <Text
+          style={{
+            color: spend.tone === "billed" ? EXHAUSTED_RED : spend.tone === "warn" ? theme.colors.statusWarning : theme.colors.foregroundMuted,
+            fontSize: 12,
+          }}
+        >
+          {spend.tone === "off" ? "" : "⚠ "}
+          {spend.label}
+        </Text>
       ) : null}
 
       {acct.last_error ? (

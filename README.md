@@ -185,7 +185,9 @@ also `POST /corrall/reload`.
 
 Every account command takes `--pool <name>` (or `TC_POOL` in the environment)
 and defaults to the pool named by `defaultPool`, so nothing has to change until
-a second pool exists. `corrall pool rm` refuses a pool that still holds
+a second pool exists. `<name>` may also be an account's id, e-mail or uuid; a
+handle that fits more than one account (two orgs sharing an e-mail) is refused
+rather than guessed, so give the full name or the id. `corrall pool rm` refuses a pool that still holds
 accounts unless `--force` is given.
 
 With `--match-path` / `--match-remote` / `--match-env` rules in place, the
@@ -489,7 +491,8 @@ corrall update             # verify, swap, restart, health-check (rolls back on 
 `update` fetches the release through the GitHub CLI, verifies the archive
 against `SHA256SUMS` and its Sigstore signature, replaces the binary with an
 atomic rename (keeping the old one as `corrall.prev`), restarts the
-`systemd --user` unit if it was running, and waits for the health endpoint. It
+`systemd --user` unit if it was running, and waits for the health endpoint on
+the configured listener address (no `curl` needed). It
 never downgrades or crosses a major version unless told to (`--version`,
 `--allow-major`), refuses to overwrite a `cargo build` in a checkout, and never
 runs unattended. The server checks daily and only *tells* you a release exists

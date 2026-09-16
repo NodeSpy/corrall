@@ -489,12 +489,14 @@ fn pool_mut_of<'a>(cfg: &'a mut Config, pool: Option<&str>) -> Result<&'a mut Po
 /// anywhere in the file otherwise. Searching every pool by default keeps
 /// `corrall disable <name>` working exactly as it did before pools existed.
 fn locate(cfg: &Config, pool: Option<&str>, needle: &str) -> Result<(String, usize)> {
+    // An ambiguous handle is its own error here (naming the candidates), so
+    // the "no account matches" below is only ever the truth.
     let found = match pool {
         Some(p) => {
             let p = pool_name(cfg, Some(p))?;
-            cfg.find_account_idx_in(&p, needle).map(|i| (p, i))
+            cfg.find_account_idx_in(&p, needle)?.map(|i| (p, i))
         }
-        None => cfg.find_account(needle),
+        None => cfg.find_account(needle)?,
     };
     found.ok_or_else(|| match pool {
         Some(p) => anyhow!("no account in pool \"{p}\" matches \"{needle}\""),
@@ -542,7 +544,16 @@ pub(crate) fn entry_at<'a>(
     }
 }
 
+/// Add or refresh an OAuth account in `pool`; true when it already existed.
 pub(crate) fn upsert_oauth(cfg: &mut Config, pool: &str, name: &str, tokens: &oauth::Tokens, profile: Option<&oauth::Profile>) -> bool {
+    upsert_oauth_at(cfg, pool, name, tokens, profile).1
+}
+
+/// [`upsert_oauth`] that also returns the index the account now has in
+/// `pool`. Callers that need the entry afterwards must use the index: a fuzzy
+/// re-lookup by name can land on a sibling sharing the e-mail (the same user
+/// in another org, say) and edit that one instead.
+pub(crate) fn upsert_oauth_at(cfg: &mut Config, pool: &str, name: &str, tokens: &oauth::Tokens, profile: Option<&oauth::Profile>) -> (usize, bool) {
     // Identify by uuid when the profile gave us one, and only fall back to the
     // display name — an account first added with `--name` (no profile) has no
     // uuid to match on yet.
@@ -553,6 +564,12 @@ pub(crate) fn upsert_oauth(cfg: &mut Config, pool: &str, name: &str, tokens: &oa
             locate_by(cfg, |a| a.account_uuid.as_deref() == Some(au) && (ou.is_none() || a.org_uuid.as_deref() == ou))
         })
         .or_else(|| locate_by(cfg, |a| a.name == name));
+    // `entry_at` edits in place when the account is already in `pool` and
+    // appends otherwise (moved in from another pool, or brand new).
+    let idx = match &found {
+        Some((from, i)) if from == pool => *i,
+        _ => cfg.pool(pool).map_or(0, |p| p.accounts.len()),
+    };
     let (entry, updated) = entry_at(cfg, pool, found, || AccountConfig { name: name.to_string(), kind: AccountType::Oauth, ..Default::default() });
     entry.name = name.to_string();
     entry.kind = AccountType::Oauth;
@@ -568,7 +585,33 @@ pub(crate) fn upsert_oauth(cfg: &mut Config, pool: &str, name: &str, tokens: &oa
         entry.rate_limit_tier = p.rate_limit_tier.clone().or(entry.rate_limit_tier.take());
         entry.seat_tier = p.seat_tier.clone().or(entry.seat_tier.take());
     }
-    updated
+    (idx, updated)
+}
+
+/// The write `corrall import` makes: upsert the account, then apply `--link`
+/// and the credential file's subscription type to the entry the upsert
+/// touched — and only that one. Returns the entry's index in `pool`.
+pub(crate) fn apply_import(
+    cfg: &mut Config,
+    pool: &str,
+    name: &str,
+    tokens: &oauth::Tokens,
+    profile: Option<&oauth::Profile>,
+    link_from: Option<&str>,
+    subscription_type: Option<&str>,
+) -> usize {
+    let (i, _) = upsert_oauth_at(cfg, pool, name, tokens, profile);
+    let a = &mut cfg.pool_mut(pool).expect("upsert_oauth wrote into this pool").accounts[i];
+    if let Some(from) = link_from {
+        a.import_from = Some(from.to_string());
+        a.access_token = None;
+        a.refresh_token = None;
+        a.expires_at = None;
+    }
+    if a.subscription_type.is_none() {
+        a.subscription_type = subscription_type.map(str::to_string);
+    }
+    i
 }
 
 pub(crate) fn display_name(profile: &oauth::Profile, cfg: &Config) -> String {
@@ -731,20 +774,7 @@ pub async fn import(args: ImportArgs) -> Result<()> {
     let tokens = oauth::Tokens { access_token: access, refresh_token: creds.refresh_token.clone(), expires_at: creds.expires_at.unwrap_or(0) };
     let cfg = Config::update(|c| {
         let pool = target_pool(c, args.pool.as_deref())?;
-        upsert_oauth(c, &pool, &name, &tokens, profile.as_ref());
-        // `upsert_oauth` just put the account in `pool`, so look it up there
-        // rather than anywhere in the file.
-        let i = c.find_account_idx_in(&pool, &name).expect("the account upsert_oauth just wrote");
-        let a = &mut c.pool_mut(&pool).expect("target_pool created it").accounts[i];
-        if args.link {
-            a.import_from = Some(args.from.clone());
-            a.access_token = None;
-            a.refresh_token = None;
-            a.expires_at = None;
-        }
-        if a.subscription_type.is_none() {
-            a.subscription_type = creds.subscription_type.clone();
-        }
+        apply_import(c, &pool, &name, &tokens, profile.as_ref(), args.link.then_some(args.from.as_str()), creds.subscription_type.as_deref());
         Ok(())
     })?;
     eprintln!("Imported \"{name}\"{}{}", if args.link { " (linked to the credential file)" } else { "" }, pool_note(args.pool.as_deref()));
@@ -1288,7 +1318,7 @@ pub async fn route(cmd: Option<RouteCmd>, pool: Option<String>) -> Result<()> {
                 // A route can only steer traffic to accounts in its own pool.
                 let owner = pool_name(c, pool.as_deref())?;
                 for a in &accounts {
-                    if c.find_account_idx_in(&owner, a).is_none() {
+                    if c.find_account_idx_in(&owner, a)?.is_none() {
                         bail!("no account in pool \"{owner}\" matches \"{a}\"");
                     }
                 }
@@ -1644,7 +1674,7 @@ fn launch_target(cfg: &Config, pool_flag: Option<&str>, cwd: Option<&str>) -> Re
     if let Some(p) = &pin {
         // A pin only resolves inside the pool serving the request.
         let scope = pool.clone().unwrap_or_else(|| cfg.default_pool.clone());
-        if cfg.find_account_idx_in(&scope, p).is_none() {
+        if cfg.find_account_idx_in(&scope, p).map_err(|e| anyhow!("TC_ACCT={p}: {e}"))?.is_none() {
             bail!("TC_ACCT={p} matches no account in pool \"{scope}\"");
         }
     }
@@ -1777,6 +1807,19 @@ pub fn service(cmd: ServiceCmd) -> Result<()> {
     }
 }
 
+/// The API host `corrall api` may send this account's credential to. A Codex
+/// account is `kind: oauth` like an Anthropic one but its bearer token is an
+/// OpenAI credential; it must never travel to an Anthropic host.
+fn api_base_for(a: &AccountConfig) -> Result<&'static str> {
+    if a.is_codex() {
+        bail!(
+            "\"{}\" is a Codex (OpenAI) account; `corrall api` only calls the Anthropic API and will not send its token there. Pick an Anthropic account with --account",
+            a.name
+        );
+    }
+    Ok("https://api.anthropic.com")
+}
+
 pub async fn api(path: String, account: Option<String>, pool: Option<String>) -> Result<()> {
     let cfg = Config::load()?.ok_or_else(|| anyhow!("no config yet"))?;
     crate::upstream::init(&cfg)?;
@@ -1796,6 +1839,9 @@ pub async fn api(path: String, account: Option<String>, pool: Option<String>) ->
         }
     };
     let a = &cfg.pool(&owner).expect("located pool exists").accounts[idx];
+    // Before any token is fetched or sent: the host is fixed, so the account
+    // has to be one whose credential belongs there.
+    let base = api_base_for(a)?;
     let m = crate::manager::Manager::new(&cfg, &owner);
     let id = a.id.clone().unwrap_or_default();
     let cred = m
@@ -1803,7 +1849,7 @@ pub async fn api(path: String, account: Option<String>, pool: Option<String>) ->
         .await
         .or_else(|| a.api_key.clone())
         .ok_or_else(|| anyhow!("no credential for {}", a.name))?;
-    let mut req = crate::upstream::client().get(format!("https://api.anthropic.com{path}"));
+    let mut req = crate::upstream::client().get(format!("{base}{path}"));
     req = match a.kind {
         AccountType::Oauth => req.bearer_auth(cred).header("anthropic-beta", oauth::USAGE_BETA),
         AccountType::Apikey => req.header("x-api-key", cred),
@@ -1907,8 +1953,85 @@ mod tests {
 
         // A login that is genuinely another account still lands beside it.
         let bob = oauth::Profile { account_uuid: Some("u2".into()), email: Some("bob@example.com".into()), ..Default::default() };
-        assert!(!upsert_oauth(&mut cfg, &pool, "bob@example.com", &tokens("bob"), Some(&bob)));
+        assert_eq!(upsert_oauth_at(&mut cfg, &pool, "bob@example.com", &tokens("bob"), Some(&bob)), (1, false));
         assert_eq!(cfg.pools[&pool].accounts.len(), 2);
+    }
+
+    /// `import --link` of the same user's credentials for a second org, where
+    /// the profile carries no org name so the display name is the bare e-mail.
+    /// The upsert appends a new entry; the link step must land on that entry
+    /// and not on the older `me@x.com (Acme)`, which a fuzzy lookup by e-mail
+    /// or name prefix finds first.
+    #[test]
+    fn import_link_touches_the_entry_it_upserted_and_no_sibling() {
+        let mut cfg = Config::default();
+        let pool = cfg.default_pool.clone();
+        let acme = oauth::Profile {
+            account_uuid: Some("u1".into()),
+            email: Some("me@x.com".into()),
+            org_uuid: Some("org-acme".into()),
+            org_name: Some("Acme".into()),
+            ..Default::default()
+        };
+        let old = oauth::Tokens { access_token: "acme-access".into(), refresh_token: Some("acme-refresh".into()), expires_at: 1 };
+        upsert_oauth(&mut cfg, &pool, "me@x.com (Acme)", &old, Some(&acme));
+        cfg.pools.get_mut(&pool).unwrap().accounts[0].subscription_type = Some("max".into());
+
+        let other =
+            oauth::Profile { account_uuid: Some("u1".into()), email: Some("me@x.com".into()), org_uuid: Some("org-other".into()), ..Default::default() };
+        let name = display_name(&other, &cfg);
+        assert_eq!(name, "me@x.com", "no org name to disambiguate with");
+        let fresh = oauth::Tokens { access_token: "other-access".into(), refresh_token: Some("other-refresh".into()), expires_at: 2 };
+        let i = apply_import(&mut cfg, &pool, &name, &fresh, Some(&other), Some("/home/me/.claude/.credentials.json"), Some("pro"));
+
+        let accounts = &cfg.pools[&pool].accounts;
+        assert_eq!(accounts.len(), 2, "{accounts:#?}");
+        assert_eq!(i, 1);
+        // The Acme entry keeps its own tokens and is not linked to anything.
+        let a = &accounts[0];
+        assert_eq!(a.name, "me@x.com (Acme)");
+        assert_eq!(a.access_token.as_deref(), Some("acme-access"));
+        assert_eq!(a.refresh_token.as_deref(), Some("acme-refresh"));
+        assert_eq!(a.import_from, None);
+        assert_eq!(a.subscription_type.as_deref(), Some("max"));
+        // The new entry is the linked one: no copied token, reads the file.
+        let b = &accounts[1];
+        assert_eq!(b.name, "me@x.com");
+        assert_eq!(b.org_uuid.as_deref(), Some("org-other"));
+        assert_eq!(b.import_from.as_deref(), Some("/home/me/.claude/.credentials.json"));
+        assert_eq!(b.access_token, None);
+        assert_eq!(b.refresh_token, None);
+        assert_eq!(b.expires_at, None);
+        assert_eq!(b.subscription_type.as_deref(), Some("pro"));
+
+        // Without --link the same import keeps the tokens on the new entry.
+        let mut cfg2 = Config::default();
+        upsert_oauth(&mut cfg2, &pool, "me@x.com (Acme)", &old, Some(&acme));
+        let i = apply_import(&mut cfg2, &pool, &name, &fresh, Some(&other), None, None);
+        assert_eq!(i, 1);
+        assert_eq!(cfg2.pools[&pool].accounts[1].access_token.as_deref(), Some("other-access"));
+        assert_eq!(cfg2.pools[&pool].accounts[0].access_token.as_deref(), Some("acme-access"));
+    }
+
+    /// A Codex account is `kind: oauth` with `provider: codex`; matching on the
+    /// kind alone would hand its OpenAI bearer token to api.anthropic.com.
+    #[test]
+    fn corrall_api_refuses_a_codex_account_before_any_request() {
+        let codex = AccountConfig {
+            name: "codex".into(),
+            kind: AccountType::Oauth,
+            provider: Some("codex".into()),
+            access_token: Some("sk-oa".into()),
+            ..Default::default()
+        };
+        let err = api_base_for(&codex).unwrap_err().to_string();
+        assert!(err.contains("Codex"), "{err}");
+        assert!(err.contains("codex"), "names the account: {err}");
+
+        let anthropic = AccountConfig { name: "me".into(), kind: AccountType::Oauth, ..Default::default() };
+        assert_eq!(api_base_for(&anthropic).unwrap(), "https://api.anthropic.com");
+        let key = AccountConfig { name: "key".into(), kind: AccountType::Apikey, ..Default::default() };
+        assert_eq!(api_base_for(&key).unwrap(), "https://api.anthropic.com");
     }
 
     /// `env` configures a client on this machine, so it emits an address that

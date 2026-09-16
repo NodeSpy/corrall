@@ -549,13 +549,19 @@ impl Default for Config {
 
 impl Config {
     pub fn load() -> Result<Option<Config>> {
-        let path = config_path();
-        let raw = match std::fs::read(&path) {
+        Self::load_from(&config_path())
+    }
+
+    /// [`Self::load`] for an explicit path. Anything the load had to fill in
+    /// (the pools shape, a proxy key, account ids) is written straight back so
+    /// the next load reads the same file this one returned.
+    pub fn load_from(path: &Path) -> Result<Option<Config>> {
+        let raw = match std::fs::read(path) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 // Never start a fresh, empty config next to a pre-rename one:
                 // the accounts in it would silently stop being served.
-                if let Some(legacy) = legacy_config_path(&path) {
+                if let Some(legacy) = legacy_config_path(path) {
                     bail!(
                         "{} does not exist but the pre-rename {} does; run scripts/install.sh to migrate it, or move it (with its .state.json and the teamclaude-*.pem certificates) to the corrall.* names yourself",
                         path.display(),
@@ -579,17 +585,29 @@ impl Config {
             cfg.proxy.api_key = new_api_key();
         }
         cfg.ensure_pools();
-        cfg.ensure_account_ids();
+        // An id issued here and not written back is a different id on the
+        // next load, and everything downstream — reload, state restore, the
+        // token-refresh write — keys accounts by id. A hand-written account
+        // would churn ids forever and never have its rotated refresh token
+        // persisted, so a freshly issued id is as much a reason to rewrite
+        // the file as a migration is.
+        let ids_issued = cfg.ensure_account_ids();
         cfg.validate()?;
-        warn_if_permissive(&path);
-        if migrated || keyless {
-            // Rewrite once so a pre-pools install lands on the new shape, and a
-            // keyless one on a stable key, without any manual migration.
-            // Failure is not fatal: we already hold a usable config in memory.
-            if let Err(e) = cfg.save() {
+        warn_if_permissive(path);
+        if migrated || keyless || ids_issued {
+            // Rewrite once so a pre-pools install lands on the new shape, a
+            // keyless one on a stable key and an id-less account on a stable
+            // id, without any manual migration. Failure is not fatal: we
+            // already hold a usable config in memory.
+            if let Err(e) = cfg.save_to(path) {
                 tracing::warn!("could not rewrite {}: {e:#}", path.display());
-            } else if keyless {
-                tracing::info!("generated proxy.apiKey in {}", path.display());
+            } else {
+                if keyless {
+                    tracing::info!("generated proxy.apiKey in {}", path.display());
+                }
+                if ids_issued {
+                    tracing::info!("assigned ids to accounts without one in {}", path.display());
+                }
             }
         }
         Ok(Some(cfg))
@@ -606,10 +624,13 @@ impl Config {
     }
 
     pub fn save(&self) -> Result<()> {
-        let path = config_path();
+        self.save_to(&config_path())
+    }
+
+    pub fn save_to(&self, path: &Path) -> Result<()> {
         let mut json = serde_json::to_vec_pretty(self)?;
         json.push(b'\n');
-        write_private_atomic(&path, &json).with_context(|| format!("writing {}", path.display()))
+        write_private_atomic(path, &json).with_context(|| format!("writing {}", path.display()))
     }
 
     /// Re-read from disk, apply `f`, and save. Serialised process-wide so two
@@ -624,19 +645,24 @@ impl Config {
         Ok(cfg)
     }
 
-    pub fn ensure_account_ids(&mut self) {
+    /// Give every account a unique id. Returns whether any id was issued or
+    /// replaced, so the caller knows the file on disk no longer matches.
+    pub fn ensure_account_ids(&mut self) -> bool {
         // Ids must be unique across the whole file, not just within a pool:
         // state, session affinity and pins are all keyed by id alone.
         let mut seen = std::collections::HashSet::new();
+        let mut changed = false;
         for p in self.pools.values_mut() {
             for a in &mut p.accounts {
                 let fresh = !matches!(&a.id, Some(id) if !id.is_empty() && !seen.contains(id));
                 if fresh {
                     a.id = Some(uuid::Uuid::new_v4().to_string());
+                    changed = true;
                 }
                 seen.insert(a.id.clone().unwrap());
             }
         }
+        changed
     }
 
     /// Guarantee the invariant the router depends on: at least one pool exists
@@ -813,35 +839,85 @@ impl Config {
         Ok(())
     }
 
-    /// Locate an account by name, id, email or uuid within one pool.
-    pub fn find_account_idx_in(&self, pool: &str, needle: &str) -> Option<usize> {
-        let accounts = &self.pools.get(pool)?.accounts;
+    /// Resolve a user-supplied account handle within one pool.
+    ///
+    /// The full name or the id names exactly one account and wins outright.
+    /// Otherwise the handle is matched loosely — `accountUuid/orgUuid`, either
+    /// uuid alone, the e-mail, or the name's prefix before ` (` — and a loose
+    /// handle that fits more than one account is [`AccountMatch::Ambiguous`]
+    /// rather than whichever sibling happens to come first: the same user in
+    /// two orgs shares an e-mail, and `remove me@x.com` must not pick one.
+    pub fn match_account_in(&self, pool: &str, needle: &str) -> AccountMatch {
+        let Some(accounts) = self.pools.get(pool).map(|p| &p.accounts) else { return AccountMatch::None };
         let n = needle.trim();
         if n.is_empty() {
-            return None;
+            return AccountMatch::None;
+        }
+        if let Some(i) = accounts.iter().position(|a| a.name == n || a.id.as_deref() == Some(n)) {
+            return AccountMatch::One(i);
         }
         // accountUuid/orgUuid
         if let Some((au, ou)) = n.split_once('/') {
             if let Some(i) = accounts.iter().position(|a| a.account_uuid.as_deref() == Some(au) && a.org_uuid.as_deref() == Some(ou)) {
-                return Some(i);
+                return AccountMatch::One(i);
             }
         }
-        accounts.iter().position(|a| {
-            a.account_uuid.as_deref() == Some(n)
-                || a.org_uuid.as_deref() == Some(n)
-                || a.id.as_deref() == Some(n)
-                || a.name == n
-                || a.email.as_deref() == Some(n)
-                || a.name.split(" (").next() == Some(n)
-        })
+        let hits: Vec<usize> = accounts
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| {
+                a.account_uuid.as_deref() == Some(n)
+                    || a.org_uuid.as_deref() == Some(n)
+                    || a.email.as_deref() == Some(n)
+                    || a.name.split(" (").next() == Some(n)
+            })
+            .map(|(i, _)| i)
+            .collect();
+        match hits.as_slice() {
+            [] => AccountMatch::None,
+            [i] => AccountMatch::One(*i),
+            _ => AccountMatch::Ambiguous(hits),
+        }
+    }
+
+    /// Locate an account by name, id, email or uuid within one pool. An
+    /// ambiguous handle is an error naming the candidates, so no caller can
+    /// mistake it for "not found" and no command acts on the wrong sibling.
+    pub fn find_account_idx_in(&self, pool: &str, needle: &str) -> Result<Option<usize>> {
+        match self.match_account_in(pool, needle) {
+            AccountMatch::None => Ok(None),
+            AccountMatch::One(i) => Ok(Some(i)),
+            AccountMatch::Ambiguous(hits) => {
+                let accounts = &self.pools[pool].accounts;
+                let names: Vec<String> =
+                    hits.iter().map(|&i| format!("\"{}\" (id {})", accounts[i].name, accounts[i].id.as_deref().unwrap_or("none"))).collect();
+                bail!("\"{needle}\" is ambiguous in pool \"{pool}\": it matches {}; use the full name or the id", names.join(", "))
+            }
+        }
     }
 
     /// Locate an account anywhere in the file. The default pool is searched
     /// first so that a name duplicated across pools resolves the way it did
-    /// before pools existed.
-    pub fn find_account(&self, needle: &str) -> Option<(String, usize)> {
-        self.pool_names().into_iter().find_map(|p| self.find_account_idx_in(&p, needle).map(|i| (p, i)))
+    /// before pools existed. An ambiguous handle in a pool is an error, not a
+    /// cue to try the next pool.
+    pub fn find_account(&self, needle: &str) -> Result<Option<(String, usize)>> {
+        for p in self.pool_names() {
+            if let Some(i) = self.find_account_idx_in(&p, needle)? {
+                return Ok(Some((p, i)));
+            }
+        }
+        Ok(None)
     }
+}
+
+/// The outcome of resolving an account handle in one pool.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccountMatch {
+    None,
+    One(usize),
+    /// A loose handle (e-mail, uuid, name prefix) that fits several accounts
+    /// and is the exact name or id of none of them.
+    Ambiguous(Vec<usize>),
 }
 
 pub const RESERVED_DIMENSION_HEADERS: &[&str] = &[
@@ -932,11 +1008,34 @@ impl State {
     }
 
     pub fn load() -> Result<Option<State>> {
-        let path = state_path();
-        match std::fs::read(&path) {
-            Ok(b) => Ok(Some(serde_json::from_slice(&b).unwrap_or_default())),
+        Self::load_from(&state_path())
+    }
+
+    /// Read the state file. A file that cannot be read is an error; one that
+    /// is there but does not parse is *reported* and replaced by an empty
+    /// state — the file only caches observed quota, so starting over is safe,
+    /// but doing so silently would hide a truncated or hand-edited file
+    /// behind accounts that merely look un-probed.
+    pub fn load_from(path: &Path) -> Result<Option<State>> {
+        match std::fs::read(path) {
+            Ok(b) => {
+                let (st, parse_error) = Self::parse_lenient(&b);
+                if let Some(e) = parse_error {
+                    tracing::warn!("{} is not a valid state file ({e}); starting with empty state", path.display());
+                }
+                Ok(Some(st))
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+        }
+    }
+
+    /// The state in `raw`, or the default plus the parse error when `raw` is
+    /// not one.
+    pub fn parse_lenient(raw: &[u8]) -> (State, Option<serde_json::Error>) {
+        match serde_json::from_slice(raw) {
+            Ok(st) => (st, None),
+            Err(e) => (State::default(), Some(e)),
         }
     }
 
@@ -1159,9 +1258,110 @@ mod tests {
         let ids: Vec<&str> = c.all_accounts().filter_map(|(_, a)| a.id.as_deref()).collect();
         assert_eq!(ids.len(), 2);
         assert_ne!(ids[0], ids[1]);
-        assert_eq!(c.find_account("a"), Some((DEFAULT_POOL.to_string(), 0)));
-        assert_eq!(c.find_account("b"), Some(("work".to_string(), 0)));
-        assert_eq!(c.find_account("missing"), None);
+        assert_eq!(c.find_account("a").unwrap(), Some((DEFAULT_POOL.to_string(), 0)));
+        assert_eq!(c.find_account("b").unwrap(), Some(("work".to_string(), 0)));
+        assert_eq!(c.find_account("missing").unwrap(), None);
+    }
+
+    /// Two accounts for the same user in different orgs share an e-mail and a
+    /// name prefix. A handle that fits both is refused, and the full name or
+    /// id still resolves each one.
+    #[test]
+    fn a_handle_fitting_two_accounts_is_refused_not_guessed() {
+        let mut c = Config::default();
+        let acct = |name: &str, id: &str, org: &str| AccountConfig {
+            name: name.into(),
+            id: Some(id.into()),
+            account_uuid: Some("u1".into()),
+            org_uuid: Some(org.into()),
+            email: Some("me@x.com".into()),
+            ..Default::default()
+        };
+        let pool = c.pools.get_mut(DEFAULT_POOL).unwrap();
+        pool.accounts.push(acct("me@x.com (Acme)", "id-acme", "org-acme"));
+        pool.accounts.push(acct("me@x.com (Other)", "id-other", "org-other"));
+
+        // Shared e-mail, shared name prefix, shared account uuid: all ambiguous.
+        for handle in ["me@x.com", "u1"] {
+            assert_eq!(c.match_account_in(DEFAULT_POOL, handle), AccountMatch::Ambiguous(vec![0, 1]), "{handle}");
+            let err = c.find_account_idx_in(DEFAULT_POOL, handle).unwrap_err().to_string();
+            assert!(err.contains("ambiguous") && err.contains("me@x.com (Acme)") && err.contains("id-other"), "{err}");
+            assert!(c.find_account(handle).is_err(), "{handle}: the file-wide lookup refuses too");
+        }
+        // Exact name, id, org uuid and uuid/org each name one account.
+        assert_eq!(c.find_account_idx_in(DEFAULT_POOL, "me@x.com (Other)").unwrap(), Some(1));
+        assert_eq!(c.find_account_idx_in(DEFAULT_POOL, "id-acme").unwrap(), Some(0));
+        assert_eq!(c.find_account_idx_in(DEFAULT_POOL, "org-other").unwrap(), Some(1));
+        assert_eq!(c.find_account_idx_in(DEFAULT_POOL, "u1/org-acme").unwrap(), Some(0));
+        assert_eq!(c.find_account(" id-other ").unwrap(), Some((DEFAULT_POOL.to_string(), 1)));
+        assert_eq!(c.find_account_idx_in(DEFAULT_POOL, "nobody").unwrap(), None);
+        assert_eq!(c.find_account_idx_in("no-such-pool", "id-acme").unwrap(), None);
+
+        // An exact name wins even when it is also a sibling's e-mail: adding
+        // a third account literally named "me@x.com" makes that handle exact.
+        c.pools.get_mut(DEFAULT_POOL).unwrap().accounts.push(AccountConfig { name: "me@x.com".into(), id: Some("id-bare".into()), ..Default::default() });
+        assert_eq!(c.find_account_idx_in(DEFAULT_POOL, "me@x.com").unwrap(), Some(2));
+    }
+
+    /// An account written by hand has no id. The id issued on load has to
+    /// reach the disk, or the next load issues another one and every id-keyed
+    /// consumer — reload, state restore, the refresh-token write — misses.
+    #[test]
+    fn ids_issued_on_load_are_persisted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corrall.json");
+        std::fs::write(&path, r#"{"proxy":{"apiKey":"tc-0123456789abcdef0123"},"pools":{"default":{"accounts":[{"name":"hand-written","type":"oauth"}]}}}"#)
+            .unwrap();
+
+        let first = Config::load_from(&path).unwrap().expect("file exists");
+        let id = first.pools[DEFAULT_POOL].accounts[0].id.clone().expect("load issues an id");
+        assert!(!id.is_empty());
+
+        let on_disk: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(on_disk.pointer("/pools/default/accounts/0/id").and_then(Value::as_str), Some(id.as_str()), "the issued id is written back");
+
+        let second = Config::load_from(&path).unwrap().unwrap();
+        assert_eq!(second.pools[DEFAULT_POOL].accounts[0].id.as_deref(), Some(id.as_str()), "a second load reads the same id");
+
+        // A file whose accounts all carry ids is not rewritten at all.
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        Config::load_from(&path).unwrap().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), mtime);
+    }
+
+    #[test]
+    fn ensure_account_ids_reports_whether_it_changed_anything() {
+        let mut c = Config::default();
+        assert!(!c.ensure_account_ids(), "nothing to do on an empty config");
+        c.pools.get_mut(DEFAULT_POOL).unwrap().accounts.push(AccountConfig { name: "a".into(), ..Default::default() });
+        assert!(c.ensure_account_ids(), "a missing id is issued");
+        assert!(!c.ensure_account_ids(), "and a second pass leaves it alone");
+        c.pools.get_mut(DEFAULT_POOL).unwrap().accounts.push(AccountConfig { name: "b".into(), id: Some(String::new()), ..Default::default() });
+        assert!(c.ensure_account_ids(), "an empty id counts as missing");
+    }
+
+    #[test]
+    fn a_corrupt_state_file_starts_empty_and_says_so() {
+        let (st, err) = State::parse_lenient(b"{not json");
+        assert!(err.is_some(), "the parse failure is reported, not swallowed");
+        assert_eq!(st.version, 0);
+        assert!(st.default.accounts.is_empty());
+
+        let (st, err) = State::parse_lenient(br#"{"version":2,"accounts":{"id-1":{}}}"#);
+        assert!(err.is_none());
+        assert_eq!(st.version, 2);
+
+        // Through the file: corrupt loads as default, missing is None, and an
+        // unreadable path is still an error.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corrall.state.json");
+        std::fs::write(&path, b"{not json").unwrap();
+        let st = State::load_from(&path).unwrap().expect("the file exists");
+        assert!(st.default.accounts.is_empty());
+        assert!(State::load_from(&dir.path().join("absent.json")).unwrap().is_none());
+        assert!(State::load_from(dir.path()).is_err(), "a directory is a read error, not an empty state");
     }
 
     #[test]
