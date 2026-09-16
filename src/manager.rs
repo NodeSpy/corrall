@@ -1411,6 +1411,20 @@ impl Fleet {
         }
     }
 
+    /// The storm ramp guards a cold account against a burst. In distribute
+    /// mode a new session lands on the least-loaded account, which is usually
+    /// one already serving other sessions; restarting its ramp on every new
+    /// session throttled a warm account back to `startConc` each time. Ramp
+    /// only an account that is idle and has no ramp running.
+    fn ramp_if_cold(&mut self, id: &str, now: i64) {
+        let active_sessions = self.sessions.stats(now).per_account_active.get(id).copied().unwrap_or(0);
+        if let Some(a) = self.account_mut(id) {
+            if a.ramp_started_at.is_none() && a.in_flight == 0 && active_sessions == 0 {
+                a.ramp_started_at = Some(now);
+            }
+        }
+    }
+
     fn set_current(&mut self, id: &str, now: i64, mgr: &Manager, scoped: bool) {
         let switched = self.current.as_deref() != Some(id);
         if !scoped {
@@ -1496,7 +1510,7 @@ impl Fleet {
                     if self.current.is_none() {
                         self.set_current(&id, now, mgr, false);
                     } else {
-                        self.begin_ramp(&id, now);
+                        self.ramp_if_cold(&id, now);
                     }
                     if let Some(s) = self.snapshot(self.account(&id).unwrap()) {
                         return Selection::Account(s);
@@ -1989,6 +2003,47 @@ mod tests {
         assert_eq!(select_name(&m, None).as_deref(), Some("c"));
         // sticky: stays on c
         assert_eq!(select_name(&m, None).as_deref(), Some("c"));
+    }
+
+    /// With `distributeSessions` every new session re-ran the account's storm
+    /// ramp, so a warm account serving many sessions was throttled back to
+    /// `startConc` each time one began. A running or finished ramp is left
+    /// alone; only an idle account with no ramp gets one.
+    #[test]
+    fn new_session_does_not_restart_the_ramp_on_a_warm_account() {
+        let mut cfg = cfg_with(vec![acct("a", 0)]);
+        pool_of(&mut cfg).distribute_sessions = true;
+        let m = mgr(&cfg);
+        let id = m.account_ids()[0].0.clone();
+        let sel = |sid: &str| m.select(&SelectRequest { session_id: Some(sid), allow_probe: true, ..Default::default() });
+        assert!(matches!(sel("11111111-1111-1111-1111-111111111111"), Selection::Account(_)));
+        m.record_session(Some("11111111-1111-1111-1111-111111111111"), &id, None);
+        let an_hour_ago = now_ms() - 3_600_000;
+        m.with(|f| f.account_mut(&id).unwrap().ramp_started_at = Some(an_hour_ago));
+        assert!(matches!(sel("22222222-2222-2222-2222-222222222222"), Selection::Account(_)));
+        m.with(|f| assert_eq!(f.account(&id).unwrap().ramp_started_at, Some(an_hour_ago), "ramp not restarted for the same account"));
+        // A finished ramp on an account still carrying an active session is
+        // not restarted either; it is warm.
+        m.with(|f| f.account_mut(&id).unwrap().ramp_started_at = None);
+        assert!(matches!(sel("33333333-3333-3333-3333-333333333333"), Selection::Account(_)));
+        m.with(|f| assert_eq!(f.account(&id).unwrap().ramp_started_at, None, "warm account: no new ramp"));
+
+        // A second, idle account does get a ramp when its first session lands.
+        let mut cfg = cfg_with(vec![acct("a", 0), acct("b", 0)]);
+        pool_of(&mut cfg).distribute_sessions = true;
+        let m = mgr(&cfg);
+        let ids = m.account_ids();
+        let sel = |sid: &str| match m.select(&SelectRequest { session_id: Some(sid), allow_probe: true, ..Default::default() }) {
+            Selection::Account(s) => s.id,
+            other => panic!("{other:?}"),
+        };
+        let first = sel("11111111-1111-1111-1111-111111111111");
+        m.record_session(Some("11111111-1111-1111-1111-111111111111"), &first, None);
+        let other = ids.iter().map(|(i, _)| i.clone()).find(|i| *i != first).unwrap();
+        m.with(|f| assert_eq!(f.account(&other).unwrap().ramp_started_at, None));
+        let second = sel("22222222-2222-2222-2222-222222222222");
+        assert_eq!(second, other, "new session spreads to the idle account");
+        m.with(|f| assert!(f.account(&other).unwrap().ramp_started_at.is_some(), "an idle account ramps up"));
     }
 
     #[tokio::test]
