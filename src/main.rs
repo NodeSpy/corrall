@@ -84,6 +84,14 @@ async fn dispatch(cli: Cli) -> Result<()> {
 }
 
 async fn server(args: ServerArgs, interactive: bool) -> Result<()> {
+    // Interactive runs install no stderr subscriber (it would fight the
+    // terminal); WARN and above are forwarded into the TUI's activity pane
+    // instead, and the channel exists from here so nothing said during
+    // start-up is lost.
+    let (activity_tx, _) = tokio::sync::broadcast::channel(512);
+    if interactive {
+        tui::install_tracing(activity_tx.clone());
+    }
     let mut cfg = Config::load_or_create()?;
     if let Some(dir) = &args.log_to {
         cfg.log_dir = Some(dir.clone());
@@ -119,7 +127,6 @@ async fn server(args: ServerArgs, interactive: bool) -> Result<()> {
     if let Some(l) = &logger {
         l.sweep(cfg.log_retention_hours);
     }
-    let (activity_tx, _) = tokio::sync::broadcast::channel(512);
     let prober = prober::Prober::new(pools.clone());
     let warmer = warmer::Warmer::new(pools.clone(), cfg.dial_authority(), &cfg.proxy.api_key, cfg.warmup_seconds);
     let titles = titles::Titles::new(&cfg.session_titles);

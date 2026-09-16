@@ -82,7 +82,7 @@ fn i(v: &Value, k: &str) -> i64 {
 fn b(v: &Value, k: &str) -> bool {
     v.get(k).and_then(Value::as_bool).unwrap_or(false)
 }
-fn ts(v: Option<&Value>) -> Option<i64> {
+pub fn ts(v: Option<&Value>) -> Option<i64> {
     let v = v?;
     if let Some(n) = v.as_i64() {
         return Some(n);
@@ -132,7 +132,7 @@ pub fn format_duration(ms: i64) -> String {
     }
 }
 
-fn format_ago(t: i64, now: i64) -> String {
+pub fn format_ago(t: i64, now: i64) -> String {
     let delta = now - t;
     if delta < 0 {
         format!("in {}", format_duration(-delta))
