@@ -462,6 +462,7 @@ impl Manager {
                     let mut a = f.accounts.remove(pos);
                     a.name = c.name.clone();
                     a.priority = c.priority;
+                    let re_enabled = a.disabled && !c.disabled;
                     a.disabled = c.disabled;
                     a.upstream = c.upstream.clone();
                     a.model_map = c.model_map.clone().unwrap_or_default();
@@ -473,12 +474,18 @@ impl Manager {
                     a.email = c.email.clone().or(a.email);
                     a.account_id = c.account_id.clone().or(a.account_id);
                     a.import_from = c.import_from.clone();
-                    // Take on-disk tokens when they differ from what we hold: a
-                    // re-login elsewhere rotated them. Keep ours otherwise (we may
-                    // have refreshed more recently than the file).
+                    // Take the on-disk credential when it differs from what we
+                    // hold: a re-login or a rotated API key. An OAuth pair we
+                    // refreshed more recently than the file (a later expiry) is
+                    // kept. A new credential also lifts an error state, since
+                    // the error was about the old one; an unchanged credential
+                    // does not, or a 401-dead key would be retried on every
+                    // reload and die again.
                     let mut fresh = a.clone();
                     fresh.apply_credentials(c);
-                    if fresh.credential.is_some() && fresh.refresh_token != a.refresh_token && fresh.expires_at.unwrap_or(0) >= a.expires_at.unwrap_or(0) {
+                    let changed = fresh.credential.is_some() && (fresh.credential != a.credential || fresh.refresh_token != a.refresh_token);
+                    let not_older = fresh.expires_at.unwrap_or(0) >= a.expires_at.unwrap_or(0);
+                    if changed && (a.credential.is_none() || not_older) {
                         a.credential = fresh.credential;
                         a.refresh_token = fresh.refresh_token;
                         a.expires_at = fresh.expires_at;
@@ -486,13 +493,11 @@ impl Manager {
                             a.status = Status::Active;
                             a.error_message = None;
                         }
-                    } else if a.credential.is_none() {
-                        a.credential = fresh.credential;
-                        a.refresh_token = fresh.refresh_token;
-                        a.expires_at = fresh.expires_at;
                     }
-                    if !a.disabled && a.status == Status::Error && a.dead_refresh_token.is_none() {
+                    // Re-enabling is the operator's explicit "try it again".
+                    if re_enabled && a.status == Status::Error && a.dead_refresh_token.is_none() {
                         a.status = Status::Active;
+                        a.error_message = None;
                     }
                     next.push(a);
                 } else {
@@ -2115,5 +2120,72 @@ mod tests {
         let cfg = cfg_with(vec![a]);
         let m = mgr(&cfg);
         assert!(select_name(&m, None).is_none());
+    }
+
+    fn apikey_cfg(key: &str) -> Config {
+        let mut c = cfg_with(vec![AccountConfig { name: "k".into(), kind: AccountType::Apikey, api_key: Some(key.into()), ..Default::default() }]);
+        // Same id across reloads, as `ensure_account_ids` on a saved file gives.
+        pool_of(&mut c).accounts[0].id = Some("acct-k".into());
+        c
+    }
+
+    /// A rotated API key (no refresh token to compare) must be picked up by a
+    /// reload, and only a changed credential clears a 401 error: an unchanged
+    /// dead key retried on every reload just dies again.
+    #[test]
+    fn reload_applies_a_rotated_api_key_and_clears_the_error_only_then() {
+        let m = mgr(&apikey_cfg("sk-old"));
+        let id = m.account_ids()[0].0.clone();
+        assert_eq!(m.credential_of(&id).as_deref(), Some("sk-old"));
+
+        m.mark_error(&id, "upstream rejected the API key (401)");
+        m.sync_config(&apikey_cfg("sk-old"), crate::config::DEFAULT_POOL);
+        m.with(|f| {
+            let a = f.account(&id).unwrap();
+            assert_eq!(a.status, Status::Error, "same key: still dead");
+            assert!(a.error_message.is_some());
+        });
+
+        // Disabling and re-enabling is the operator's explicit retry.
+        let mut off = apikey_cfg("sk-old");
+        pool_of(&mut off).accounts[0].disabled = true;
+        m.sync_config(&off, crate::config::DEFAULT_POOL);
+        m.with(|f| assert_eq!(f.account(&id).unwrap().status, Status::Error));
+        m.sync_config(&apikey_cfg("sk-old"), crate::config::DEFAULT_POOL);
+        m.with(|f| assert_eq!(f.account(&id).unwrap().status, Status::Active, "re-enabled: retried"));
+
+        m.mark_error(&id, "upstream rejected the API key (401)");
+        m.sync_config(&apikey_cfg("sk-new"), crate::config::DEFAULT_POOL);
+        assert_eq!(m.credential_of(&id).as_deref(), Some("sk-new"));
+        m.with(|f| {
+            let a = f.account(&id).unwrap();
+            assert_eq!(a.status, Status::Active, "a new key lifts the error");
+            assert!(a.error_message.is_none());
+        });
+    }
+
+    /// An OAuth access token rotated on disk with the same refresh token is
+    /// taken too, while a pair we refreshed more recently than the file is kept.
+    #[test]
+    fn reload_takes_a_newer_access_token_and_keeps_our_fresher_one() {
+        let mut base = acct("a", 0);
+        base.id = Some("acct-a".into());
+        let m = mgr(&cfg_with(vec![base.clone()]));
+        let id = m.account_ids()[0].0.clone();
+
+        let mut rotated = base.clone();
+        rotated.access_token = Some("tok2".into());
+        rotated.expires_at = Some(base.expires_at.unwrap() + 60_000);
+        m.sync_config(&cfg_with(vec![rotated]), crate::config::DEFAULT_POOL);
+        assert_eq!(m.credential_of(&id).as_deref(), Some("tok2"));
+
+        // We refreshed in memory after the file was written: keep ours.
+        m.with(|f| {
+            let a = f.account_mut(&id).unwrap();
+            a.credential = Some("tok3".into());
+            a.expires_at = Some(now_ms() + 7_200_000);
+        });
+        m.sync_config(&cfg_with(vec![base]), crate::config::DEFAULT_POOL);
+        assert_eq!(m.credential_of(&id).as_deref(), Some("tok3"));
     }
 }
