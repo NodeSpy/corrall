@@ -15,7 +15,8 @@ use hyper::header::{HeaderMap, HeaderValue};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::server::conn::auto;
 use parking_lot::{Mutex, RwLock};
 use serde_json::{json, Value};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -204,8 +205,12 @@ pub async fn run(ctx: Ctx, bind: SocketAddr, mut shutdown: tokio::sync::watch::R
     Ok(())
 }
 
-/// Serve HTTP/1.1 on any stream (the raw TCP socket, or a terminated TLS
-/// tunnel). `forced_pin` carries a CONNECT-level account pin into the tunnel.
+/// Serve HTTP on any stream (the raw TCP socket, or a terminated TLS tunnel),
+/// HTTP/1.1 or HTTP/2 by what the client speaks. Inside a tunnel the ALPN
+/// choice made in `mitm::tls_config` decides: with `mitm.http1Only` off the
+/// client negotiates `h2` and this must actually serve it, or every
+/// intercepted request dies on the first frame. `tunnel` carries the
+/// CONNECT-level authentication, pin and pool into the tunnel.
 pub fn serve_connection<S>(ctx: Ctx, stream: S, peer: IpAddr, tunnel: Option<TunnelCtx>) -> futures_util::future::BoxFuture<'static, ()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -218,7 +223,9 @@ where
             let tunnel = tunnel.clone();
             async move { Ok::<_, hyper::Error>(handle(ctx, req, peer, tunnel.as_ref().as_ref()).await) }
         });
-        let conn = http1::Builder::new().keep_alive(true).preserve_header_case(true).max_buf_size(1024 * 1024).serve_connection(io, svc).with_upgrades();
+        let mut builder = auto::Builder::new(TokioExecutor::new());
+        builder.http1().keep_alive(true).preserve_header_case(true).max_buf_size(1024 * 1024);
+        let conn = builder.serve_connection_with_upgrades(io, svc);
         if let Err(e) = conn.await {
             let s = e.to_string();
             if !s.contains("connection closed") && !s.contains("reset") && !s.contains("broken pipe") {
@@ -270,6 +277,22 @@ async fn handle(ctx: Ctx, req: Request<Incoming>, peer: IpAddr, tunnel: Option<&
     // In MITM mode there is no local URL to carry the keyword, so the pool
     // comes from the CONNECT username instead. An explicit keyword still wins.
     let asked_pool = asked_pool.or_else(|| tunnel.and_then(|t| t.pool.clone()));
+
+    // Deprecated path pin, stripped here too so that `path` is the upstream
+    // path for everything below: provider detection, the passthrough list,
+    // the telemetry checks and the activity log. Stripping only
+    // `path_and_query` left `/tc-acct/<pin>/backend-api/codex/...` looking
+    // like an Anthropic path, and the pinned Codex account was refused as
+    // "other provider".
+    let (pin, path, path_and_query) = match path_and_query.strip_prefix(PIN_PREFIX).and_then(|rest| rest.split_once('/')) {
+        Some((token, tail)) => {
+            let tok = percent_encoding::percent_decode_str(token).decode_utf8_lossy().to_string();
+            let rest = format!("/{tail}");
+            let path = rest.split(['?', '#']).next().unwrap_or("/").to_string();
+            (Some(tok), path, rest)
+        }
+        None => (tunnel.and_then(|t| t.pin.clone()), path, path_and_query),
+    };
 
     // The dashboard page is a static asset with no data in it; everything it
     // shows is fetched with the key. Serving it unauthenticated lets a browser
@@ -326,19 +349,6 @@ async fn handle(ctx: Ctx, req: Request<Incoming>, peer: IpAddr, tunnel: Option<&
         };
         return super::relay::passthrough(&upstream, parts, body).await;
     }
-
-    // Deprecated path pin.
-    let (pin, path_and_query) = if let Some(rest) = path_and_query.strip_prefix(PIN_PREFIX) {
-        match rest.split_once('/') {
-            Some((token, tail)) => {
-                let tok = percent_encoding::percent_decode_str(token).decode_utf8_lossy().to_string();
-                (Some(tok), format!("/{tail}"))
-            }
-            None => (None, path_and_query),
-        }
-    } else {
-        (tunnel.and_then(|t| t.pin.clone()), path_and_query)
-    };
 
     // Telemetry noise.
     if path.starts_with("/api/event_logging") && cfg.event_logging == EventLogging::Block {
@@ -892,11 +902,23 @@ async fn handle_connect(ctx: Ctx, req: Request<Incoming>, peer: IpAddr) -> Respo
             return error_response(StatusCode::FORBIDDEN, "permission_error", why);
         }
         HostMode::Tunnel => {
+            // Resolve first and dial only what was vetted: a name that answers
+            // with a loopback, RFC1918, link-local or metadata address is
+            // refused like the literal would be, and there is no second lookup
+            // for a rebinding answer to slip through.
+            let addrs = match tokio::time::timeout(Duration::from_secs(10), mitm::resolve_tunnel_target(&host, port)).await {
+                Ok(Ok(a)) => a,
+                Ok(Err(why)) => {
+                    tracing::warn!("CONNECT {host}:{port} refused: {why}");
+                    return error_response(StatusCode::FORBIDDEN, "permission_error", why);
+                }
+                Err(_) => return error_response(StatusCode::BAD_GATEWAY, "api_error", "tunnel host did not resolve in time"),
+            };
             tokio::spawn(async move {
                 match hyper::upgrade::on(req).await {
                     Ok(upgraded) => {
                         let mut client = TokioIo::new(upgraded);
-                        match tokio::time::timeout(Duration::from_secs(30), tokio::net::TcpStream::connect((host.as_str(), port))).await {
+                        match tokio::time::timeout(Duration::from_secs(30), tokio::net::TcpStream::connect(&addrs[..])).await {
                             Ok(Ok(mut up)) => {
                                 let _ = tokio::io::copy_bidirectional(&mut client, &mut up).await;
                             }

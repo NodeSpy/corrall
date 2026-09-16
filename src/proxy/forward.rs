@@ -64,6 +64,22 @@ pub fn json_response(status: StatusCode, body: Value) -> Response<BoxBody> {
     r
 }
 
+/// Drop hop-by-hop, client-credential, encoding and dimension headers, keeping
+/// every value of a multi-valued header. `HeaderMap::into_iter` yields the
+/// name only with the first value of each header (`None` for the rest), so a
+/// filter built on it silently kept just one `anthropic-beta` line.
+fn filter_request_headers(headers: &HeaderMap, strip: &HashSet<String>) -> HeaderMap {
+    let mut kept = HeaderMap::with_capacity(headers.len());
+    for (k, v) in headers.iter() {
+        let n = k.as_str();
+        if HOP_BY_HOP.contains(&n) || CLIENT_CREDENTIAL_HEADERS.contains(&n) || n == "accept-encoding" || n.starts_with(':') || strip.contains(n) {
+            continue;
+        }
+        kept.append(k.clone(), v.clone());
+    }
+    kept
+}
+
 pub fn error_response(status: StatusCode, kind: &str, message: &str) -> Response<BoxBody> {
     json_response(status, json!({ "type": "error", "error": { "type": kind, "message": message } }))
 }
@@ -73,6 +89,17 @@ fn with_retry_after(mut r: Response<BoxBody>, secs: u64) -> Response<BoxBody> {
         r.headers_mut().insert("retry-after", v);
     }
     r
+}
+
+/// Every eligible account was tried and failed. All of them timing out is a
+/// 504; anything else (5xx, connection errors, a mix) is a 502. Neither carries
+/// a `retry-after`: nothing on this side knows when the upstream recovers.
+fn transient_exhaustion(tried: usize, transient_failures: usize, timeouts: usize) -> Response<BoxBody> {
+    let all_timed_out = transient_failures > 0 && timeouts == transient_failures;
+    let status = if all_timed_out { StatusCode::GATEWAY_TIMEOUT } else { StatusCode::BAD_GATEWAY };
+    let msg =
+        if all_timed_out { format!("No account answered in time ({tried} tried).") } else { format!("No account could serve the request ({tried} tried).") };
+    error_response(status, "api_error", &msg)
 }
 
 /// Outcome of one upstream attempt.
@@ -100,14 +127,7 @@ pub async fn forward(ctx: &Ctx, mgr: &Manager, info: &ReqInfo, mut headers: Head
     // Strip hop-by-hop, client credentials, dimension headers, and encodings
     // we cannot faithfully relay.
     let strip: HashSet<String> = ctx.dimension_headers();
-    headers = headers
-        .into_iter()
-        .filter_map(|(k, v)| k.map(|k| (k, v)))
-        .filter(|(k, _)| {
-            let n = k.as_str();
-            !HOP_BY_HOP.contains(&n) && !CLIENT_CREDENTIAL_HEADERS.contains(&n) && n != "accept-encoding" && !n.starts_with(':') && !strip.contains(n)
-        })
-        .collect();
+    headers = filter_request_headers(&headers, &strip);
 
     let session = info.session_id.as_deref();
     let (model, advisor) = (info.model.as_deref(), info.advisor_model.as_deref());
@@ -116,7 +136,12 @@ pub async fn forward(ctx: &Ctx, mgr: &Manager, info: &ReqInfo, mut headers: Head
     let mut attempts = 0usize;
     let mut same_account_retries = 0usize;
     let mut rate_limit_hops = 0usize;
-    let mut last_exhausted: Option<(u64, String)> = None;
+    // Soonest recovery of a quota- or rate-limit-held account, when the last
+    // selection found one; `None` means every account is either healthy-but-
+    // tried or out for a reason no reset will cure.
+    let mut last_exhausted: Option<Option<u64>> = None;
+    let mut transient_failures = 0usize;
+    let mut timeouts = 0usize;
     let started = std::time::Instant::now();
     let mut last_account = String::new();
     // A served response reports its own completion once the body ends. Every
@@ -156,10 +181,10 @@ pub async fn forward(ctx: &Ctx, mgr: &Manager, info: &ReqInfo, mut headers: Head
                 return fail(with_retry_after(error_response(StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", &msg), 30), &name);
             }
             Selection::Exhausted { retry_after_secs, reason } => {
-                last_exhausted = Some((retry_after_secs, reason.clone()));
+                last_exhausted = Some(retry_after_secs);
                 if let Some(deadline) = hold_deadline {
                     if tokio::time::Instant::now() < deadline {
-                        let wait = Duration::from_secs(retry_after_secs.clamp(2, 30));
+                        let wait = Duration::from_secs(retry_after_secs.unwrap_or(HEADERLESS_429_PAUSE_SECONDS).clamp(2, 30));
                         mgr.log(format!("All accounts exhausted; holding request {} for {}s", info.id, wait.as_secs()));
                         tokio::time::sleep(wait).await;
                         tried.clear();
@@ -167,12 +192,20 @@ pub async fn forward(ctx: &Ctx, mgr: &Manager, info: &ReqInfo, mut headers: Head
                     }
                 }
                 tracing::warn!("exhausted: {reason}");
+                if !tried.is_empty() && retry_after_secs.is_none() {
+                    // Every eligible account answered 5xx or timed out and none
+                    // is held back by quota: an upstream failure, not a rate
+                    // limit. A 429 with a reset-derived retry-after here made
+                    // clients back off for up to an hour from a blip.
+                    return fail(transient_exhaustion(tried.len(), transient_failures, timeouts), &last_account);
+                }
                 let msg = if tried.is_empty() {
                     "All accounts have reached their quota. Retry after the soonest reset.".to_string()
                 } else {
                     format!("No account could serve the request ({} tried).", tried.len())
                 };
-                return fail(with_retry_after(error_response(StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", &msg), retry_after_secs), &last_account);
+                let ra = retry_after_secs.unwrap_or(60);
+                return fail(with_retry_after(error_response(StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", &msg), ra), &last_account);
             }
         };
 
@@ -187,6 +220,10 @@ pub async fn forward(ctx: &Ctx, mgr: &Manager, info: &ReqInfo, mut headers: Head
                 tried.insert(account.id.clone());
                 if transient {
                     mgr.record_failure(&account.id);
+                    transient_failures += 1;
+                    if reason == "timeout" {
+                        timeouts += 1;
+                    }
                 }
                 tracing::info!("failover off \"{}\": {reason}", account.name);
                 if info.pin.is_some() {
@@ -194,11 +231,12 @@ pub async fn forward(ctx: &Ctx, mgr: &Manager, info: &ReqInfo, mut headers: Head
                     return fail(error_response(StatusCode::BAD_GATEWAY, "api_error", "Pinned account failed to serve the request"), &account.name);
                 }
                 if tried.len() >= MAX_ATTEMPTS {
-                    let (ra, _) = last_exhausted.clone().unwrap_or((30, String::new()));
-                    return fail(
-                        with_retry_after(error_response(StatusCode::BAD_GATEWAY, "api_error", "Every eligible account failed to serve the request"), ra),
-                        &account.name,
-                    );
+                    let r = transient_exhaustion(tried.len(), transient_failures, timeouts);
+                    let r = match last_exhausted.flatten() {
+                        Some(ra) => with_retry_after(r, ra),
+                        None => r,
+                    };
+                    return fail(r, &account.name);
                 }
             }
             Attempt::RateLimitedHop { retry_after } => {
@@ -254,6 +292,19 @@ pub async fn forward(ctx: &Ctx, mgr: &Manager, info: &ReqInfo, mut headers: Head
             }
         }
     }
+}
+
+/// Seconds to wait from a `retry-after` value: either delta-seconds or an
+/// HTTP-date (RFC 7231 IMF-fixdate, which RFC 2822 parsing covers). A date in
+/// the past still means "retry", so it clamps to one second. Anything else is
+/// `None` and the caller falls back to its default.
+fn parse_retry_after(v: &str, now: chrono::DateTime<chrono::Utc>) -> Option<i64> {
+    let v = v.trim();
+    if let Ok(secs) = v.parse::<i64>() {
+        return Some(secs);
+    }
+    let at = chrono::DateTime::parse_from_rfc2822(v).ok()?;
+    Some((at.with_timezone(&chrono::Utc) - now).num_seconds().max(1))
 }
 
 fn is_entitlement_denied(body: &[u8]) -> bool {
@@ -360,7 +411,8 @@ async fn attempt(ctx: &Ctx, mgr: &Manager, info: &ReqInfo, account: &Selected, h
         429 => {
             let hdr = |n: &str| res.headers().get(n).and_then(|v| v.to_str().ok()).map(str::to_string);
             let retry_after_hdr = hdr("retry-after");
-            let retry_after = retry_after_hdr.as_deref().and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(60);
+            let retry_after_parsed = retry_after_hdr.as_deref().and_then(|v| parse_retry_after(v, chrono::Utc::now()));
+            let retry_after = retry_after_parsed.unwrap_or(60);
             let (ctype, cf_ray, req_id) = (hdr("content-type"), hdr("cf-ray"), hdr("request-id"));
             let body_snip = {
                 let b = read_limited(res).await;
@@ -394,7 +446,7 @@ async fn attempt(ctx: &Ctx, mgr: &Manager, info: &ReqInfo, account: &Selected, h
                 rl,
                 body_snip
             );
-            let ra = match retry_after_hdr.as_deref().and_then(|v| v.trim().parse::<i64>().ok()) {
+            let ra = match retry_after_parsed {
                 Some(v) => v.clamp(1, 300) as u64,
                 None => HEADERLESS_429_PAUSE_SECONDS,
             };
@@ -530,12 +582,13 @@ async fn attempt(ctx: &Ctx, mgr: &Manager, info: &ReqInfo, account: &Selected, h
     }
 
     // Non-streaming: buffer (bounded by upstream), record usage, relay.
+    // A failed read is a failover like any other: the loop in `forward`
+    // reports the request's end once, either from the account that finally
+    // serves it or from `fail`. Reporting here as well counted the request
+    // twice in `requests_total`/`requests_failed` and logged two ✗ lines.
     let bytes = match tokio::time::timeout(body_idle_timeout() * 4, res.bytes()).await {
         Ok(Ok(b)) => b,
-        _ => {
-            ctx.notify_end(info, &account.name, 502, started.elapsed(), false);
-            return Attempt::Failover { reason: "upstream body read failed".into(), transient: true };
-        }
+        _ => return Attempt::Failover { reason: "upstream body read failed".into(), transient: true },
     };
     if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
         if let Some(u) = v.get("usage") {
@@ -641,6 +694,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn retry_after_seconds_or_http_date() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-09-15T10:00:00Z").unwrap().with_timezone(&chrono::Utc);
+        assert_eq!(parse_retry_after("42", now), Some(42));
+        assert_eq!(parse_retry_after(" 7 ", now), Some(7));
+        assert_eq!(parse_retry_after("Tue, 15 Sep 2026 10:01:30 GMT", now), Some(90));
+        assert_eq!(parse_retry_after("Tue, 15 Sep 2026 09:00:00 GMT", now), Some(1), "a date in the past still means retry");
+        assert_eq!(parse_retry_after("soon", now), None);
+        assert_eq!(parse_retry_after("", now), None);
+    }
+
+    #[test]
     fn usage_merge() {
         let mut acc = UsageAccumulator::default();
         let mut buf = Vec::new();
@@ -650,6 +714,23 @@ mod tests {
         assert_eq!(m["input_tokens"], 10);
         assert_eq!(m["output_tokens"], 42);
         assert_eq!(m["cache_read_input_tokens"], 5);
+    }
+
+    #[test]
+    fn multi_valued_headers_survive_filtering() {
+        let mut h = HeaderMap::new();
+        h.append("anthropic-beta", HeaderValue::from_static("one"));
+        h.append("anthropic-beta", HeaderValue::from_static("two"));
+        h.append("authorization", HeaderValue::from_static("Bearer x"));
+        h.append("content-length", HeaderValue::from_static("3"));
+        h.append("x-project", HeaderValue::from_static("p"));
+        let strip: HashSet<String> = ["x-project".to_string()].into_iter().collect();
+        let out = filter_request_headers(&h, &strip);
+        let betas: Vec<&str> = out.get_all("anthropic-beta").iter().map(|v| v.to_str().unwrap()).collect();
+        assert_eq!(betas, vec!["one", "two"]);
+        assert!(out.get("authorization").is_none());
+        assert!(out.get("content-length").is_none());
+        assert!(out.get("x-project").is_none());
     }
 
     #[test]

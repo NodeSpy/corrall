@@ -30,7 +30,10 @@ const KEY: &str = "tc-test-key-0123456789abcdef";
 #[derive(Debug, Clone)]
 struct Seen {
     path: String,
+    /// Last value of each header; see `header_values` for repeated lines.
     headers: HashMap<String, String>,
+    /// Every value of every header, in wire order.
+    header_values: HashMap<String, Vec<String>>,
     body: Value,
 }
 
@@ -86,6 +89,10 @@ async fn mock_handler(mock: Mock, req: Request<Incoming>) -> Result<Response<Moc
     let path = req.uri().path_and_query().map(|p| p.to_string()).unwrap_or_default();
     let is_upgrade = req.headers().get("upgrade").is_some();
     let headers: HashMap<String, String> = req.headers().iter().map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string())).collect();
+    let mut header_values: HashMap<String, Vec<String>> = HashMap::new();
+    for (k, v) in req.headers().iter() {
+        header_values.entry(k.as_str().to_string()).or_default().push(v.to_str().unwrap_or("").to_string());
+    }
     // Cloudflare fronts the real upstream and rejects a request that carries
     // `content-length` twice with a bare HTML 400, even when the values agree.
     // hyper would quietly accept that here, so refuse it the same way.
@@ -124,7 +131,7 @@ async fn mock_handler(mock: Mock, req: Request<Incoming>) -> Result<Response<Moc
     let tok = token_of(&headers);
     let behaviour = {
         let mut st = mock.state.lock().unwrap();
-        st.seen.push(Seen { path: path.clone(), headers: headers.clone(), body: body_json.clone() });
+        st.seen.push(Seen { path: path.clone(), headers: headers.clone(), header_values, body: body_json.clone() });
         st.behaviours.get_mut(&tok).and_then(|v| if v.is_empty() { None } else { Some(v.remove(0)) }).unwrap_or(Behaviour::Ok)
     };
     let cur = mock.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
@@ -388,6 +395,28 @@ async fn client_credentials_are_stripped_and_account_token_injected() {
     assert!(!h.contains_key("cookie"));
     let user_id = seen[0].body["metadata"]["user_id"].as_str().unwrap();
     assert!(user_id.contains("00000001-0000-0000-0000-000000000000"), "account_uuid rewritten: {user_id}");
+}
+
+/// Claude Code sends `anthropic-beta` as several header lines. The forward
+/// path used to rebuild the header map from `into_iter()`, whose second and
+/// later values of a repeated name come with no name, and dropped them.
+#[tokio::test]
+async fn repeated_request_headers_all_reach_upstream() {
+    let mock = spawn_mock().await;
+    let p = spawn_proxy(cfg_with(vec![account("a", "tok-a", 0, &mock.url())])).await;
+    let r = http()
+        .post(p.url("/v1/messages"))
+        .header("anthropic-beta", "interleaved-thinking-2025-05-14")
+        .header("anthropic-beta", "context-management-2025-06-27")
+        .json(&msg("claude-opus-5"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let seen = mock.seen();
+    assert_eq!(seen.len(), 1);
+    let betas = seen[0].header_values.get("anthropic-beta").cloned().unwrap_or_default();
+    assert_eq!(betas, vec!["interleaved-thinking-2025-05-14".to_string(), "context-management-2025-06-27".to_string()], "both lines forwarded, in order");
 }
 
 #[tokio::test]
@@ -728,6 +757,35 @@ async fn overloaded_upstream_takes_one_failover_hop() {
     assert_eq!(v["served_by"], "tok-b");
 }
 
+/// Every account answering 5xx is an upstream outage, not a quota exhaustion.
+/// With fewer accounts than the attempt cap the loop used to re-select, find
+/// nothing, and answer 429 `rate_limit_error` with a retry-after taken from
+/// the healthy accounts' 5h/7d reset (up to an hour), so clients backed off
+/// from a blip as if the fleet were spent.
+#[tokio::test]
+async fn every_account_overloaded_is_a_502_not_a_429() {
+    let mock = spawn_mock().await;
+    let p = spawn_proxy(cfg_with(vec![account("a", "tok-a", 0, &mock.url()), account("b", "tok-b", 1, &mock.url())])).await;
+    // Both accounts have healthy, far-off resets on record.
+    let _ = post(&p, "/v1/messages", msg("claude-opus-5")).await;
+    mock.queue("tok-a", Behaviour::ServerError);
+    mock.queue("tok-b", Behaviour::ServerError);
+    let (st, v, h) = post(&p, "/v1/messages", msg("claude-opus-5")).await;
+    assert_eq!(st, StatusCode::BAD_GATEWAY, "{v}");
+    assert_eq!(v["error"]["type"], "api_error");
+    assert!(h.get("retry-after").is_none(), "no reset-derived retry-after: {:?}", h.get("retry-after"));
+    let status = p.manager.status(false);
+    assert_eq!(status["accounts"][0]["status"], "active", "a 5xx does not throttle the account");
+    assert_eq!(status["accounts"][1]["status"], "active");
+    // A quota-held sibling still yields the 429 with its recovery time.
+    mock.queue("tok-a", Behaviour::QuotaRejected { retry_after: 300 });
+    mock.queue("tok-b", Behaviour::ServerError);
+    let (st, _, h) = post(&p, "/v1/messages", msg("claude-opus-5")).await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS);
+    let ra: u64 = h.get("retry-after").unwrap().to_str().unwrap().parse().unwrap();
+    assert!((250..=300).contains(&ra), "retry-after {ra} comes from a's throttle");
+}
+
 #[tokio::test]
 async fn all_exhausted_returns_429_with_retry_after_then_hold_waits() {
     let mock = spawn_mock().await;
@@ -872,6 +930,30 @@ async fn codex_requests_use_codex_pool_only() {
     assert_eq!(v["served_by"], "tok-a", "Anthropic requests never land on the Codex account");
 }
 
+/// The `/tc-acct/<pin>/` prefix was stripped from the query string the proxy
+/// forwards but not from the path it routes on, so a pinned Codex request
+/// looked like an Anthropic one and the Codex account was refused as "other
+/// provider".
+#[tokio::test]
+async fn path_pin_is_stripped_before_provider_routing() {
+    let mock = spawn_mock().await;
+    let mut codex = account("cx", "tok-cx", 0, &mock.url());
+    codex.provider = Some("codex".into());
+    codex.account_id = Some("acct_9".into());
+    let p = spawn_proxy(cfg_with(vec![account("a", "tok-a", 0, &mock.url()), codex])).await;
+    let (st, v, _) = post(&p, "/tc-acct/cx/backend-api/codex/responses", json!({ "model": "gpt-5", "input": "hi" })).await;
+    assert_eq!(st, 200, "{v}");
+    let seen = mock.seen();
+    let last = seen.last().unwrap();
+    assert_eq!(last.headers.get("authorization").unwrap(), "Bearer tok-cx", "the pinned Codex account served it");
+    assert_eq!(last.path, "/backend-api/codex/responses", "upstream never sees the pin");
+    // The Anthropic pin still works and keeps its query string.
+    let (st, v, _) = post(&p, "/tc-acct/a/v1/messages?beta=true", msg("claude-opus-5")).await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(v["served_by"], "tok-a");
+    assert_eq!(mock.seen().last().unwrap().path, "/v1/messages?beta=true");
+}
+
 #[tokio::test]
 async fn usage_dimensions_are_consumed_and_attributed() {
     let mock = spawn_mock().await;
@@ -930,6 +1012,21 @@ async fn mitm_connect_intercepts_with_local_ca_and_refuses_blind_tunnels() {
     assert_eq!(v["served_by"], "tok-a", "intercepted CONNECT went through account selection");
     let blind = client.get("https://example.com/").send().await;
     assert!(blind.is_err(), "blind tunnels are off by default");
+
+    // With `mitm.http1Only` off the tunnel offers `h2` in ALPN; an h2-capable
+    // client takes it, and the proxy has to actually serve HTTP/2 on that
+    // stream rather than answer the first frame with an HTTP/1.1 parse error.
+    let mut cfg2 = cfg_with(vec![account("a", "tok-a", 0, &mock.url())]);
+    cfg2.upstream = mock.url();
+    cfg2.mitm.http1_only = false;
+    let p2 = spawn_proxy(cfg2).await;
+    let cert = reqwest::Certificate::from_pem(&ca).unwrap();
+    let h2 = reqwest::Client::builder().proxy(reqwest::Proxy::all(p2.url("")).unwrap()).add_root_certificate(cert).use_rustls_tls().build().unwrap();
+    let r = h2.post("https://api.anthropic.com/v1/messages").json(&msg("claude-opus-5")).send().await.unwrap();
+    assert_eq!(r.version(), reqwest::Version::HTTP_2, "the client negotiated h2 inside the tunnel");
+    assert_eq!(r.status(), 200);
+    let v: Value = r.json().await.unwrap();
+    assert_eq!(v["served_by"], "tok-a", "an h2 request inside the tunnel is served");
 }
 
 // The management control routes: per-account enable/disable/priority, pool
@@ -1061,13 +1158,14 @@ async fn abandoned_requests_report_completion() {
     let p = spawn_proxy(cfg_with(vec![account("a", "tok-a", 0, &mock.url())])).await;
     mock.queue("tok-a", Behaviour::Hang { ms: 6_000 });
     let mut rx = p.ctx.activity.subscribe();
-    let (st, _, _) = post(&p, "/v1/messages", msg("claude-sonnet-4-6")).await;
-    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "the only account timed out and nothing else could serve it");
+    let (st, _, h) = post(&p, "/v1/messages", msg("claude-sonnet-4-6")).await;
+    assert_eq!(st, StatusCode::GATEWAY_TIMEOUT, "the only account timed out and nothing else could serve it");
+    assert!(h.get("retry-after").is_none(), "a timeout is not a quota exhaustion");
     let mut ended = None;
     while let Ok(a) = rx.try_recv() {
         if let corrall::proxy::server::Activity::End { account, status, ok, .. } = a {
             ended = Some((account, status, ok));
         }
     }
-    assert_eq!(ended, Some(("a".to_string(), 429, false)));
+    assert_eq!(ended, Some(("a".to_string(), 504, false)));
 }

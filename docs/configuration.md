@@ -123,7 +123,7 @@ directory, for a wrapper resolving a project it has not entered yet.
 | `proxy.maxBodyBytes` | `67108864` | Largest client request body accepted |
 | `upstream` | `https://api.anthropic.com` | Upstream base URL. Must be https unless loopback |
 | `switchThreshold` | `0.98` | Number, or table `{ "default": 0.98, "unified7d": 0.9, … }` keyed by bucket |
-| `holdSeconds` | `0` | Hold a request this long when all accounts are exhausted instead of returning 429 |
+| `holdSeconds` | `0` | Hold a request this long when no account can take it, instead of answering at once (429 when the fleet is spent, 502/504 when every account failed; see [When nothing can serve](#when-nothing-can-serve)) |
 | `distributeSessions` | `false` | Spread new sessions across equal-priority accounts, pinned per weekly bucket |
 | `quotaProbeSeconds` | `0` | Background zero-spend usage probe interval (min 30) |
 | `eventLogging` | `hide` | Claude Code telemetry: `hide` (forward, not shown), `block` (answer 200 locally), `show` |
@@ -133,8 +133,8 @@ directory, for a wrapper resolving a project it has not entered yet.
 | `expiryRouting` | off | `{ "enabled", "tolerance": 1.5, "preempt": true }`: rank the top priority tier by headroom ÷ seconds-to-reset of the governing weekly bucket, keep accounts within `tolerance` of the best, and with `preempt` re-rank the sticky/pinned account when its window rolls over |
 | `warmupSeconds` | `0` | Keep-warm interval (min 60). Spawns `claude -p --bare --model haiku` per idle account through this proxy; spends a little quota |
 | `sessionTitles` | off | `{ "enabled", "width": 18, "projectsDir"? }`: label activity rows with the Claude Code session title read from `~/.claude/projects` |
-| `mitm.http1Only` | `true` | Offer only HTTP/1.1 inside the intercepted tunnel (needed for WebSocket / Remote Control) |
-| `mitm.allowTunnel` | `false` | Allow blind CONNECT tunnels to non-intercepted hosts (port 443, public addresses only). `platform.claude.com`, `mcp-proxy.anthropic.com` and `*.mcp.claude.com` are tunnelled regardless, see [claude.ai connectors](#claudeai-connectors) |
+| `mitm.http1Only` | `true` | Offer only HTTP/1.1 inside the intercepted tunnel (needed for WebSocket / Remote Control). With `false` the tunnel also offers `h2` and serves whichever the client negotiates |
+| `mitm.allowTunnel` | `false` | Allow blind CONNECT tunnels to non-intercepted hosts (port 443, public addresses only: the name is resolved first and refused if any answer is loopback, private, link-local or the metadata address). `platform.claude.com`, `mcp-proxy.anthropic.com` and `*.mcp.claude.com` are tunnelled regardless, see [claude.ai connectors](#claudeai-connectors) |
 | `mitm.tunnelAllow` | `[]` | Explicit `host` or `host:port` allow-list for blind tunnels |
 | `logDir` | unset | One file per request. Directory 0700, files 0600 |
 | `logLevel` | `body` | `body`, `headers`, or `off` |
@@ -276,6 +276,19 @@ what Claude Code does with its own login:
 its point is the mode rather than authentication; in MITM mode the proxy
 strips the header it produces. A hand-written `settings.json` picks either
 form the same way: the `env` block above, or `"ANTHROPIC_API_KEY": "tc-…"`.
+
+## When nothing can serve
+
+Two different situations end with no account for a request, and they are
+answered differently. A **spent fleet**, where every eligible account is held
+back by quota or a rate limit, gets a 429 `rate_limit_error` with a
+`retry-after` taken from the soonest of those accounts' recoveries (their
+throttle, or their 5h/7d reset, at most 3600 s). A **failing upstream**, where
+every eligible account was tried and answered 5xx or timed out, gets a 502
+`api_error` (504 when every failure was a timeout) with no `retry-after`: those
+accounts are healthy, and their quota resets say nothing about when the upstream
+will answer again. `holdSeconds` holds either case for its duration and retries
+the whole fleet before answering.
 
 ## Per-minute 429s
 

@@ -275,10 +275,12 @@ pub struct Selected {
 #[derive(Debug)]
 pub enum Selection {
     Account(Selected),
-    /// No account can take this request now; `retry_after_secs` is the soonest
-    /// known recovery.
+    /// No account can take this request now. `retry_after_secs` is the
+    /// soonest known recovery of an account held back by quota or a rate
+    /// limit; it is `None` when no account is in that state, which is the case
+    /// when every eligible account was tried by the caller and failed.
     Exhausted {
-        retry_after_secs: u64,
+        retry_after_secs: Option<u64>,
         reason: String,
     },
     /// A pinned account exists but cannot serve.
@@ -460,6 +462,7 @@ impl Manager {
                     let mut a = f.accounts.remove(pos);
                     a.name = c.name.clone();
                     a.priority = c.priority;
+                    let re_enabled = a.disabled && !c.disabled;
                     a.disabled = c.disabled;
                     a.upstream = c.upstream.clone();
                     a.model_map = c.model_map.clone().unwrap_or_default();
@@ -471,12 +474,18 @@ impl Manager {
                     a.email = c.email.clone().or(a.email);
                     a.account_id = c.account_id.clone().or(a.account_id);
                     a.import_from = c.import_from.clone();
-                    // Take on-disk tokens when they differ from what we hold: a
-                    // re-login elsewhere rotated them. Keep ours otherwise (we may
-                    // have refreshed more recently than the file).
+                    // Take the on-disk credential when it differs from what we
+                    // hold: a re-login or a rotated API key. An OAuth pair we
+                    // refreshed more recently than the file (a later expiry) is
+                    // kept. A new credential also lifts an error state, since
+                    // the error was about the old one; an unchanged credential
+                    // does not, or a 401-dead key would be retried on every
+                    // reload and die again.
                     let mut fresh = a.clone();
                     fresh.apply_credentials(c);
-                    if fresh.credential.is_some() && fresh.refresh_token != a.refresh_token && fresh.expires_at.unwrap_or(0) >= a.expires_at.unwrap_or(0) {
+                    let changed = fresh.credential.is_some() && (fresh.credential != a.credential || fresh.refresh_token != a.refresh_token);
+                    let not_older = fresh.expires_at.unwrap_or(0) >= a.expires_at.unwrap_or(0);
+                    if changed && (a.credential.is_none() || not_older) {
                         a.credential = fresh.credential;
                         a.refresh_token = fresh.refresh_token;
                         a.expires_at = fresh.expires_at;
@@ -484,13 +493,11 @@ impl Manager {
                             a.status = Status::Active;
                             a.error_message = None;
                         }
-                    } else if a.credential.is_none() {
-                        a.credential = fresh.credential;
-                        a.refresh_token = fresh.refresh_token;
-                        a.expires_at = fresh.expires_at;
                     }
-                    if !a.disabled && a.status == Status::Error && a.dead_refresh_token.is_none() {
+                    // Re-enabling is the operator's explicit "try it again".
+                    if re_enabled && a.status == Status::Error && a.dead_refresh_token.is_none() {
                         a.status = Status::Active;
+                        a.error_message = None;
                     }
                     next.push(a);
                 } else {
@@ -1406,6 +1413,20 @@ impl Fleet {
         }
     }
 
+    /// The storm ramp guards a cold account against a burst. In distribute
+    /// mode a new session lands on the least-loaded account, which is usually
+    /// one already serving other sessions; restarting its ramp on every new
+    /// session throttled a warm account back to `startConc` each time. Ramp
+    /// only an account that is idle and has no ramp running.
+    fn ramp_if_cold(&mut self, id: &str, now: i64) {
+        let active_sessions = self.sessions.stats(now).per_account_active.get(id).copied().unwrap_or(0);
+        if let Some(a) = self.account_mut(id) {
+            if a.ramp_started_at.is_none() && a.in_flight == 0 && active_sessions == 0 {
+                a.ramp_started_at = Some(now);
+            }
+        }
+    }
+
     fn set_current(&mut self, id: &str, now: i64, mgr: &Manager, scoped: bool) {
         let switched = self.current.as_deref() != Some(id);
         if !scoped {
@@ -1491,7 +1512,7 @@ impl Fleet {
                     if self.current.is_none() {
                         self.set_current(&id, now, mgr, false);
                     } else {
-                        self.begin_ramp(&id, now);
+                        self.ramp_if_cold(&id, now);
                     }
                     if let Some(s) = self.snapshot(self.account(&id).unwrap()) {
                         return Selection::Account(s);
@@ -1600,8 +1621,14 @@ impl Fleet {
         Selection::Exhausted { retry_after_secs: retry, reason }
     }
 
-    fn exhausted_info(&self, req: &SelectRequest, now: i64) -> (u64, String) {
+    /// Why nothing can serve, and when to retry. Only accounts held back by
+    /// quota or a rate limit contribute a reset: an account the caller merely
+    /// tried (and got a 5xx or a timeout from) is healthy, and its own 5h/7d
+    /// reset says nothing about when the upstream will answer again. Using it
+    /// turned two overloaded siblings into a 429 with `retry-after: 3600`.
+    fn exhausted_info(&self, req: &SelectRequest, now: i64) -> (Option<u64>, String) {
         let mut soonest: Option<i64> = None;
+        let mut quota_bound = false;
         let mut parts = Vec::new();
         for a in &self.accounts {
             if let Some(p) = req.provider {
@@ -1609,8 +1636,14 @@ impl Fleet {
                     continue;
                 }
             }
-            let reason = self.unavailable_reason(a, req.model, req.advisor_model, now).unwrap_or_else(|| "tried".into());
-            parts.push(format!("{}: {}", a.name, reason));
+            let reason = self.unavailable_reason(a, req.model, req.advisor_model, now);
+            let held_back =
+                reason.as_deref().map(|r| matches!(unavailable_key(r), "throttled" | "capped" | "advisor-capped" | "quota" | "advisor-quota")).unwrap_or(false);
+            parts.push(format!("{}: {}", a.name, reason.unwrap_or_else(|| "tried".into())));
+            if !held_back {
+                continue;
+            }
+            quota_bound = true;
             let r = a.rate_limited_until.or_else(|| a.quota.soonest_reset());
             if let Some(r) = r {
                 if r > now && soonest.map(|s| r < s).unwrap_or(true) {
@@ -1618,7 +1651,7 @@ impl Fleet {
                 }
             }
         }
-        let secs = soonest.map(|s| ((s - now) / 1000).clamp(5, 3600) as u64).unwrap_or(60);
+        let secs = if quota_bound { Some(soonest.map(|s| ((s - now) / 1000).clamp(5, 3600) as u64).unwrap_or(60)) } else { None };
         (secs, parts.join("; "))
     }
 
@@ -1974,6 +2007,47 @@ mod tests {
         assert_eq!(select_name(&m, None).as_deref(), Some("c"));
     }
 
+    /// With `distributeSessions` every new session re-ran the account's storm
+    /// ramp, so a warm account serving many sessions was throttled back to
+    /// `startConc` each time one began. A running or finished ramp is left
+    /// alone; only an idle account with no ramp gets one.
+    #[test]
+    fn new_session_does_not_restart_the_ramp_on_a_warm_account() {
+        let mut cfg = cfg_with(vec![acct("a", 0)]);
+        pool_of(&mut cfg).distribute_sessions = true;
+        let m = mgr(&cfg);
+        let id = m.account_ids()[0].0.clone();
+        let sel = |sid: &str| m.select(&SelectRequest { session_id: Some(sid), allow_probe: true, ..Default::default() });
+        assert!(matches!(sel("11111111-1111-1111-1111-111111111111"), Selection::Account(_)));
+        m.record_session(Some("11111111-1111-1111-1111-111111111111"), &id, None);
+        let an_hour_ago = now_ms() - 3_600_000;
+        m.with(|f| f.account_mut(&id).unwrap().ramp_started_at = Some(an_hour_ago));
+        assert!(matches!(sel("22222222-2222-2222-2222-222222222222"), Selection::Account(_)));
+        m.with(|f| assert_eq!(f.account(&id).unwrap().ramp_started_at, Some(an_hour_ago), "ramp not restarted for the same account"));
+        // A finished ramp on an account still carrying an active session is
+        // not restarted either; it is warm.
+        m.with(|f| f.account_mut(&id).unwrap().ramp_started_at = None);
+        assert!(matches!(sel("33333333-3333-3333-3333-333333333333"), Selection::Account(_)));
+        m.with(|f| assert_eq!(f.account(&id).unwrap().ramp_started_at, None, "warm account: no new ramp"));
+
+        // A second, idle account does get a ramp when its first session lands.
+        let mut cfg = cfg_with(vec![acct("a", 0), acct("b", 0)]);
+        pool_of(&mut cfg).distribute_sessions = true;
+        let m = mgr(&cfg);
+        let ids = m.account_ids();
+        let sel = |sid: &str| match m.select(&SelectRequest { session_id: Some(sid), allow_probe: true, ..Default::default() }) {
+            Selection::Account(s) => s.id,
+            other => panic!("{other:?}"),
+        };
+        let first = sel("11111111-1111-1111-1111-111111111111");
+        m.record_session(Some("11111111-1111-1111-1111-111111111111"), &first, None);
+        let other = ids.iter().map(|(i, _)| i.clone()).find(|i| *i != first).unwrap();
+        m.with(|f| assert_eq!(f.account(&other).unwrap().ramp_started_at, None));
+        let second = sel("22222222-2222-2222-2222-222222222222");
+        assert_eq!(second, other, "new session spreads to the idle account");
+        m.with(|f| assert!(f.account(&other).unwrap().ramp_started_at.is_some(), "an idle account ramps up"));
+    }
+
     #[tokio::test]
     async fn probe_refresh_never_disables_account() {
         // A refresh token already known dead. The fast path in ensure_token_fresh
@@ -2035,7 +2109,39 @@ mod tests {
         // probe allowed once
         assert!(select_name(&m, None).is_some());
         match m.select(&SelectRequest { allow_probe: true, ..Default::default() }) {
-            Selection::Exhausted { retry_after_secs, .. } => assert!(retry_after_secs >= 5),
+            Selection::Exhausted { retry_after_secs, .. } => assert!(retry_after_secs.unwrap() >= 5),
+            other => panic!("expected exhausted, got {other:?}"),
+        }
+    }
+
+    /// Two healthy accounts the caller already tried (upstream 5xx or a
+    /// timeout) are not a quota exhaustion: no reset-derived retry-after.
+    #[test]
+    fn exhaustion_after_transient_failures_carries_no_reset() {
+        let cfg = cfg_with(vec![acct("a", 0), acct("b", 0)]);
+        let m = mgr(&cfg);
+        let ids = m.account_ids();
+        m.with(|f| {
+            for (id, _) in &ids {
+                let a = f.account_mut(id).unwrap();
+                a.quota.unified5h.utilization = Some(0.3);
+                a.quota.unified5h.reset_at = Some(now_ms() + 3_600_000 * 4);
+                a.quota.unified7d.utilization = Some(0.3);
+                a.quota.unified7d.reset_at = Some(now_ms() + 86_400_000 * 6);
+            }
+        });
+        let exclude: HashSet<String> = ids.iter().map(|(id, _)| id.clone()).collect();
+        match m.select(&SelectRequest { exclude: exclude.clone(), allow_probe: true, ..Default::default() }) {
+            Selection::Exhausted { retry_after_secs, reason } => {
+                assert_eq!(retry_after_secs, None, "{reason}");
+                assert!(reason.contains("a: tried") && reason.contains("b: tried"), "{reason}");
+            }
+            other => panic!("expected exhausted, got {other:?}"),
+        }
+        // Once one of them is genuinely rate-limited its recovery is the answer.
+        m.with(|f| f.account_mut(&ids[1].0).unwrap().rate_limited_until = Some(now_ms() + 120_000));
+        match m.select(&SelectRequest { exclude, allow_probe: true, ..Default::default() }) {
+            Selection::Exhausted { retry_after_secs, .. } => assert!((100..=130).contains(&retry_after_secs.unwrap())),
             other => panic!("expected exhausted, got {other:?}"),
         }
     }
@@ -2071,5 +2177,72 @@ mod tests {
         let cfg = cfg_with(vec![a]);
         let m = mgr(&cfg);
         assert!(select_name(&m, None).is_none());
+    }
+
+    fn apikey_cfg(key: &str) -> Config {
+        let mut c = cfg_with(vec![AccountConfig { name: "k".into(), kind: AccountType::Apikey, api_key: Some(key.into()), ..Default::default() }]);
+        // Same id across reloads, as `ensure_account_ids` on a saved file gives.
+        pool_of(&mut c).accounts[0].id = Some("acct-k".into());
+        c
+    }
+
+    /// A rotated API key (no refresh token to compare) must be picked up by a
+    /// reload, and only a changed credential clears a 401 error: an unchanged
+    /// dead key retried on every reload just dies again.
+    #[test]
+    fn reload_applies_a_rotated_api_key_and_clears_the_error_only_then() {
+        let m = mgr(&apikey_cfg("sk-old"));
+        let id = m.account_ids()[0].0.clone();
+        assert_eq!(m.credential_of(&id).as_deref(), Some("sk-old"));
+
+        m.mark_error(&id, "upstream rejected the API key (401)");
+        m.sync_config(&apikey_cfg("sk-old"), crate::config::DEFAULT_POOL);
+        m.with(|f| {
+            let a = f.account(&id).unwrap();
+            assert_eq!(a.status, Status::Error, "same key: still dead");
+            assert!(a.error_message.is_some());
+        });
+
+        // Disabling and re-enabling is the operator's explicit retry.
+        let mut off = apikey_cfg("sk-old");
+        pool_of(&mut off).accounts[0].disabled = true;
+        m.sync_config(&off, crate::config::DEFAULT_POOL);
+        m.with(|f| assert_eq!(f.account(&id).unwrap().status, Status::Error));
+        m.sync_config(&apikey_cfg("sk-old"), crate::config::DEFAULT_POOL);
+        m.with(|f| assert_eq!(f.account(&id).unwrap().status, Status::Active, "re-enabled: retried"));
+
+        m.mark_error(&id, "upstream rejected the API key (401)");
+        m.sync_config(&apikey_cfg("sk-new"), crate::config::DEFAULT_POOL);
+        assert_eq!(m.credential_of(&id).as_deref(), Some("sk-new"));
+        m.with(|f| {
+            let a = f.account(&id).unwrap();
+            assert_eq!(a.status, Status::Active, "a new key lifts the error");
+            assert!(a.error_message.is_none());
+        });
+    }
+
+    /// An OAuth access token rotated on disk with the same refresh token is
+    /// taken too, while a pair we refreshed more recently than the file is kept.
+    #[test]
+    fn reload_takes_a_newer_access_token_and_keeps_our_fresher_one() {
+        let mut base = acct("a", 0);
+        base.id = Some("acct-a".into());
+        let m = mgr(&cfg_with(vec![base.clone()]));
+        let id = m.account_ids()[0].0.clone();
+
+        let mut rotated = base.clone();
+        rotated.access_token = Some("tok2".into());
+        rotated.expires_at = Some(base.expires_at.unwrap() + 60_000);
+        m.sync_config(&cfg_with(vec![rotated]), crate::config::DEFAULT_POOL);
+        assert_eq!(m.credential_of(&id).as_deref(), Some("tok2"));
+
+        // We refreshed in memory after the file was written: keep ours.
+        m.with(|f| {
+            let a = f.account_mut(&id).unwrap();
+            a.credential = Some("tok3".into());
+            a.expires_at = Some(now_ms() + 7_200_000);
+        });
+        m.sync_config(&cfg_with(vec![base]), crate::config::DEFAULT_POOL);
+        assert_eq!(m.credential_of(&id).as_deref(), Some("tok3"));
     }
 }
