@@ -47,6 +47,7 @@ enum Behaviour {
     QuotaRejected { retry_after: u64 },
     FamilyRejected,
     RateLimited { retry_after: u64 },
+    RateLimitedNoHeader,
     Unauthorized,
     ServerError,
     EntitlementDenied,
@@ -85,6 +86,17 @@ async fn mock_handler(mock: Mock, req: Request<Incoming>) -> Result<Response<Moc
     let path = req.uri().path_and_query().map(|p| p.to_string()).unwrap_or_default();
     let is_upgrade = req.headers().get("upgrade").is_some();
     let headers: HashMap<String, String> = req.headers().iter().map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string())).collect();
+    // Cloudflare fronts the real upstream and rejects a request that carries
+    // `content-length` twice with a bare HTML 400, even when the values agree.
+    // hyper would quietly accept that here, so refuse it the same way.
+    if req.headers().get_all("content-length").iter().count() > 1 {
+        let r = Response::builder()
+            .status(400)
+            .header("content-type", "text/html")
+            .body(Full::new(Bytes::from_static(b"<html><head><title>400 Bad Request</title></head><body><center><h1>400 Bad Request</h1></center><hr><center>cloudflare</center></body></html>")).boxed())
+            .unwrap();
+        return Ok(r);
+    }
     if is_upgrade {
         // Answer a WebSocket-style 101; the test then talks raw bytes.
         tokio::spawn(async move {
@@ -177,6 +189,10 @@ async fn mock_handler(mock: Mock, req: Request<Incoming>) -> Result<Response<Moc
         Behaviour::RateLimited { retry_after } => base(429)
             .header("retry-after", retry_after.to_string())
             .body(Full::new(Bytes::from(r#"{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}"#)))
+            .unwrap(),
+        Behaviour::RateLimitedNoHeader => base(429)
+            .header("content-type", "text/html")
+            .body(Full::new(Bytes::from("<html><head><title>429 Too Many Requests</title></head><body>cloudflare</body></html>")))
             .unwrap(),
         Behaviour::Unauthorized => Response::builder()
             .status(401)
@@ -399,6 +415,50 @@ async fn quota_rejection_rotates_but_rate_limit_retries_same_account() {
 }
 
 #[tokio::test]
+async fn headerless_429_pauses_briefly_and_retries_the_same_account() {
+    let mock = spawn_mock().await;
+    let p = spawn_proxy(cfg_with(vec![account("a", "tok-a", 0, &mock.url()), account("b", "tok-b", 0, &mock.url())])).await;
+    // No retry-after: a short pause on the same account, not a 60s mark and a
+    // hop that would have marked b too.
+    mock.queue("tok-a", Behaviour::RateLimitedNoHeader);
+    let started = std::time::Instant::now();
+    let (st, v, _) = post(&p, "/v1/messages", msg("claude-opus-5")).await;
+    assert_eq!(st, 200);
+    assert_eq!(v["served_by"], "tok-a", "no failover onto b");
+    let took = started.elapsed();
+    assert!(took >= Duration::from_secs(4) && took < Duration::from_secs(20), "a short pause: {took:?}");
+    let seen = mock.seen();
+    assert_eq!(seen.len(), 2, "one 429 then one retry");
+    assert!(seen.iter().all(|s| token_of(&s.headers) == "tok-a"));
+    let status = p.manager.status(false);
+    assert_eq!(status["accounts"][1]["status"], "active", "b was never touched");
+}
+
+#[tokio::test]
+async fn two_rate_limited_accounts_in_a_row_stop_the_cascade() {
+    let mock = spawn_mock().await;
+    let p =
+        spawn_proxy(cfg_with(vec![account("a", "tok-a", 0, &mock.url()), account("b", "tok-b", 0, &mock.url()), account("c", "tok-c", 0, &mock.url())])).await;
+    // A long retry-after hops once; a second rate-limited account means the
+    // limit follows the request, so c is left alone and the client gets the
+    // upstream retry-after.
+    mock.queue("tok-a", Behaviour::RateLimited { retry_after: 60 });
+    mock.queue("tok-b", Behaviour::RateLimited { retry_after: 60 });
+    let (st, _, h) = post(&p, "/v1/messages", msg("claude-opus-5")).await;
+    assert_eq!(st, 429);
+    assert_eq!(h.get("retry-after").unwrap(), "60");
+    let seen = mock.seen();
+    assert_eq!(seen.len(), 2, "a and b were tried, c was not");
+    assert!(seen.iter().all(|s| token_of(&s.headers) != "tok-c"));
+    let status = p.manager.status(false);
+    assert_eq!(status["accounts"][2]["status"], "active", "c stays available to everyone else");
+    // Anyone else is served by c meanwhile.
+    let (st, v, _) = post(&p, "/v1/messages", msg("claude-opus-5")).await;
+    assert_eq!(st, 200);
+    assert_eq!(v["served_by"], "tok-c");
+}
+
+#[tokio::test]
 async fn family_rejection_diverts_only_that_family() {
     let mock = spawn_mock().await;
     let p = spawn_proxy(cfg_with(vec![account("a", "tok-a", 0, &mock.url()), account("b", "tok-b", 0, &mock.url())])).await;
@@ -522,6 +582,65 @@ async fn oauth_token_refresh_passthrough_keeps_client_credentials() {
     assert_eq!(seen[0].path, "/v1/oauth/token");
     assert_eq!(seen[0].headers.get("authorization").unwrap(), "Bearer CLIENT-OWN");
     assert!(!seen[0].headers.contains_key("x-api-key"), "the proxy key never leaves");
+}
+
+#[tokio::test]
+async fn connector_list_is_passthrough_with_the_clients_own_login() {
+    let mock = spawn_mock().await;
+    let mut cfg = cfg_with(vec![account("a", "tok-a", 0, &mock.url())]);
+    cfg.upstream = mock.url();
+    let p = spawn_proxy(cfg).await;
+    // Claude Code lists the connectors authorised on claude.ai with its own
+    // login token. Rotating that onto an account would answer with someone
+    // else's connectors, so the request goes through untouched.
+    for path in ["/v1/mcp_servers?limit=1000", "/api/organizations/org_1/mcp/start-auth/srv_1"] {
+        let r = http()
+            .get(p.url(path))
+            .header("authorization", "Bearer CLIENT-OWN")
+            .header("x-corrall-key", KEY)
+            .header("anthropic-beta", "mcp-client-2025-04-04")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "{path}");
+    }
+    let seen = mock.seen();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[0].path, "/v1/mcp_servers?limit=1000", "the query survives");
+    for s in &seen {
+        assert_eq!(s.headers.get("authorization").unwrap(), "Bearer CLIENT-OWN", "{}", s.path);
+        assert_eq!(s.headers.get("anthropic-beta").unwrap(), "mcp-client-2025-04-04");
+        assert!(!s.headers.contains_key("x-corrall-key"), "the proxy key never leaves");
+    }
+}
+
+#[tokio::test]
+async fn proxy_key_header_authenticates_and_is_stripped() {
+    let mock = spawn_mock().await;
+    let p = spawn_proxy(cfg_with(vec![account("a", "tok-a", 0, &mock.url())])).await;
+    let c = http();
+    // The header form of the key: what `corrall env` hands Claude Code through
+    // ANTHROPIC_CUSTOM_HEADERS so ANTHROPIC_API_KEY can stay unset.
+    let keyed = c.get(p.url("/corrall/status")).header("host", "attacker.example").header("x-corrall-key", KEY).send().await.unwrap();
+    assert_eq!(keyed.status(), 200, "the header key works regardless of Host");
+    let wrong = c.get(p.url("/corrall/status")).header("host", "attacker.example").header("x-corrall-key", "nope").send().await.unwrap();
+    assert_eq!(wrong.status(), 401);
+    mock.queue("tok-a", Behaviour::Ok);
+    let r = c
+        .post(p.url("/v1/messages"))
+        .header("host", "attacker.example")
+        .header("x-corrall-key", KEY)
+        .header("authorization", "Bearer sk-ant-oat01-CLIENT-LOGIN")
+        .json(&msg("claude-opus-5"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let seen = mock.seen();
+    let last = seen.last().unwrap();
+    assert_eq!(last.path, "/v1/messages");
+    assert_eq!(token_of(&last.headers), "tok-a", "the account token is injected");
+    assert!(!last.headers.contains_key("x-corrall-key"), "the proxy key never leaves");
 }
 
 #[tokio::test]
