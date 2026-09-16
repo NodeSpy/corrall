@@ -1805,6 +1805,19 @@ pub fn service(cmd: ServiceCmd) -> Result<()> {
     }
 }
 
+/// The API host `corrall api` may send this account's credential to. A Codex
+/// account is `kind: oauth` like an Anthropic one but its bearer token is an
+/// OpenAI credential; it must never travel to an Anthropic host.
+fn api_base_for(a: &AccountConfig) -> Result<&'static str> {
+    if a.is_codex() {
+        bail!(
+            "\"{}\" is a Codex (OpenAI) account; `corrall api` only calls the Anthropic API and will not send its token there. Pick an Anthropic account with --account",
+            a.name
+        );
+    }
+    Ok("https://api.anthropic.com")
+}
+
 pub async fn api(path: String, account: Option<String>, pool: Option<String>) -> Result<()> {
     let cfg = Config::load()?.ok_or_else(|| anyhow!("no config yet"))?;
     crate::upstream::init(&cfg)?;
@@ -1824,6 +1837,9 @@ pub async fn api(path: String, account: Option<String>, pool: Option<String>) ->
         }
     };
     let a = &cfg.pool(&owner).expect("located pool exists").accounts[idx];
+    // Before any token is fetched or sent: the host is fixed, so the account
+    // has to be one whose credential belongs there.
+    let base = api_base_for(a)?;
     let m = crate::manager::Manager::new(&cfg, &owner);
     let id = a.id.clone().unwrap_or_default();
     let cred = m
@@ -1831,7 +1847,7 @@ pub async fn api(path: String, account: Option<String>, pool: Option<String>) ->
         .await
         .or_else(|| a.api_key.clone())
         .ok_or_else(|| anyhow!("no credential for {}", a.name))?;
-    let mut req = crate::upstream::client().get(format!("https://api.anthropic.com{path}"));
+    let mut req = crate::upstream::client().get(format!("{base}{path}"));
     req = match a.kind {
         AccountType::Oauth => req.bearer_auth(cred).header("anthropic-beta", oauth::USAGE_BETA),
         AccountType::Apikey => req.header("x-api-key", cred),
@@ -1993,6 +2009,27 @@ mod tests {
         assert_eq!(i, 1);
         assert_eq!(cfg2.pools[&pool].accounts[1].access_token.as_deref(), Some("other-access"));
         assert_eq!(cfg2.pools[&pool].accounts[0].access_token.as_deref(), Some("acme-access"));
+    }
+
+    /// A Codex account is `kind: oauth` with `provider: codex`; matching on the
+    /// kind alone would hand its OpenAI bearer token to api.anthropic.com.
+    #[test]
+    fn corrall_api_refuses_a_codex_account_before_any_request() {
+        let codex = AccountConfig {
+            name: "codex".into(),
+            kind: AccountType::Oauth,
+            provider: Some("codex".into()),
+            access_token: Some("sk-oa".into()),
+            ..Default::default()
+        };
+        let err = api_base_for(&codex).unwrap_err().to_string();
+        assert!(err.contains("Codex"), "{err}");
+        assert!(err.contains("codex"), "names the account: {err}");
+
+        let anthropic = AccountConfig { name: "me".into(), kind: AccountType::Oauth, ..Default::default() };
+        assert_eq!(api_base_for(&anthropic).unwrap(), "https://api.anthropic.com");
+        let key = AccountConfig { name: "key".into(), kind: AccountType::Apikey, ..Default::default() };
+        assert_eq!(api_base_for(&key).unwrap(), "https://api.anthropic.com");
     }
 
     /// `env` configures a client on this machine, so it emits an address that
