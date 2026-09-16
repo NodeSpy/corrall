@@ -181,8 +181,24 @@ impl Ctx {
     }
 }
 
-pub async fn run(ctx: Ctx, bind: SocketAddr, mut shutdown: tokio::sync::watch::Receiver<bool>) -> Result<()> {
-    let listener = TcpListener::bind(bind).await.with_context(|| format!("binding {bind}"))?;
+/// Bind the proxy's listener. Done before anything else starts so a port
+/// already held (by another corrall, most often) fails the process outright
+/// instead of leaving a half-alive instance that probes and refreshes tokens
+/// but serves nothing.
+pub async fn bind(addr: SocketAddr) -> Result<TcpListener> {
+    match TcpListener::bind(addr).await {
+        Ok(l) => Ok(l),
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => Err(anyhow::anyhow!(
+            "{addr} is already in use: another corrall is probably listening there. \
+             Use `corrall status` to talk to it, or pass --port to run a second instance"
+        )),
+        Err(e) => Err(e).with_context(|| format!("binding {addr}")),
+    }
+}
+
+/// Accept connections on an already-bound listener until `shutdown` flips.
+pub async fn serve(ctx: Ctx, listener: TcpListener, mut shutdown: tokio::sync::watch::Receiver<bool>) -> Result<()> {
+    let bind = listener.local_addr().context("listener address")?;
     tracing::info!("listening on http://{bind}");
     loop {
         tokio::select! {
@@ -997,4 +1013,19 @@ pub fn parse_bind(host: &str, port: u16) -> Result<SocketAddr> {
 #[allow(dead_code)]
 pub fn header_str<'a>(h: &'a HeaderMap, k: &str) -> Option<&'a str> {
     h.get(k).and_then(|v| v.to_str().ok())
+}
+
+#[cfg(test)]
+mod bind_tests {
+    use super::bind;
+
+    #[tokio::test]
+    async fn bind_names_the_port_holder_when_in_use() {
+        let first = bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let addr = first.local_addr().unwrap();
+        let err = bind(addr).await.expect_err("second bind must fail").to_string();
+        assert!(err.contains("already in use"), "{err}");
+        assert!(err.contains("corrall status"), "{err}");
+        assert!(err.contains(&addr.to_string()), "{err}");
+    }
 }
