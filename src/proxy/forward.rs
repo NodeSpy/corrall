@@ -91,15 +91,11 @@ fn with_retry_after(mut r: Response<BoxBody>, secs: u64) -> Response<BoxBody> {
     r
 }
 
-/// Every eligible account was tried and failed. All of them timing out is a
-/// 504; anything else (5xx, connection errors, a mix) is a 502. Neither carries
-/// a `retry-after`: nothing on this side knows when the upstream recovers.
-fn transient_exhaustion(tried: usize, transient_failures: usize, timeouts: usize) -> Response<BoxBody> {
-    let all_timed_out = transient_failures > 0 && timeouts == transient_failures;
-    let status = if all_timed_out { StatusCode::GATEWAY_TIMEOUT } else { StatusCode::BAD_GATEWAY };
-    let msg =
-        if all_timed_out { format!("No account answered in time ({tried} tried).") } else { format!("No account could serve the request ({tried} tried).") };
-    error_response(status, "api_error", &msg)
+/// Every eligible account was tried and failed (5xx, connection refused, a
+/// mix): a 502 with no `retry-after`, since nothing on this side knows when
+/// the upstream recovers.
+fn transient_exhaustion(tried: usize) -> Response<BoxBody> {
+    error_response(StatusCode::BAD_GATEWAY, "api_error", &format!("No account could serve the request ({tried} tried)."))
 }
 
 /// Outcome of one upstream attempt.
@@ -118,6 +114,14 @@ enum Attempt {
     /// stop if that one is rate-limited too.
     RateLimitedHop {
         retry_after: u64,
+    },
+    /// The request was already on the wire when the account failed to answer
+    /// (no headers in time, or the connection died after the body was sent).
+    /// Upstream may still be running and billing it, so it is not resent: the
+    /// client gets `response` and decides whether to retry.
+    Abort {
+        response: Response<BoxBody>,
+        reason: String,
     },
 }
 
@@ -140,8 +144,6 @@ pub async fn forward(ctx: &Ctx, mgr: &Manager, info: &ReqInfo, mut headers: Head
     // selection found one; `None` means every account is either healthy-but-
     // tried or out for a reason no reset will cure.
     let mut last_exhausted: Option<Option<u64>> = None;
-    let mut transient_failures = 0usize;
-    let mut timeouts = 0usize;
     let started = std::time::Instant::now();
     let mut last_account = String::new();
     // A served response reports its own completion once the body ends. Every
@@ -197,7 +199,7 @@ pub async fn forward(ctx: &Ctx, mgr: &Manager, info: &ReqInfo, mut headers: Head
                     // is held back by quota: an upstream failure, not a rate
                     // limit. A 429 with a reset-derived retry-after here made
                     // clients back off for up to an hour from a blip.
-                    return fail(transient_exhaustion(tried.len(), transient_failures, timeouts), &last_account);
+                    return fail(transient_exhaustion(tried.len()), &last_account);
                 }
                 let msg = if tried.is_empty() {
                     "All accounts have reached their quota. Retry after the soonest reset.".to_string()
@@ -220,10 +222,6 @@ pub async fn forward(ctx: &Ctx, mgr: &Manager, info: &ReqInfo, mut headers: Head
                 tried.insert(account.id.clone());
                 if transient {
                     mgr.record_failure(&account.id);
-                    transient_failures += 1;
-                    if reason == "timeout" {
-                        timeouts += 1;
-                    }
                 }
                 tracing::info!("failover off \"{}\": {reason}", account.name);
                 if info.pin.is_some() {
@@ -231,7 +229,7 @@ pub async fn forward(ctx: &Ctx, mgr: &Manager, info: &ReqInfo, mut headers: Head
                     return fail(error_response(StatusCode::BAD_GATEWAY, "api_error", "Pinned account failed to serve the request"), &account.name);
                 }
                 if tried.len() >= MAX_ATTEMPTS {
-                    let r = transient_exhaustion(tried.len(), transient_failures, timeouts);
+                    let r = transient_exhaustion(tried.len());
                     let r = match last_exhausted.flatten() {
                         Some(ra) => with_retry_after(r, ra),
                         None => r,
@@ -272,6 +270,11 @@ pub async fn forward(ctx: &Ctx, mgr: &Manager, info: &ReqInfo, mut headers: Head
                         &account.name,
                     );
                 }
+            }
+            Attempt::Abort { response, reason } => {
+                mgr.record_failure(&account.id);
+                mgr.log(format!("\"{}\" did not answer request {} ({reason}); not resending a request already sent", account.name, info.id));
+                return fail(response, &account.name);
             }
             Attempt::RetrySame { wait } => {
                 same_account_retries += 1;
@@ -387,16 +390,34 @@ async fn attempt(ctx: &Ctx, mgr: &Manager, info: &ReqInfo, account: &Selected, h
     let res = tokio::time::timeout(headers_timeout(), req.send()).await;
     mgr.release(&account.id);
 
+    // A failure before the request left this side (DNS, TCP, TLS) cost
+    // nothing upstream and moves to a sibling. Once the body is on the wire
+    // the account may already be processing and billing it, so resending
+    // would pay for the same prompt again: v3.0–v3.1 did exactly that on
+    // every turn longer than its (mistaken) total deadline, and a client
+    // retry on top multiplied it. The request ends here with a 5xx instead,
+    // and the client decides whether to retry.
     let res = match res {
         Ok(Ok(r)) => r,
+        Ok(Err(e)) if e.is_connect() => {
+            tracing::warn!("upstream error on \"{}\": connect failed", account.name);
+            return Attempt::Failover { reason: "connect failed".into(), transient: true };
+        }
         Ok(Err(e)) => {
             let reason = describe_reqwest(&e);
-            tracing::warn!("upstream error on \"{}\": {reason}", account.name);
-            return Attempt::Failover { reason, transient: true };
+            tracing::warn!("upstream error on \"{}\": {reason} after the request was sent; not resending", account.name);
+            return Attempt::Abort {
+                response: error_response(StatusCode::BAD_GATEWAY, "api_error", "Upstream connection failed after the request was sent; it was not resent."),
+                reason,
+            };
         }
         Err(_) => {
-            tracing::warn!("upstream error on \"{}\": no response headers within {:.0}s", account.name, headers_timeout().as_secs_f64());
-            return Attempt::Failover { reason: "timeout".into(), transient: true };
+            let secs = headers_timeout().as_secs_f64();
+            tracing::warn!("upstream error on \"{}\": no response headers within {secs:.0}s; not resending", account.name);
+            return Attempt::Abort {
+                response: error_response(StatusCode::GATEWAY_TIMEOUT, "api_error", "Upstream sent no response headers in time; the request was not resent."),
+                reason: "timeout".into(),
+            };
         }
     };
 
@@ -581,14 +602,19 @@ async fn attempt(ctx: &Ctx, mgr: &Manager, info: &ReqInfo, account: &Selected, h
         return Attempt::Done(resp.body(body).unwrap());
     }
 
-    // Non-streaming: buffer (bounded by upstream), record usage, relay.
-    // A failed read is a failover like any other: the loop in `forward`
-    // reports the request's end once, either from the account that finally
-    // serves it or from `fail`. Reporting here as well counted the request
-    // twice in `requests_total`/`requests_failed` and logged two ✗ lines.
+    // Non-streaming: buffer (bounded by upstream), record usage, relay. A
+    // failed read arrives after a 2xx: the upstream ran and billed the
+    // request, so it is not resent. The loop in `forward` reports the
+    // request's end once, from `fail`; reporting here as well counted the
+    // request twice in `requests_total`/`requests_failed`.
     let bytes = match tokio::time::timeout(body_idle_timeout() * 4, res.bytes()).await {
         Ok(Ok(b)) => b,
-        _ => return Attempt::Failover { reason: "upstream body read failed".into(), transient: true },
+        _ => {
+            return Attempt::Abort {
+                response: error_response(StatusCode::BAD_GATEWAY, "api_error", "Upstream response body could not be read; the request was not resent."),
+                reason: "upstream body read failed".into(),
+            }
+        }
     };
     if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
         if let Some(u) = v.get("usage") {

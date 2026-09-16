@@ -175,7 +175,7 @@ Bucket keys: `unified5h`, `unified7d`, `unified7dFable`, `unified7dSonnet`,
 | `CORRALL_CONFIG` | Config path |
 | `CORRALL_HOST` | Override `proxy.host` |
 | `CORRALL_LOG` | `tracing` filter, e.g. `debug` |
-| `CORRALL_UPSTREAM_HEADERS_TIMEOUT_MS` | Time to response headers, default 120000. Not a total deadline: a streamed response runs as long as chunks keep arriving |
+| `CORRALL_UPSTREAM_HEADERS_TIMEOUT_MS` | Time to response headers, default 120000. Not a total deadline: a streamed response runs as long as chunks keep arriving. On expiry the request is answered 504 and not resent (see "When nothing can serve") |
 | `CORRALL_UPSTREAM_BODY_TIMEOUT_MS` | Idle gap between body chunks, default 120000 |
 | `CORRALL_UPSTREAM_MAX_SOCKETS` | Idle pooled connections per host, default 256 |
 | `CORRALL_REFRESH_TIMEOUT_MS` | OAuth refresh timeout, default 30000 |
@@ -311,11 +311,20 @@ answered differently. A **spent fleet**, where every eligible account is held
 back by quota or a rate limit, gets a 429 `rate_limit_error` with a
 `retry-after` taken from the soonest of those accounts' recoveries (their
 throttle, or their 5h/7d reset, at most 3600 s). A **failing upstream**, where
-every eligible account was tried and answered 5xx or timed out, gets a 502
-`api_error` (504 when every failure was a timeout) with no `retry-after`: those
-accounts are healthy, and their quota resets say nothing about when the upstream
-will answer again. `holdSeconds` holds either case for its duration and retries
-the whole fleet before answering.
+every eligible account was tried and answered 5xx or refused the connection,
+gets a 502 `api_error` with no `retry-after`: those accounts are healthy, and
+their quota resets say nothing about when the upstream will answer again.
+`holdSeconds` holds either case for its duration and retries the whole fleet
+before answering.
+
+A request that was **already sent** and then got no answer is different again:
+no response headers within `CORRALL_UPSTREAM_HEADERS_TIMEOUT_MS`, or a
+connection that died after the body went out, ends the request at once with a
+504 (or 502) `api_error` and is **not** resent on another account. The upstream
+may well still be running and billing that prompt; resending it would pay for
+it twice, and a client retry on top would pay a third time. The client decides
+whether to retry. Only a failure before anything left this side (DNS, TCP
+connect, TLS) moves the request to a sibling.
 
 ## Per-minute 429s
 

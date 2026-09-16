@@ -1133,21 +1133,37 @@ async fn long_stream_is_not_cut_by_the_headers_timeout() {
     }
 }
 
-/// No response headers within the budget is a transient failure on that
-/// account: the request moves to a sibling instead of waiting on it.
+/// No response headers within the budget ends the request with a 504 rather
+/// than moving it to a sibling: the body is already on the wire and the
+/// account may be running and billing it, so a resend would pay for the same
+/// prompt twice. The client retries if it wants to. A connection refused
+/// before anything was sent is the case that still fails over.
 #[tokio::test]
-async fn first_byte_timeout_fails_over_to_a_sibling() {
+async fn first_byte_timeout_fails_fast_instead_of_resending() {
     let mock = spawn_mock().await;
     let p = spawn_proxy(cfg_with(vec![account("a", "tok-a", 0, &mock.url()), account("b", "tok-b", 1, &mock.url())])).await;
     mock.queue("tok-a", Behaviour::Hang { ms: 6_000 });
     let started = std::time::Instant::now();
-    let (st, v, _) = post(&p, "/v1/messages", msg("claude-sonnet-4-6")).await;
+    let (st, v, h) = post(&p, "/v1/messages", msg("claude-sonnet-4-6")).await;
     let took = started.elapsed();
-    assert_eq!(st, 200);
-    assert_eq!(v["served_by"], "tok-b");
-    assert!(took >= Duration::from_millis(1_400) && took < Duration::from_millis(5_000), "took {took:?}");
+    assert_eq!(st, StatusCode::GATEWAY_TIMEOUT, "{v}");
+    assert_eq!(v["error"]["type"], "api_error");
+    assert!(h.get("retry-after").is_none(), "a timeout is not a quota exhaustion");
+    assert!(took >= Duration::from_millis(1_400) && took < Duration::from_millis(3_000), "took {took:?}");
     let status = p.manager.status(true);
     assert_eq!(status["accounts"][0]["usage"]["failedRequests"], 1);
+    assert_eq!(status["accounts"][1]["usage"]["totalRequests"], 0, "b was not sent the request");
+    // Nothing on the wire yet (connection refused): a sibling still serves it.
+    let dead = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        drop(l);
+        url
+    };
+    let p2 = spawn_proxy(cfg_with(vec![account("a", "tok-a", 0, &dead), account("b", "tok-b", 1, &mock.url())])).await;
+    let (st, v, _) = post(&p2, "/v1/messages", msg("claude-sonnet-4-6")).await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(v["served_by"], "tok-b");
 }
 
 /// A request the proxy gives up on still reports a completion, so it leaves
