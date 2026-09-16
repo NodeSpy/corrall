@@ -1583,6 +1583,14 @@ pub fn env_lines_with(cfg: &Config, use_mitm: bool, pin: Option<&str>, pool: Opt
         let pool_prefix = named.map(|p| format!("{}{p}", crate::pools::POOL_PREFIX)).unwrap_or_default();
         let pin_prefix = pin.map(|p| format!("/tc-acct/{}", pin_component(p))).unwrap_or_default();
         lines.push(format!("export ANTHROPIC_BASE_URL=http://{authority}{pool_prefix}{pin_prefix}"));
+        // A base URL other than api.anthropic.com puts Claude Code in
+        // third-party mode, where deferred tool loading is off and every MCP
+        // tool schema rides on every request in full. The proxy forwards
+        // requests, tool_reference blocks included, unchanged, so keep Claude
+        // Code in first-party mode. Not needed above: MITM leaves the base URL
+        // unset.
+        lines.push("export ENABLE_TOOL_SEARCH=auto".into());
+        lines.push("export _CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL=1".into());
         if !api_key_env.is_empty() {
             lines.push("unset ANTHROPIC_AUTH_TOKEN".into());
             lines.push(format!("export ANTHROPIC_API_KEY={}", shell_quote(api_key_env)));
@@ -1835,6 +1843,21 @@ mod tests {
         assert!(lines.contains("export ANTHROPIC_API_KEY='tc-secret-0123456789abcdef'"));
         assert!(lines.contains("HTTPS_PROXY='http://127.0.0.1:3456'"), "CONNECT auth is unchanged");
         assert_eq!(env_lines(&cfg, false, None, None), env_lines_with(&cfg, false, None, None, KeyMode::Header));
+    }
+
+    #[test]
+    fn env_lines_keep_first_party_mode_behind_a_base_url() {
+        let cfg = Config::default();
+        for key_mode in [KeyMode::Header, KeyMode::ApiKey] {
+            let lines = env_lines_with(&cfg, false, None, None, key_mode);
+            assert!(lines.contains(&"export ENABLE_TOOL_SEARCH=auto".to_string()), "{lines:?}");
+            assert!(lines.contains(&"export _CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL=1".to_string()), "{lines:?}");
+            // MITM mode leaves ANTHROPIC_BASE_URL unset, so Claude Code already
+            // sees api.anthropic.com and needs no telling.
+            let lines = env_lines_with(&cfg, true, None, None, key_mode).join("\n");
+            assert!(!lines.contains("ENABLE_TOOL_SEARCH"), "{lines}");
+            assert!(!lines.contains("FIRST_PARTY"), "{lines}");
+        }
     }
 
     #[test]

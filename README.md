@@ -169,7 +169,7 @@ corrall pool set work --match-path ~/Projects/acme  # auto-select it there
 corrall pool set work --match-remote '(?i)acme/'    # ...or by git remote
 corrall login --pool work    # add an account to that pool
 corrall env --pool work      # export lines pointing at that pool
-corrall env                  # export lines for eval "$(corrall env)"
+corrall env                  # export lines for eval "$(corrall env)"; keeps Claude Code in first-party mode (deferred tool loading on)
 corrall env --api-key        # the pre-connectors form: ANTHROPIC_API_KEY, connectors off
 corrall ca-path              # where the MITM CA certificate lives
 corrall config check         # validate and print a redacted config

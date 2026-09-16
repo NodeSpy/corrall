@@ -233,13 +233,16 @@ Three things make connectors work through Corrall:
    {
      "env": {
        "ANTHROPIC_BASE_URL": "http://127.0.0.1:3456",
-       "ANTHROPIC_CUSTOM_HEADERS": "x-corrall-key: tc-…"
+       "ANTHROPIC_CUSTOM_HEADERS": "x-corrall-key: tc-…",
+       "ENABLE_TOOL_SEARCH": "auto",
+       "_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL": "1"
      }
    }
    ```
 
    `corrall env` and `corrall run` emit exactly this (and never
-   `ANTHROPIC_API_KEY`).
+   `ANTHROPIC_API_KEY`); the last two variables are explained
+   [below](#request-size-behind-a-custom-base-url).
 2. **The connector list is relayed with the client's own login.**
    `/v1/mcp_servers` and `/api/organizations/*/mcp/*` are passthrough paths:
    the connectors belong to the login that authorised them, and an injected
@@ -259,6 +262,30 @@ MCP servers configured in Claude Code itself (`claude mcp add`, `.mcp.json`)
 are not affected by any of this: stdio servers never touch the proxy, and
 remote ones only do in MITM mode, where their hosts need a tunnel.
 
+### Request size behind a custom base URL
+
+Claude Code treats any `ANTHROPIC_BASE_URL` other than `api.anthropic.com` as a
+third-party endpoint and switches deferred tool loading off, on the assumption
+that the endpoint may not forward the ToolSearch tool's `tool_reference`
+blocks. Every MCP tool schema then rides on every request in full, and with a
+few claude.ai connectors attached those schemas are most of the request body.
+Measured on the same turn against a local capture endpoint, Claude Code
+2.1.273 with three connectors connected:
+
+| | tools in request | body bytes |
+| --- | --- | --- |
+| custom base URL, nothing else | 111 (81 from connectors) | 325,924 |
+| plus `ENABLE_TOOL_SEARCH=auto`, `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL=1` | 13 | 59,623 |
+
+Corrall forwards requests to Anthropic unchanged, `tool_reference` blocks
+included, so `corrall env` and `corrall run` set both variables in base-URL
+mode. `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL=1` has Claude Code treat the
+base URL as a first-party host (which also turns its gateway discovery off and
+the `count_tokens` endpoint on); `ENABLE_TOOL_SEARCH=auto` turns deferred tool
+loading back on, which the host check otherwise forces off. MITM mode needs
+neither, since there `ANTHROPIC_BASE_URL` stays unset. A hand-written
+`settings.json` should carry both, as in the recipe above.
+
 ### Choosing a mode
 
 Both ways of handing Claude Code the proxy key keep working. The difference is
@@ -269,7 +296,7 @@ what Claude Code does with its own login:
 | Launcher | `corrall env --api-key`, `corrall run --api-key` | `corrall env`, `corrall run` |
 | Claude Code's auth source | the proxy key | its claude.ai login (`/login` once) |
 | claude.ai connectors | off | on |
-| Request size | smaller: local tools only | larger: every connected connector's tool schemas ride along |
+| Request size | smaller: local tools only | larger: every connected connector's tool schemas ride along, unless deferred ([above](#request-size-behind-a-custom-base-url)) |
 | Works with no Claude Code login | yes | no |
 
 `--api-key` emits `ANTHROPIC_API_KEY` always, whatever the bind address, since
