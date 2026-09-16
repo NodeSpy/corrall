@@ -55,8 +55,9 @@ and state output.
 ## Additional hardening in this port
 
 - Blind CONNECT tunnels are off by default (`mitm.allowTunnel`), and when on
-  refuse loopback, RFC1918, link-local, ULA, CGNAT and metadata addresses and
-  any port other than 443 unless listed in `mitm.tunnelAllow`.
+  refuse loopback, RFC1918, link-local, ULA, CGNAT and metadata addresses,
+  whether given as a literal or resolved from the name, and any port other
+  than 443 unless listed in `mitm.tunnelAllow`.
 - Non-loopback bind without a key of at least 16 characters fails config
   validation; so does a plaintext `upstream` to a non-loopback host.
 - Failed authentication is delayed 250 ms and counted in
@@ -74,6 +75,14 @@ and state output.
 | `platform.claude.com`, `mcp-proxy.anthropic.com` and `*.mcp.claude.com` get a blind tunnel on 443 regardless of `mitm.allowTunnel` (`mitm.rs::is_session_tunnel_host`). | Widens the open-relay question by three Anthropic-owned names. CONNECT authentication still runs first; other ports and every other host keep the old rules. The suffix match is anchored to `.mcp.claude.com`, so `evil-mcp.claude.com` does not match. The tunnel dials the name as given, so a DNS answer from Anthropic's zone is trusted, as it is for the intercepted host. | Accepted. The alternative (refusing) broke token refresh and connectors for every MITM-mode session. |
 | The proxy key is accepted in `x-corrall-key` (`auth.rs::PROXY_KEY_HEADER`), added to `CLIENT_CREDENTIAL_HEADERS` and to the relay's drop list. | One more header that carries the key. Stripped on every path before anything goes upstream; never written to request logs (those record the upstream-bound header set). `corrall env`/`run` now emit it through `ANTHROPIC_CUSTOM_HEADERS` instead of `ANTHROPIC_API_KEY`, and only when the client will not be a loopback peer. | Accepted. Residual: Claude Code applies `ANTHROPIC_CUSTOM_HEADERS` to its SDK client, whose base URL is the proxy in base-URL mode and which is intercepted in MITM mode, so the key does not leave the box in either launch mode Corrall configures. A hand-written `settings.json` that sets the header while pointing the SDK elsewhere would send the key there. |
 | `corrall env` decides whether a key is needed from the dial address rather than the bind address (`cli.rs::env_lines`). | A wildcard bind is reached over loopback, where the server exempts the peer anyway, so the emitted key was redundant and switched off Claude Code's login. A specific non-loopback bind still emits the key. | Fixed. |
+
+## Proxy core fixes (2026-09-15)
+
+| Change | Surface | Disposition |
+| --- | --- | --- |
+| Blind tunnels resolve the CONNECT host and vet every answer before dialling (`mitm.rs::resolve_tunnel_target`, `vet_tunnel_addrs`). | The private-address guard checked the host only as a literal IP. With `mitm.allowTunnel` on and an empty `tunnelAllow`, `CONNECT 127.0.0.1.nip.io:443`, or any name resolving to loopback, RFC1918, link-local, CGNAT or `169.254.169.254`, was tunnelled, contrary to what this document claimed. | Fixed. The name is resolved once before the 200 is sent; a set with any loopback, private or unspecified address is refused with 403, and the tunnel dials the vetted addresses rather than the name, so a rebinding second answer has nothing to change. Literal IPs skip DNS as before. The session-tunnel hosts (`platform.claude.com`, `mcp-proxy.anthropic.com`, `*.mcp.claude.com`) go through the same check. |
+| A request whose every account failed transiently is answered 502/504 `api_error` with no `retry-after`, not 429 `rate_limit_error` (`forward.rs`, `manager.rs::exhausted_info`). | Not a confidentiality or integrity change; noted because the status class a client sees changed. The 429 carried a `retry-after` derived from the *healthy* accounts' 5h/7d resets (up to 3600 s), so an upstream blip on a small fleet read as a spent fleet and clients backed off for up to an hour. | Fixed. The 429 with a reset-derived `retry-after` is now only sent when an account is actually held back by quota or a rate limit. |
+| Intercepted tunnels are served by `hyper_util::server::conn::auto` (`server.rs::serve_connection`). | With `mitm.http1Only: false` the tunnel offered `h2` in ALPN but served HTTP/1.1 only, so every h2-capable client failed on the first frame. | Fixed; no change to what is intercepted or to authentication, which still happens at CONNECT time. |
 
 ## Residual risks
 
