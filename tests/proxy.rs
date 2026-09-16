@@ -757,6 +757,35 @@ async fn overloaded_upstream_takes_one_failover_hop() {
     assert_eq!(v["served_by"], "tok-b");
 }
 
+/// Every account answering 5xx is an upstream outage, not a quota exhaustion.
+/// With fewer accounts than the attempt cap the loop used to re-select, find
+/// nothing, and answer 429 `rate_limit_error` with a retry-after taken from
+/// the healthy accounts' 5h/7d reset (up to an hour), so clients backed off
+/// from a blip as if the fleet were spent.
+#[tokio::test]
+async fn every_account_overloaded_is_a_502_not_a_429() {
+    let mock = spawn_mock().await;
+    let p = spawn_proxy(cfg_with(vec![account("a", "tok-a", 0, &mock.url()), account("b", "tok-b", 1, &mock.url())])).await;
+    // Both accounts have healthy, far-off resets on record.
+    let _ = post(&p, "/v1/messages", msg("claude-opus-5")).await;
+    mock.queue("tok-a", Behaviour::ServerError);
+    mock.queue("tok-b", Behaviour::ServerError);
+    let (st, v, h) = post(&p, "/v1/messages", msg("claude-opus-5")).await;
+    assert_eq!(st, StatusCode::BAD_GATEWAY, "{v}");
+    assert_eq!(v["error"]["type"], "api_error");
+    assert!(h.get("retry-after").is_none(), "no reset-derived retry-after: {:?}", h.get("retry-after"));
+    let status = p.manager.status(false);
+    assert_eq!(status["accounts"][0]["status"], "active", "a 5xx does not throttle the account");
+    assert_eq!(status["accounts"][1]["status"], "active");
+    // A quota-held sibling still yields the 429 with its recovery time.
+    mock.queue("tok-a", Behaviour::QuotaRejected { retry_after: 300 });
+    mock.queue("tok-b", Behaviour::ServerError);
+    let (st, _, h) = post(&p, "/v1/messages", msg("claude-opus-5")).await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS);
+    let ra: u64 = h.get("retry-after").unwrap().to_str().unwrap().parse().unwrap();
+    assert!((250..=300).contains(&ra), "retry-after {ra} comes from a's throttle");
+}
+
 #[tokio::test]
 async fn all_exhausted_returns_429_with_retry_after_then_hold_waits() {
     let mock = spawn_mock().await;
@@ -1090,13 +1119,14 @@ async fn abandoned_requests_report_completion() {
     let p = spawn_proxy(cfg_with(vec![account("a", "tok-a", 0, &mock.url())])).await;
     mock.queue("tok-a", Behaviour::Hang { ms: 6_000 });
     let mut rx = p.ctx.activity.subscribe();
-    let (st, _, _) = post(&p, "/v1/messages", msg("claude-sonnet-4-6")).await;
-    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "the only account timed out and nothing else could serve it");
+    let (st, _, h) = post(&p, "/v1/messages", msg("claude-sonnet-4-6")).await;
+    assert_eq!(st, StatusCode::GATEWAY_TIMEOUT, "the only account timed out and nothing else could serve it");
+    assert!(h.get("retry-after").is_none(), "a timeout is not a quota exhaustion");
     let mut ended = None;
     while let Ok(a) = rx.try_recv() {
         if let corrall::proxy::server::Activity::End { account, status, ok, .. } = a {
             ended = Some((account, status, ok));
         }
     }
-    assert_eq!(ended, Some(("a".to_string(), 429, false)));
+    assert_eq!(ended, Some(("a".to_string(), 504, false)));
 }

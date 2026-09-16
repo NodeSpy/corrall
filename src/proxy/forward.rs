@@ -91,6 +91,17 @@ fn with_retry_after(mut r: Response<BoxBody>, secs: u64) -> Response<BoxBody> {
     r
 }
 
+/// Every eligible account was tried and failed. All of them timing out is a
+/// 504; anything else (5xx, connection errors, a mix) is a 502. Neither carries
+/// a `retry-after`: nothing on this side knows when the upstream recovers.
+fn transient_exhaustion(tried: usize, transient_failures: usize, timeouts: usize) -> Response<BoxBody> {
+    let all_timed_out = transient_failures > 0 && timeouts == transient_failures;
+    let status = if all_timed_out { StatusCode::GATEWAY_TIMEOUT } else { StatusCode::BAD_GATEWAY };
+    let msg =
+        if all_timed_out { format!("No account answered in time ({tried} tried).") } else { format!("No account could serve the request ({tried} tried).") };
+    error_response(status, "api_error", &msg)
+}
+
 /// Outcome of one upstream attempt.
 enum Attempt {
     Done(Response<BoxBody>),
@@ -125,7 +136,12 @@ pub async fn forward(ctx: &Ctx, mgr: &Manager, info: &ReqInfo, mut headers: Head
     let mut attempts = 0usize;
     let mut same_account_retries = 0usize;
     let mut rate_limit_hops = 0usize;
-    let mut last_exhausted: Option<(u64, String)> = None;
+    // Soonest recovery of a quota- or rate-limit-held account, when the last
+    // selection found one; `None` means every account is either healthy-but-
+    // tried or out for a reason no reset will cure.
+    let mut last_exhausted: Option<Option<u64>> = None;
+    let mut transient_failures = 0usize;
+    let mut timeouts = 0usize;
     let started = std::time::Instant::now();
     let mut last_account = String::new();
     // A served response reports its own completion once the body ends. Every
@@ -165,10 +181,10 @@ pub async fn forward(ctx: &Ctx, mgr: &Manager, info: &ReqInfo, mut headers: Head
                 return fail(with_retry_after(error_response(StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", &msg), 30), &name);
             }
             Selection::Exhausted { retry_after_secs, reason } => {
-                last_exhausted = Some((retry_after_secs, reason.clone()));
+                last_exhausted = Some(retry_after_secs);
                 if let Some(deadline) = hold_deadline {
                     if tokio::time::Instant::now() < deadline {
-                        let wait = Duration::from_secs(retry_after_secs.clamp(2, 30));
+                        let wait = Duration::from_secs(retry_after_secs.unwrap_or(HEADERLESS_429_PAUSE_SECONDS).clamp(2, 30));
                         mgr.log(format!("All accounts exhausted; holding request {} for {}s", info.id, wait.as_secs()));
                         tokio::time::sleep(wait).await;
                         tried.clear();
@@ -176,12 +192,20 @@ pub async fn forward(ctx: &Ctx, mgr: &Manager, info: &ReqInfo, mut headers: Head
                     }
                 }
                 tracing::warn!("exhausted: {reason}");
+                if !tried.is_empty() && retry_after_secs.is_none() {
+                    // Every eligible account answered 5xx or timed out and none
+                    // is held back by quota: an upstream failure, not a rate
+                    // limit. A 429 with a reset-derived retry-after here made
+                    // clients back off for up to an hour from a blip.
+                    return fail(transient_exhaustion(tried.len(), transient_failures, timeouts), &last_account);
+                }
                 let msg = if tried.is_empty() {
                     "All accounts have reached their quota. Retry after the soonest reset.".to_string()
                 } else {
                     format!("No account could serve the request ({} tried).", tried.len())
                 };
-                return fail(with_retry_after(error_response(StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", &msg), retry_after_secs), &last_account);
+                let ra = retry_after_secs.unwrap_or(60);
+                return fail(with_retry_after(error_response(StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", &msg), ra), &last_account);
             }
         };
 
@@ -196,6 +220,10 @@ pub async fn forward(ctx: &Ctx, mgr: &Manager, info: &ReqInfo, mut headers: Head
                 tried.insert(account.id.clone());
                 if transient {
                     mgr.record_failure(&account.id);
+                    transient_failures += 1;
+                    if reason == "timeout" {
+                        timeouts += 1;
+                    }
                 }
                 tracing::info!("failover off \"{}\": {reason}", account.name);
                 if info.pin.is_some() {
@@ -203,11 +231,12 @@ pub async fn forward(ctx: &Ctx, mgr: &Manager, info: &ReqInfo, mut headers: Head
                     return fail(error_response(StatusCode::BAD_GATEWAY, "api_error", "Pinned account failed to serve the request"), &account.name);
                 }
                 if tried.len() >= MAX_ATTEMPTS {
-                    let (ra, _) = last_exhausted.clone().unwrap_or((30, String::new()));
-                    return fail(
-                        with_retry_after(error_response(StatusCode::BAD_GATEWAY, "api_error", "Every eligible account failed to serve the request"), ra),
-                        &account.name,
-                    );
+                    let r = transient_exhaustion(tried.len(), transient_failures, timeouts);
+                    let r = match last_exhausted.flatten() {
+                        Some(ra) => with_retry_after(r, ra),
+                        None => r,
+                    };
+                    return fail(r, &account.name);
                 }
             }
             Attempt::RateLimitedHop { retry_after } => {

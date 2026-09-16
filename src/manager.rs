@@ -275,10 +275,12 @@ pub struct Selected {
 #[derive(Debug)]
 pub enum Selection {
     Account(Selected),
-    /// No account can take this request now; `retry_after_secs` is the soonest
-    /// known recovery.
+    /// No account can take this request now. `retry_after_secs` is the
+    /// soonest known recovery of an account held back by quota or a rate
+    /// limit; it is `None` when no account is in that state, which is the case
+    /// when every eligible account was tried by the caller and failed.
     Exhausted {
-        retry_after_secs: u64,
+        retry_after_secs: Option<u64>,
         reason: String,
     },
     /// A pinned account exists but cannot serve.
@@ -1598,8 +1600,14 @@ impl Fleet {
         Selection::Exhausted { retry_after_secs: retry, reason }
     }
 
-    fn exhausted_info(&self, req: &SelectRequest, now: i64) -> (u64, String) {
+    /// Why nothing can serve, and when to retry. Only accounts held back by
+    /// quota or a rate limit contribute a reset: an account the caller merely
+    /// tried (and got a 5xx or a timeout from) is healthy, and its own 5h/7d
+    /// reset says nothing about when the upstream will answer again. Using it
+    /// turned two overloaded siblings into a 429 with `retry-after: 3600`.
+    fn exhausted_info(&self, req: &SelectRequest, now: i64) -> (Option<u64>, String) {
         let mut soonest: Option<i64> = None;
+        let mut quota_bound = false;
         let mut parts = Vec::new();
         for a in &self.accounts {
             if let Some(p) = req.provider {
@@ -1607,8 +1615,14 @@ impl Fleet {
                     continue;
                 }
             }
-            let reason = self.unavailable_reason(a, req.model, req.advisor_model, now).unwrap_or_else(|| "tried".into());
-            parts.push(format!("{}: {}", a.name, reason));
+            let reason = self.unavailable_reason(a, req.model, req.advisor_model, now);
+            let held_back =
+                reason.as_deref().map(|r| matches!(unavailable_key(r), "throttled" | "capped" | "advisor-capped" | "quota" | "advisor-quota")).unwrap_or(false);
+            parts.push(format!("{}: {}", a.name, reason.unwrap_or_else(|| "tried".into())));
+            if !held_back {
+                continue;
+            }
+            quota_bound = true;
             let r = a.rate_limited_until.or_else(|| a.quota.soonest_reset());
             if let Some(r) = r {
                 if r > now && soonest.map(|s| r < s).unwrap_or(true) {
@@ -1616,7 +1630,7 @@ impl Fleet {
                 }
             }
         }
-        let secs = soonest.map(|s| ((s - now) / 1000).clamp(5, 3600) as u64).unwrap_or(60);
+        let secs = if quota_bound { Some(soonest.map(|s| ((s - now) / 1000).clamp(5, 3600) as u64).unwrap_or(60)) } else { None };
         (secs, parts.join("; "))
     }
 
@@ -2033,7 +2047,39 @@ mod tests {
         // probe allowed once
         assert!(select_name(&m, None).is_some());
         match m.select(&SelectRequest { allow_probe: true, ..Default::default() }) {
-            Selection::Exhausted { retry_after_secs, .. } => assert!(retry_after_secs >= 5),
+            Selection::Exhausted { retry_after_secs, .. } => assert!(retry_after_secs.unwrap() >= 5),
+            other => panic!("expected exhausted, got {other:?}"),
+        }
+    }
+
+    /// Two healthy accounts the caller already tried (upstream 5xx or a
+    /// timeout) are not a quota exhaustion: no reset-derived retry-after.
+    #[test]
+    fn exhaustion_after_transient_failures_carries_no_reset() {
+        let cfg = cfg_with(vec![acct("a", 0), acct("b", 0)]);
+        let m = mgr(&cfg);
+        let ids = m.account_ids();
+        m.with(|f| {
+            for (id, _) in &ids {
+                let a = f.account_mut(id).unwrap();
+                a.quota.unified5h.utilization = Some(0.3);
+                a.quota.unified5h.reset_at = Some(now_ms() + 3_600_000 * 4);
+                a.quota.unified7d.utilization = Some(0.3);
+                a.quota.unified7d.reset_at = Some(now_ms() + 86_400_000 * 6);
+            }
+        });
+        let exclude: HashSet<String> = ids.iter().map(|(id, _)| id.clone()).collect();
+        match m.select(&SelectRequest { exclude: exclude.clone(), allow_probe: true, ..Default::default() }) {
+            Selection::Exhausted { retry_after_secs, reason } => {
+                assert_eq!(retry_after_secs, None, "{reason}");
+                assert!(reason.contains("a: tried") && reason.contains("b: tried"), "{reason}");
+            }
+            other => panic!("expected exhausted, got {other:?}"),
+        }
+        // Once one of them is genuinely rate-limited its recovery is the answer.
+        m.with(|f| f.account_mut(&ids[1].0).unwrap().rate_limited_until = Some(now_ms() + 120_000));
+        match m.select(&SelectRequest { exclude, allow_probe: true, ..Default::default() }) {
+            Selection::Exhausted { retry_after_secs, .. } => assert!((100..=130).contains(&retry_after_secs.unwrap())),
             other => panic!("expected exhausted, got {other:?}"),
         }
     }
