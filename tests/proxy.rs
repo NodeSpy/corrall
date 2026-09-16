@@ -23,7 +23,7 @@ use tokio::net::TcpListener;
 use corrall::config::{AccountConfig, AccountType, Config, PoolConfig, ProxyConfig, DEFAULT_POOL};
 use corrall::manager::Manager;
 use corrall::pools::Pools;
-use corrall::proxy::server::{run, Ctx, CtxInner, Metrics};
+use corrall::proxy::server::{bind as bind_listener, serve, Ctx, CtxInner, Metrics};
 
 const KEY: &str = "tc-test-key-0123456789abcdef";
 
@@ -311,16 +311,11 @@ async fn spawn_proxy(mut cfg: Config) -> Proxy {
     let (_stx, srx) = tokio::sync::watch::channel(false);
     let bind: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     let c2 = ctx.clone();
+    let listener = bind_listener(bind).await.expect("bind test listener");
     tokio::spawn(async move {
-        let _ = run(c2, bind, srx).await;
+        let _ = serve(c2, listener, srx).await;
     });
     std::mem::forget(_stx);
-    for _ in 0..50 {
-        if tokio::net::TcpStream::connect(bind).await.is_ok() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
     Proxy { port, ctx, manager }
 }
 

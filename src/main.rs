@@ -94,6 +94,10 @@ async fn server(args: ServerArgs, interactive: bool) -> Result<()> {
     if !security::is_loopback_ip(bind.ip()) {
         tracing::warn!("binding {bind}: remote clients must present proxy.apiKey; put a TLS terminator in front on untrusted networks");
     }
+    // Bind first: if the port is taken there is nothing for this process to
+    // do, and starting the prober, warmer and state saver anyway would put a
+    // second fleet on the same accounts and the same state file.
+    let listener = proxy::server::bind(bind).await?;
 
     let pools = Pools::new(&cfg);
     match State::load() {
@@ -166,7 +170,7 @@ async fn server(args: ServerArgs, interactive: bool) -> Result<()> {
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
     // Listener.
-    let srv = tokio::spawn(proxy::server::run(ctx.clone(), bind, shutdown_rx.clone()));
+    let srv = tokio::spawn(proxy::server::serve(ctx.clone(), listener, shutdown_rx.clone()));
 
     // Background: prober, state saver, log sweeper, signals.
     tokio::spawn(prober.clone().run());
