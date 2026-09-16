@@ -19,6 +19,15 @@ use crate::upstream::{body_idle_timeout, client, headers_timeout};
 
 const MAX_ATTEMPTS: usize = 6;
 const INLINE_RETRY_AFTER_MAX_SECONDS: u64 = 15;
+/// Pause for a per-minute 429 that carries no `retry-after`. Sixty seconds
+/// was the old guess, and applied per account as a request hopped across the
+/// fleet it turned one rate-limited request into a minute-long outage for
+/// every session.
+const HEADERLESS_429_PAUSE_SECONDS: u64 = 5;
+/// A request rate-limited on this many accounts in a row is not hitting a
+/// per-account limit; a further hop would only mark another account
+/// unavailable to everyone else.
+const MAX_RATE_LIMIT_HOPS: usize = 2;
 const ERROR_BODY_INSPECTION_LIMIT: usize = 64 * 1024;
 
 /// Headers that never cross the proxy as received. Besides the RFC 7230
@@ -78,8 +87,11 @@ enum Attempt {
     RetrySame {
         wait: Duration,
     },
-    /// Client is gone or the request is unrecoverable.
-    Abort(Response<BoxBody>),
+    /// A per-minute 429 too long to absorb inline: try one other account, and
+    /// stop if that one is rate-limited too.
+    RateLimitedHop {
+        retry_after: u64,
+    },
 }
 
 /// `mgr` is the manager of `info.pool` — resolved once by the caller so every
@@ -103,6 +115,7 @@ pub async fn forward(ctx: &Ctx, mgr: &Manager, info: &ReqInfo, mut headers: Head
     let hold_deadline = if info.hold_ms > 0 { Some(tokio::time::Instant::now() + Duration::from_millis(info.hold_ms)) } else { None };
     let mut attempts = 0usize;
     let mut same_account_retries = 0usize;
+    let mut rate_limit_hops = 0usize;
     let mut last_exhausted: Option<(u64, String)> = None;
     let started = std::time::Instant::now();
     let mut last_account = String::new();
@@ -170,7 +183,6 @@ pub async fn forward(ctx: &Ctx, mgr: &Manager, info: &ReqInfo, mut headers: Head
                 mgr.record_session(session, &account.id, model);
                 return r;
             }
-            Attempt::Abort(r) => return fail(r, &account.name),
             Attempt::Failover { reason, transient } => {
                 tried.insert(account.id.clone());
                 if transient {
@@ -185,6 +197,40 @@ pub async fn forward(ctx: &Ctx, mgr: &Manager, info: &ReqInfo, mut headers: Head
                     let (ra, _) = last_exhausted.clone().unwrap_or((30, String::new()));
                     return fail(
                         with_retry_after(error_response(StatusCode::BAD_GATEWAY, "api_error", "Every eligible account failed to serve the request"), ra),
+                        &account.name,
+                    );
+                }
+            }
+            Attempt::RateLimitedHop { retry_after } => {
+                tried.insert(account.id.clone());
+                rate_limit_hops += 1;
+                tracing::info!("failover off \"{}\": rate limited {retry_after}s", account.name);
+                if info.pin.is_some() {
+                    return fail(
+                        with_retry_after(error_response(StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", "Upstream rate limit"), retry_after),
+                        &account.name,
+                    );
+                }
+                if rate_limit_hops >= MAX_RATE_LIMIT_HOPS {
+                    mgr.log(format!("Rate-limit 429 on {rate_limit_hops} accounts in a row for request {}; not trying another", info.id));
+                    return fail(
+                        with_retry_after(
+                            error_response(
+                                StatusCode::TOO_MANY_REQUESTS,
+                                "rate_limit_error",
+                                "Upstream rate limit on two accounts in a row; not a per-account limit",
+                            ),
+                            retry_after,
+                        ),
+                        &account.name,
+                    );
+                }
+                if tried.len() >= MAX_ATTEMPTS {
+                    return fail(
+                        with_retry_after(
+                            error_response(StatusCode::BAD_GATEWAY, "api_error", "Every eligible account failed to serve the request"),
+                            retry_after,
+                        ),
                         &account.name,
                     );
                 }
@@ -312,8 +358,14 @@ async fn attempt(ctx: &Ctx, mgr: &Manager, info: &ReqInfo, account: &Selected, h
 
     match status.as_u16() {
         429 => {
-            let retry_after = res.headers().get("retry-after").and_then(|v| v.to_str().ok()).and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(60);
-            let _ = res.bytes().await;
+            let hdr = |n: &str| res.headers().get(n).and_then(|v| v.to_str().ok()).map(str::to_string);
+            let retry_after_hdr = hdr("retry-after");
+            let retry_after = retry_after_hdr.as_deref().and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(60);
+            let (ctype, cf_ray, req_id) = (hdr("content-type"), hdr("cf-ray"), hdr("request-id"));
+            let body_snip = {
+                let b = read_limited(res).await;
+                crate::security::safe_text(&String::from_utf8_lossy(&b), 400)
+            };
             let general_rejected = rl.get("anthropic-ratelimit-unified-5h-status").map(|s| s == "rejected").unwrap_or(false)
                 || rl.get("anthropic-ratelimit-unified-7d-status").map(|s| s == "rejected").unwrap_or(false);
             let family_rejected = !general_rejected && rl.get("anthropic-ratelimit-unified-7d_oi-status").map(|s| s == "rejected").unwrap_or(false);
@@ -328,18 +380,33 @@ async fn attempt(ctx: &Ctx, mgr: &Manager, info: &ReqInfo, account: &Selected, h
                 return Attempt::Failover { reason: "quota rejected".into(), transient: false };
             }
             // Per-minute rate limit: pause the account, retry the same one.
-            let ra = retry_after.clamp(1, 300) as u64;
+            // Logged in full: a 429 that is not a quota rejection and hits
+            // several accounts of one fleet in a row has so far come without
+            // a retry-after, and whether it is Cloudflare, an org-wide limit
+            // or something about the request only its headers and body say.
+            tracing::warn!(
+                "429 on \"{}\" (not a quota rejection): retry-after={} content-type={} cf-ray={} request-id={} unified={:?} body={}",
+                account.name,
+                retry_after_hdr.as_deref().unwrap_or("<absent>"),
+                ctype.as_deref().unwrap_or("<absent>"),
+                cf_ray.as_deref().unwrap_or("<absent>"),
+                req_id.as_deref().unwrap_or("<absent>"),
+                rl,
+                body_snip
+            );
+            let ra = match retry_after_hdr.as_deref().and_then(|v| v.trim().parse::<i64>().ok()) {
+                Some(v) => v.clamp(1, 300) as u64,
+                None => HEADERLESS_429_PAUSE_SECONDS,
+            };
             mgr.mark_rate_limited(&account.id, ra);
             if ra <= INLINE_RETRY_AFTER_MAX_SECONDS || (ra <= rate_limit_absorb_max() && info.hold_ms > 0) {
                 mgr.log(format!("Rate-limit 429 on \"{}\"; waiting {ra}s and retrying the same account", account.name));
                 return Attempt::RetrySame { wait: Duration::from_secs(ra) };
             }
-            if info.pin.is_none() {
-                // One failover hop onto an idle sibling; a second throttle is IP-scoped.
-                mgr.log(format!("Rate-limit 429 on \"{}\" (retry-after {ra}s); one failover hop", account.name));
-                return Attempt::Failover { reason: format!("rate limited {ra}s"), transient: false };
-            }
-            return Attempt::Abort(with_retry_after(error_response(StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", "Upstream rate limit"), ra));
+            // One failover hop onto an idle sibling; the loop stops at a second
+            // rate-limited account rather than marking the whole fleet.
+            mgr.log(format!("Rate-limit 429 on \"{}\" (retry-after {ra}s); one failover hop", account.name));
+            return Attempt::RateLimitedHop { retry_after: ra };
         }
         401 => {
             let bytes = res.bytes().await.unwrap_or_default();

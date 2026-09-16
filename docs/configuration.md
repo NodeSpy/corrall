@@ -259,6 +259,37 @@ MCP servers configured in Claude Code itself (`claude mcp add`, `.mcp.json`)
 are not affected by any of this: stdio servers never touch the proxy, and
 remote ones only do in MITM mode, where their hosts need a tunnel.
 
+### Choosing a mode
+
+Both ways of handing Claude Code the proxy key keep working. The difference is
+what Claude Code does with its own login:
+
+| | `ANTHROPIC_API_KEY` | header (default) |
+| --- | --- | --- |
+| Launcher | `corrall env --api-key`, `corrall run --api-key` | `corrall env`, `corrall run` |
+| Claude Code's auth source | the proxy key | its claude.ai login (`/login` once) |
+| claude.ai connectors | off | on |
+| Request size | smaller: local tools only | larger: every connected connector's tool schemas ride along |
+| Works with no Claude Code login | yes | no |
+
+`--api-key` emits `ANTHROPIC_API_KEY` always, whatever the bind address, since
+its point is the mode rather than authentication; in MITM mode the proxy
+strips the header it produces. A hand-written `settings.json` picks either
+form the same way: the `env` block above, or `"ANTHROPIC_API_KEY": "tc-…"`.
+
+## Per-minute 429s
+
+A 429 without `anthropic-ratelimit-unified-*-status: rejected` is a per-minute
+limit, not a spent quota. With a `retry-after` of 15s or less the proxy waits
+and retries the same account; longer than that it fails over once. Without a
+`retry-after` header it pauses the account 5s and retries it, rather than
+assuming 60s. A request rate-limited on two accounts in a row is answered 429
+with the upstream `retry-after` instead of trying a third: a limit that follows
+the request across accounts is not per-account, and each further hop only
+marked another account unavailable to every other session. Every such 429 is
+logged at `warn` with its `retry-after`, `content-type`, `cf-ray`,
+`request-id` and the start of its body.
+
 ## Importing from claudeacrobat
 
 `corrall import-claudeacrobat` reads the account files of a

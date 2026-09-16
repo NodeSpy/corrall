@@ -106,7 +106,9 @@ rather than create an empty config beside your accounts.
   of Fable quota still serves Opus and Sonnet.
 - Tells a spent quota bucket (`unified-*-status: rejected`) apart from a
   per-minute rate limit. Only the first one rotates; the second is absorbed
-  inline on the same account, with one failover hop onto an idle sibling.
+  inline on the same account, with one failover hop onto an idle sibling and
+  never a second: a 429 that follows the request onto another account is
+  returned to the client instead of being spread across the fleet.
 - Paces requests onto a freshly switched account (storm control) so a herd of
   agents failing over together cannot cascade down the fleet.
 - Catches hardcoded `api.anthropic.com` endpoints through a local MITM forward
@@ -168,6 +170,7 @@ corrall pool set work --match-remote '(?i)acme/'    # ...or by git remote
 corrall login --pool work    # add an account to that pool
 corrall env --pool work      # export lines pointing at that pool
 corrall env                  # export lines for eval "$(corrall env)"
+corrall env --api-key        # the pre-connectors form: ANTHROPIC_API_KEY, connectors off
 corrall ca-path              # where the MITM CA certificate lives
 corrall config check         # validate and print a redacted config
 corrall server --listen 127.0.0.1:3457   # bind elsewhere for one run

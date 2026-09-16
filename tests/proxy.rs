@@ -47,6 +47,7 @@ enum Behaviour {
     QuotaRejected { retry_after: u64 },
     FamilyRejected,
     RateLimited { retry_after: u64 },
+    RateLimitedNoHeader,
     Unauthorized,
     ServerError,
     EntitlementDenied,
@@ -188,6 +189,10 @@ async fn mock_handler(mock: Mock, req: Request<Incoming>) -> Result<Response<Moc
         Behaviour::RateLimited { retry_after } => base(429)
             .header("retry-after", retry_after.to_string())
             .body(Full::new(Bytes::from(r#"{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}"#)))
+            .unwrap(),
+        Behaviour::RateLimitedNoHeader => base(429)
+            .header("content-type", "text/html")
+            .body(Full::new(Bytes::from("<html><head><title>429 Too Many Requests</title></head><body>cloudflare</body></html>")))
             .unwrap(),
         Behaviour::Unauthorized => Response::builder()
             .status(401)
@@ -407,6 +412,50 @@ async fn quota_rejection_rotates_but_rate_limit_retries_same_account() {
     let after = mock.seen();
     assert_eq!(after.len(), n + 2, "one 429 then one retry");
     assert!(after[n..].iter().all(|s| token_of(&s.headers) == "tok-b"));
+}
+
+#[tokio::test]
+async fn headerless_429_pauses_briefly_and_retries_the_same_account() {
+    let mock = spawn_mock().await;
+    let p = spawn_proxy(cfg_with(vec![account("a", "tok-a", 0, &mock.url()), account("b", "tok-b", 0, &mock.url())])).await;
+    // No retry-after: a short pause on the same account, not a 60s mark and a
+    // hop that would have marked b too.
+    mock.queue("tok-a", Behaviour::RateLimitedNoHeader);
+    let started = std::time::Instant::now();
+    let (st, v, _) = post(&p, "/v1/messages", msg("claude-opus-5")).await;
+    assert_eq!(st, 200);
+    assert_eq!(v["served_by"], "tok-a", "no failover onto b");
+    let took = started.elapsed();
+    assert!(took >= Duration::from_secs(4) && took < Duration::from_secs(20), "a short pause: {took:?}");
+    let seen = mock.seen();
+    assert_eq!(seen.len(), 2, "one 429 then one retry");
+    assert!(seen.iter().all(|s| token_of(&s.headers) == "tok-a"));
+    let status = p.manager.status(false);
+    assert_eq!(status["accounts"][1]["status"], "active", "b was never touched");
+}
+
+#[tokio::test]
+async fn two_rate_limited_accounts_in_a_row_stop_the_cascade() {
+    let mock = spawn_mock().await;
+    let p =
+        spawn_proxy(cfg_with(vec![account("a", "tok-a", 0, &mock.url()), account("b", "tok-b", 0, &mock.url()), account("c", "tok-c", 0, &mock.url())])).await;
+    // A long retry-after hops once; a second rate-limited account means the
+    // limit follows the request, so c is left alone and the client gets the
+    // upstream retry-after.
+    mock.queue("tok-a", Behaviour::RateLimited { retry_after: 60 });
+    mock.queue("tok-b", Behaviour::RateLimited { retry_after: 60 });
+    let (st, _, h) = post(&p, "/v1/messages", msg("claude-opus-5")).await;
+    assert_eq!(st, 429);
+    assert_eq!(h.get("retry-after").unwrap(), "60");
+    let seen = mock.seen();
+    assert_eq!(seen.len(), 2, "a and b were tried, c was not");
+    assert!(seen.iter().all(|s| token_of(&s.headers) != "tok-c"));
+    let status = p.manager.status(false);
+    assert_eq!(status["accounts"][2]["status"], "active", "c stays available to everyone else");
+    // Anyone else is served by c meanwhile.
+    let (st, v, _) = post(&p, "/v1/messages", msg("claude-opus-5")).await;
+    assert_eq!(st, 200);
+    assert_eq!(v["served_by"], "tok-c");
 }
 
 #[tokio::test]
