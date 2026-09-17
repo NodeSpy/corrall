@@ -303,6 +303,7 @@ async fn spawn_proxy(mut cfg: Config) -> Proxy {
         logger: None,
         activity: tx,
         reload: None,
+        prober: None,
         metrics: Metrics::default(),
         tls: parking_lot::RwLock::new(None),
         titles: corrall::titles::Titles::new(&cfg.session_titles),
@@ -1179,4 +1180,91 @@ async fn abandoned_requests_report_completion() {
         }
     }
     assert_eq!(ended, Some(("a".to_string(), 504, false)));
+}
+
+/// `GET /corrall/activity` is the feed `corrall attach` tails: a request
+/// through the proxy shows up on it as start/end events that parse back into
+/// the same `Activity` the in-process TUI sees, with the session label filled
+/// in by the daemon.
+#[tokio::test]
+async fn activity_feed_streams_requests_as_events() {
+    use corrall::attach::SseParser;
+    use corrall::proxy::server::Activity;
+    use futures_util::StreamExt;
+    let mock = spawn_mock().await;
+    let p = spawn_proxy(cfg_with(vec![account("a", "tok-a", 0, &mock.url())])).await;
+    let feed = http().get(p.url("/corrall/activity")).header("x-api-key", KEY).send().await.unwrap();
+    assert_eq!(feed.status(), 200);
+    assert_eq!(feed.headers().get("content-type").unwrap(), "text/event-stream");
+    let mut stream = feed.bytes_stream();
+    // The greeting comment arrives before anything happens, so a subscriber
+    // knows the link is up.
+    let first = tokio::time::timeout(Duration::from_secs(2), stream.next()).await.expect("greeting").unwrap().unwrap();
+    assert!(first.starts_with(b": corrall activity"), "{first:?}");
+
+    let (st, _, _) = post(&p, "/v1/messages", msg("claude-opus-5")).await;
+    assert_eq!(st, StatusCode::OK);
+    let _ = p.ctx.activity.send(Activity::Log("Switched to account \"a\"".into()));
+
+    let mut parser = SseParser::default();
+    let mut events = Vec::new();
+    while events.iter().filter_map(Activity::from_json).filter(|a| matches!(a, Activity::Log(_))).count() == 0 {
+        let chunk = tokio::time::timeout(Duration::from_secs(3), stream.next()).await.expect("feed kept flowing").unwrap().unwrap();
+        events.extend(parser.feed(&chunk));
+    }
+    let acts: Vec<Activity> = events.iter().filter_map(Activity::from_json).collect();
+    let start = acts.iter().find_map(|a| match a {
+        Activity::Start { method, path, model, label, .. } => Some((method.clone(), path.clone(), model.clone(), label.clone())),
+        _ => None,
+    });
+    assert_eq!(start, Some(("POST".into(), "/v1/messages".into(), Some("claude-opus-5".into()), None)), "no session on this request, so no label");
+    let end = acts.iter().find_map(|a| match a {
+        Activity::End { account, status, ok, .. } => Some((account.clone(), *status, *ok)),
+        _ => None,
+    });
+    assert_eq!(end, Some(("a".into(), 200, true)));
+    assert!(acts.iter().any(|a| matches!(a, Activity::Log(l) if l == "Switched to account \"a\"")));
+    // The feed is authenticated like everything else.
+    let anon = http().get(p.url("/corrall/activity")).header("host", "attacker.example").send().await.unwrap();
+    assert_eq!(anon.status(), 401);
+}
+
+/// A session id on the request comes back on the feed with its label, which
+/// is what an attached TUI draws in the session column.
+#[tokio::test]
+async fn activity_feed_labels_sessions() {
+    use corrall::attach::SseParser;
+    use corrall::proxy::server::Activity;
+    use futures_util::StreamExt;
+    let mock = spawn_mock().await;
+    let p = spawn_proxy(cfg_with(vec![account("a", "tok-a", 0, &mock.url())])).await;
+    let feed = http().get(p.url("/corrall/activity")).header("x-api-key", KEY).send().await.unwrap();
+    let mut stream = feed.bytes_stream();
+    let sid = "0f2a6c1e-1111-4222-8333-444455556666";
+    let r = http().post(p.url("/v1/messages")).header("x-claude-code-session-id", sid).json(&msg("claude-opus-5")).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    let mut parser = SseParser::default();
+    let mut label = None;
+    while label.is_none() {
+        let chunk = tokio::time::timeout(Duration::from_secs(3), stream.next()).await.expect("feed kept flowing").unwrap().unwrap();
+        for ev in parser.feed(&chunk) {
+            if let Some(Activity::Start { session, label: l, .. }) = Activity::from_json(&ev) {
+                assert_eq!(session.as_deref(), Some(sid));
+                label = l;
+            }
+        }
+    }
+    assert_eq!(label.as_deref(), Some("0f2a6c"), "titles are off, so the label is the short id");
+}
+
+/// Without a prober (tests, or a build that does not probe) the route says so
+/// instead of pretending.
+#[tokio::test]
+async fn probe_route_without_a_prober_is_not_implemented() {
+    let mock = spawn_mock().await;
+    let p = spawn_proxy(cfg_with(vec![account("a", "tok-a", 0, &mock.url())])).await;
+    let r = http().post(p.url("/corrall/probe")).header("x-api-key", KEY).send().await.unwrap();
+    assert_eq!(r.status(), 501);
+    let v: Value = r.json().await.unwrap();
+    assert_eq!(v["ok"], false);
 }

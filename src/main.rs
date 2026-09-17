@@ -60,6 +60,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
         }
         Command::Accounts { verbose, pool } => cli::accounts(verbose, pool),
         Command::Status { json, color } => cli::status(json, &color).await,
+        Command::Attach(a) => attach::run(a).await,
         Command::Switch { name, pool } => cli::switch(name, pool).await,
         Command::Remove { name, pool } => cli::remove(name, pool).await,
         Command::Disable { name, pool } => cli::set_disabled(name, true, pool).await,
@@ -162,6 +163,7 @@ async fn server(args: ServerArgs, interactive: bool) -> Result<()> {
         logger: logger.clone(),
         activity: activity_tx.clone(),
         reload: Some(reload),
+        prober: Some(prober.clone()),
         metrics: Metrics::default(),
         tls: RwLock::new(None),
         titles: titles.clone(),
@@ -276,7 +278,7 @@ async fn server(args: ServerArgs, interactive: bool) -> Result<()> {
         if interactive { "" } else { " [headless]" }
     );
     if interactive {
-        let t = tui::Tui::new(ctx.clone(), prober.clone(), activity_file);
+        let t = tui::Tui::new(tui::Backend::Local { ctx: ctx.clone(), prober: prober.clone() }, activity_file);
         let mut tx = shutdown_tx.clone();
         t.run(std::mem::replace(&mut tx, shutdown_tx.clone())).await?;
     } else {
@@ -288,7 +290,7 @@ async fn server(args: ServerArgs, interactive: bool) -> Result<()> {
             tokio::select! {
                 Ok(a) = rx.recv() => {
                     let line = match a {
-                        proxy::server::Activity::Start { id, method, path, model, session, client } => {
+                        proxy::server::Activity::Start { id, method, path, model, session, client, .. } => {
                             let label = ctx.titles.label(session.as_deref(), quota::now_ms());
                             format!("→ {id} {}{label} {method} {path}{}", client.map(|c| format!("[{c}] ")).unwrap_or_default(), model.map(|m| format!(" ({m})")).unwrap_or_default())
                         }

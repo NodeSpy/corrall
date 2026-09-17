@@ -2,6 +2,11 @@
 //! activity log with warnings picked out, and a few keys (q quit, R reload,
 //! s switch, p probe). All text that reaches the screen came through
 //! `safe_text` first.
+//!
+//! The facts come from a [`Backend`]: inside `corrall server` that is this
+//! process's own pools and activity channel; under `corrall attach` it is a
+//! running daemon's control API (see `attach.rs`). The drawing code does not
+//! know which.
 
 use std::collections::VecDeque;
 use std::io::{Stdout, Write};
@@ -16,6 +21,7 @@ use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 use serde_json::Value;
 use tracing_subscriber::fmt::MakeWriter;
 
+use crate::attach::{Link, Remote};
 use crate::prober::{ManualProbe, Prober};
 use crate::proxy::server::{Activity, Ctx};
 use crate::security::safe_text;
@@ -152,9 +158,115 @@ struct InFlight {
     account: String,
 }
 
+/// A request row still waiting for its `End` after this long is one whose
+/// end this process never saw (the attach feed reconnected under it); the
+/// proxy's own idle timeouts end a real request well before.
+const INFLIGHT_MAX_AGE: Duration = Duration::from_secs(30 * 60);
+
+/// Where the dashboard's facts come from.
+pub enum Backend {
+    /// This process is the server.
+    Local { ctx: Ctx, prober: Prober },
+    /// A daemon elsewhere, over its control API.
+    Remote(Remote),
+}
+
+impl Backend {
+    /// The status document the table is drawn from.
+    fn status(&self) -> Value {
+        match self {
+            Backend::Local { ctx, .. } => ctx.pools.status(false),
+            Backend::Remote(r) => r.status(),
+        }
+    }
+
+    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<Activity> {
+        match self {
+            Backend::Local { ctx, .. } => ctx.activity.subscribe(),
+            Backend::Remote(r) => r.subscribe(),
+        }
+    }
+
+    /// The session column: its label and the width it is padded to. In
+    /// process the titles cache answers; attached, the daemon sent the label
+    /// with the event and the status document carries the width setting.
+    fn session_label(&self, st: &Value, session: Option<&str>, label: Option<String>) -> (String, usize) {
+        match self {
+            Backend::Local { ctx, .. } => {
+                let width = if ctx.titles.enabled() { ctx.titles.width() } else { 6 };
+                (label.unwrap_or_else(|| ctx.titles.label(session, crate::quota::now_ms())), width)
+            }
+            Backend::Remote(_) => {
+                let titles = st.get("sessionTitles");
+                let enabled = titles.and_then(|t| t.get("enabled")).and_then(Value::as_bool).unwrap_or(false);
+                let width = if enabled { titles.and_then(|t| t.get("width")).and_then(Value::as_u64).unwrap_or(18) as usize } else { 6 };
+                (label.unwrap_or_else(|| session.map(|s| s.chars().take(6).collect()).unwrap_or_default()), width)
+            }
+        }
+    }
+
+    async fn switch(&self, pool: &str, id: &str) -> Result<Option<(String, Option<String>)>> {
+        match self {
+            Backend::Local { ctx, .. } => Ok(ctx.pools.get(pool).and_then(|m| m.switch_to(id))),
+            Backend::Remote(r) => r.switch(pool, id).await.map(Some),
+        }
+    }
+
+    /// `None` when there is nothing to reload (no reload hook).
+    async fn reload(&self) -> Option<Result<usize>> {
+        match self {
+            Backend::Local { ctx, .. } => ctx.reload.as_ref().map(|f| f()),
+            Backend::Remote(r) => Some(r.reload().await),
+        }
+    }
+
+    async fn probe(&self) -> String {
+        match self {
+            Backend::Local { prober, .. } => match prober.request_manual() {
+                ManualProbe::Started => "probing all OAuth accounts…".into(),
+                ManualProbe::AlreadyRunning => "probe already running".into(),
+                ManualProbe::TooSoon { wait_secs } => format!("probed moments ago; try again in {wait_secs}s"),
+            },
+            Backend::Remote(r) => match r.probe().await {
+                Ok(m) => m,
+                Err(e) => format!("probe failed: {}", safe_text(&e.to_string(), 80)),
+            },
+        }
+    }
+
+    /// The footer's "where": the address this process bound, or the daemon
+    /// this one is attached to. `main` binds before the TUI starts, so the
+    /// local answer is what is actually being served, not a hope.
+    fn where_line(&self) -> String {
+        match self {
+            Backend::Local { ctx, .. } => {
+                let cfg = ctx.config();
+                match crate::proxy::server::parse_bind(&cfg.bind_host(), cfg.proxy.port) {
+                    Ok(a) => format!("listening on http://{a}"),
+                    Err(_) => format!("listening on http://{}:{}", safe_text(&cfg.bind_host(), 40), cfg.proxy.port),
+                }
+            }
+            Backend::Remote(r) => format!("attached to {}", safe_text(r.base(), 60)),
+        }
+    }
+
+    /// A warning for the header when the daemon has stopped answering.
+    fn link_warning(&self) -> Option<String> {
+        match self {
+            Backend::Local { .. } => None,
+            Backend::Remote(r) => match r.link() {
+                Link::Fresh(_) => None,
+                Link::Connecting => Some("connecting…".into()),
+                Link::Lost { since, why } => {
+                    Some(format!("DAEMON UNREACHABLE for {} ({}); showing last known state", format_duration(since.as_millis() as i64), why))
+                }
+            },
+        }
+    }
+}
+
 pub struct Tui {
-    ctx: Ctx,
-    prober: Prober,
+    backend: Backend,
     log: VecDeque<(String, Severity)>,
     inflight: Vec<InFlight>,
     selecting: Option<usize>,
@@ -167,8 +279,8 @@ fn ts() -> String {
 }
 
 impl Tui {
-    pub fn new(ctx: Ctx, prober: Prober, activity_file: Option<std::fs::File>) -> Tui {
-        Tui { ctx, prober, log: VecDeque::new(), inflight: Vec::new(), selecting: None, message: None, activity_file }
+    pub fn new(backend: Backend, activity_file: Option<std::fs::File>) -> Tui {
+        Tui { backend, log: VecDeque::new(), inflight: Vec::new(), selecting: None, message: None, activity_file }
     }
 
     /// The `(pool, account)` pairs the table shows, in display order. This is
@@ -185,16 +297,6 @@ impl Tui {
         out
     }
 
-    /// The address this process bound. `main` binds before the TUI starts, so
-    /// this is what is actually being served, not a hope.
-    fn listen_url(&self) -> String {
-        let cfg = self.ctx.config();
-        match crate::proxy::server::parse_bind(&cfg.bind_host(), cfg.proxy.port) {
-            Ok(a) => format!("http://{a}"),
-            Err(_) => format!("http://{}:{}", safe_text(&cfg.bind_host(), 40), cfg.proxy.port),
-        }
-    }
-
     fn push_log(&mut self, line: String, severity: Severity) {
         let line = safe_text(&line, 300);
         if let Some(f) = &mut self.activity_file {
@@ -206,11 +308,10 @@ impl Tui {
         }
     }
 
-    fn on_activity(&mut self, a: Activity) {
+    fn on_activity(&mut self, st: &Value, a: Activity) {
         match a {
-            Activity::Start { id, method, path, model, session, client } => {
-                let width = if self.ctx.titles.enabled() { self.ctx.titles.width() } else { 6 };
-                let mut sess = self.ctx.titles.label(session.as_deref(), crate::quota::now_ms());
+            Activity::Start { id, method, path, model, session, client, label } => {
+                let (mut sess, width) = self.backend.session_label(st, session.as_deref(), label);
                 if sess.chars().count() > width {
                     sess = sess.chars().take(width).collect();
                 }
@@ -253,14 +354,15 @@ impl Tui {
     async fn event_loop(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>, shutdown: &mut tokio::sync::watch::Sender<bool>) -> Result<()> {
         let mut events = EventStream::new();
         // Every pool's log lines already arrive here as `Activity::Log`.
-        let mut activity = self.ctx.activity.subscribe();
+        let mut activity = self.backend.subscribe();
         let mut tick = tokio::time::interval(Duration::from_millis(500));
         loop {
-            let st = self.ctx.pools.status(false);
+            let st = self.backend.status();
+            self.inflight.retain(|r| r.started.elapsed() < INFLIGHT_MAX_AGE);
             terminal.draw(|f| self.draw(f, &st))?;
             tokio::select! {
                 _ = tick.tick() => {}
-                Ok(a) = activity.recv() => self.on_activity(a),
+                Ok(a) = activity.recv() => self.on_activity(&st, a),
                 Some(Ok(ev)) = events.next() => {
                     if let Event::Key(k) = ev {
                         if k.kind != KeyEventKind::Press { continue; }
@@ -277,12 +379,12 @@ impl Tui {
                                 KeyCode::Enter => {
                                     if let Some((pool, a)) = flat.get(sel) {
                                         let id = a.get("id").and_then(Value::as_str).unwrap_or_default();
-                                        if let Some((name, blocked)) = self.ctx.pools.get(pool).and_then(|m| m.switch_to(id)) {
-                                            self.message = Some(match blocked {
-                                                None => format!("switched to {name}"),
-                                                Some(b) => format!("switched to {name} (currently {b})"),
-                                            });
-                                        }
+                                        self.message = match self.backend.switch(pool, id).await {
+                                            Ok(Some((name, None))) => Some(format!("switched to {}", safe_text(&name, 40))),
+                                            Ok(Some((name, Some(b)))) => Some(format!("switched to {} (currently {})", safe_text(&name, 40), safe_text(&b, 40))),
+                                            Ok(None) => None,
+                                            Err(e) => Some(format!("switch failed: {}", safe_text(&e.to_string(), 80))),
+                                        };
                                     }
                                     self.selecting = None;
                                 }
@@ -293,20 +395,14 @@ impl Tui {
                         match k.code {
                             KeyCode::Char('q') => { let _ = shutdown.send(true); return Ok(()); }
                             KeyCode::Char('R') | KeyCode::Char('r') => {
-                                match self.ctx.reload.as_ref().map(|f| f()) {
+                                match self.backend.reload().await {
                                     Some(Ok(n)) => self.message = Some(format!("config reloaded ({n} added)")),
                                     Some(Err(e)) => self.message = Some(format!("reload failed: {}", safe_text(&e.to_string(), 80))),
                                     None => {}
                                 }
                             }
                             KeyCode::Char('s') => self.selecting = Some(0),
-                            KeyCode::Char('p') => {
-                                self.message = Some(match self.prober.request_manual() {
-                                    ManualProbe::Started => "probing all OAuth accounts…".into(),
-                                    ManualProbe::AlreadyRunning => "probe already running".into(),
-                                    ManualProbe::TooSoon { wait_secs } => format!("probed moments ago; try again in {wait_secs}s"),
-                                });
-                            }
+                            KeyCode::Char('p') => self.message = Some(self.backend.probe().await),
                             _ => {}
                         }
                     }
@@ -327,7 +423,7 @@ impl Tui {
             sessions.and_then(|s| s.get("active")).and_then(Value::as_u64).unwrap_or(0),
             sessions.and_then(|s| s.get("known")).and_then(Value::as_u64).unwrap_or(0),
             st.get("switchThreshold").map(|t| t.to_string()).unwrap_or_default(),
-            probe_summary(st, self.prober.interval(), crate::quota::now_ms()),
+            probe_summary(st, crate::quota::now_ms()),
         );
         // The release check is daemon-wide and records itself on the default
         // pool, which is what the status document's top level carries.
@@ -335,7 +431,11 @@ impl Tui {
             Some(tag) => format!("{header}   UPDATE {tag} available (corrall update)"),
             None => header,
         };
-        f.render_widget(Paragraph::new(header).style(Style::default().bold()), chunks[0]);
+        let mut head = vec![Line::from(header).style(Style::default().bold())];
+        if let Some(w) = self.backend.link_warning() {
+            head.push(Line::from(format!(" {w}")).style(Style::default().fg(Color::Red).bold()));
+        }
+        f.render_widget(Paragraph::new(head), chunks[0]);
 
         let flat = Self::flat_accounts(st);
         let now = crate::quota::now_ms();
@@ -423,19 +523,21 @@ impl Tui {
         let footer = match (&self.selecting, &self.message) {
             (Some(_), _) => " ↑/↓ choose account, Enter switch, Esc cancel".to_string(),
             (None, Some(m)) => format!(" {m}   |   q quit  R reload  s switch  p probe"),
-            (None, None) => format!(" q quit   R reload config   s switch account   p probe quota   listening on {}", self.listen_url()),
+            (None, None) => format!(" q quit   R reload config   s switch account   p probe quota   {}", self.backend.where_line()),
         };
         f.render_widget(Paragraph::new(footer).style(Style::default().fg(Color::DarkGray)), chunks[3]);
     }
 }
 
-/// The header's probe summary: interval, plus whether a run is on or when
-/// the next one is due.
-fn probe_summary(st: &Value, interval: u64, now: i64) -> String {
+/// The header's probe summary: the default pool's interval (the status
+/// document's top level), plus whether a run is on or when the next one is
+/// due.
+fn probe_summary(st: &Value, now: i64) -> String {
+    let probe = st.get("probe");
+    let interval = probe.and_then(|p| p.get("intervalSeconds")).and_then(Value::as_u64).unwrap_or(0);
     if interval == 0 {
         return "off".into();
     }
-    let probe = st.get("probe");
     if probe.and_then(|p| p.get("running")).and_then(Value::as_bool).unwrap_or(false) {
         return format!("{interval}s, running");
     }
@@ -476,10 +578,11 @@ mod tests {
     #[test]
     fn header_probe_summary() {
         let now = 1_000_000_000_000;
-        assert_eq!(probe_summary(&json!({}), 0, now), "off");
-        assert_eq!(probe_summary(&json!({ "probe": { "running": true } }), 300, now), "300s, running");
-        assert_eq!(probe_summary(&json!({ "probe": { "nextRunAt": now + 120_000 } }), 300, now), "300s, next 2m");
-        assert_eq!(probe_summary(&json!({ "probe": { "nextRunAt": now - 1 } }), 300, now), "300s");
+        assert_eq!(probe_summary(&json!({}), now), "off");
+        assert_eq!(probe_summary(&json!({ "probe": { "intervalSeconds": 0, "running": true } }), now), "off");
+        assert_eq!(probe_summary(&json!({ "probe": { "intervalSeconds": 300, "running": true } }), now), "300s, running");
+        assert_eq!(probe_summary(&json!({ "probe": { "intervalSeconds": 300, "nextRunAt": now + 120_000 } }), now), "300s, next 2m");
+        assert_eq!(probe_summary(&json!({ "probe": { "intervalSeconds": 300, "nextRunAt": now - 1 } }), now), "300s");
     }
 
     #[tokio::test]

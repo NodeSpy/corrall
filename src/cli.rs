@@ -45,6 +45,9 @@ pub enum Command {
         #[arg(long, default_value = "auto")]
         color: String,
     },
+    /// Show the TUI for a server that is already running (its status and
+    /// activity over the control API)
+    Attach(AttachArgs),
     /// Make the running server prefer one account
     Switch {
         name: Option<String>,
@@ -170,6 +173,19 @@ pub struct ServerArgs {
     /// Bind this port for this run instead of proxy.port
     #[arg(long, value_name = "PORT")]
     pub port: Option<u16>,
+}
+
+#[derive(Args, Debug, Default)]
+pub struct AttachArgs {
+    /// Control URL of the server to watch (default: the configured proxy.host/port)
+    #[arg(long, value_name = "URL")]
+    pub url: Option<String>,
+    /// Proxy key to present (default: proxy.apiKey from the config)
+    #[arg(long, value_name = "KEY")]
+    pub key: Option<String>,
+    /// Append activity lines to FILE
+    #[arg(long, value_name = "FILE")]
+    pub activity_log: Option<String>,
 }
 
 #[derive(Args, Debug)]

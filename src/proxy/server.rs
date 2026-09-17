@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
-use hyper::body::Incoming;
+use http_body_util::{BodyExt, Full, StreamBody};
+use hyper::body::{Frame, Incoming};
 use hyper::header::{HeaderMap, HeaderValue};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -62,10 +62,76 @@ pub struct ReqInfo {
 /// Activity events for the TUI / activity log.
 #[derive(Debug, Clone)]
 pub enum Activity {
-    Start { id: String, method: String, path: String, model: Option<String>, session: Option<String>, client: Option<String> },
-    Account { id: String, account: String },
-    End { id: String, account: String, status: u16, elapsed_ms: u128, ok: bool },
+    /// A request arrived. `label` is the session's display label when the
+    /// event came over `/corrall/activity` (the daemon resolved the title);
+    /// in-process it is `None` and the TUI asks its own `Titles`.
+    Start {
+        id: String,
+        method: String,
+        path: String,
+        model: Option<String>,
+        session: Option<String>,
+        client: Option<String>,
+        label: Option<String>,
+    },
+    Account {
+        id: String,
+        account: String,
+    },
+    End {
+        id: String,
+        account: String,
+        status: u16,
+        elapsed_ms: u128,
+        ok: bool,
+    },
     Log(String),
+}
+
+impl Activity {
+    /// The wire form `GET /corrall/activity` streams, one object per event.
+    /// A `start` carries the session label this daemon would draw, so an
+    /// attached TUI shows titles from this machine's Claude Code files.
+    pub fn to_json(&self, titles: &crate::titles::Titles, now: i64) -> Value {
+        match self {
+            Activity::Start { id, method, path, model, session, client, label } => {
+                let label = label.clone().or_else(|| session.as_deref().map(|s| titles.label(Some(s), now)));
+                json!({ "type": "start", "id": id, "method": method, "path": path, "model": model, "session": session, "client": client, "label": label })
+            }
+            Activity::Account { id, account } => json!({ "type": "account", "id": id, "account": account }),
+            Activity::End { id, account, status, elapsed_ms, ok } => {
+                json!({ "type": "end", "id": id, "account": account, "status": status, "elapsedMs": u64::try_from(*elapsed_ms).unwrap_or(u64::MAX), "ok": ok })
+            }
+            Activity::Log(line) => json!({ "type": "log", "line": line }),
+        }
+    }
+
+    /// Inverse of [`Activity::to_json`]. `None` for anything that is not an
+    /// activity event (a future event kind, a stray object).
+    pub fn from_json(v: &Value) -> Option<Activity> {
+        let s = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
+        match v.get("type").and_then(Value::as_str)? {
+            "start" => Some(Activity::Start {
+                id: s("id")?,
+                method: s("method").unwrap_or_default(),
+                path: s("path").unwrap_or_default(),
+                model: s("model"),
+                session: s("session"),
+                client: s("client"),
+                label: s("label"),
+            }),
+            "account" => Some(Activity::Account { id: s("id")?, account: s("account").unwrap_or_default() }),
+            "end" => Some(Activity::End {
+                id: s("id")?,
+                account: s("account").unwrap_or_default(),
+                status: v.get("status").and_then(Value::as_u64).and_then(|n| u16::try_from(n).ok()).unwrap_or(0),
+                elapsed_ms: u128::from(v.get("elapsedMs").and_then(Value::as_u64).unwrap_or(0)),
+                ok: v.get("ok").and_then(Value::as_bool).unwrap_or(false),
+            }),
+            "log" => Some(Activity::Log(s("line")?)),
+            _ => None,
+        }
+    }
 }
 
 pub struct CtxInner {
@@ -74,6 +140,9 @@ pub struct CtxInner {
     pub logger: Option<RequestLogger>,
     pub activity: tokio::sync::broadcast::Sender<Activity>,
     pub reload: Option<Box<dyn Fn() -> Result<usize> + Send + Sync>>,
+    /// The quota prober, so `POST /corrall/probe` can start a run. `None`
+    /// where nothing probes (tests).
+    pub prober: Option<crate::prober::Prober>,
     pub metrics: Metrics,
     pub tls: RwLock<Option<Arc<tokio_rustls::rustls::ServerConfig>>>,
     pub titles: crate::titles::Titles,
@@ -190,7 +259,7 @@ pub async fn bind(addr: SocketAddr) -> Result<TcpListener> {
         Ok(l) => Ok(l),
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => Err(anyhow::anyhow!(
             "{addr} is already in use: another corrall is probably listening there. \
-             Use `corrall status` to talk to it, or pass --port to run a second instance"
+             Use `corrall attach` to watch it, `corrall status` to query it, or pass --port to run a second instance"
         )),
         Err(e) => Err(e).with_context(|| format!("binding {addr}")),
     }
@@ -452,6 +521,7 @@ async fn handle(ctx: Ctx, req: Request<Incoming>, peer: IpAddr, tunnel: Option<&
             model: info.model.clone(),
             session: info.session_id.clone(),
             client: info.client.clone(),
+            label: None,
         });
     }
     manager.begin_session_request(info.session_id.as_deref(), info.client.as_deref());
@@ -504,6 +574,20 @@ async fn control(ctx: &Ctx, req: Request<Incoming>, auth: &Auth, asked_pool: Opt
             }
             json_response(StatusCode::OK, q)
         }
+        (Method::GET, "/corrall/activity") => activity_stream(ctx),
+        (Method::POST, "/corrall/probe") => match &ctx.prober {
+            None => json_response(StatusCode::NOT_IMPLEMENTED, json!({ "ok": false, "error": "probe not available" })),
+            Some(p) => match p.request_manual() {
+                crate::prober::ManualProbe::Started => json_response(StatusCode::OK, json!({ "ok": true, "result": "started" })),
+                crate::prober::ManualProbe::AlreadyRunning => {
+                    json_response(StatusCode::OK, json!({ "ok": false, "result": "already-running", "error": "probe already running" }))
+                }
+                crate::prober::ManualProbe::TooSoon { wait_secs } => json_response(
+                    StatusCode::OK,
+                    json!({ "ok": false, "result": "too-soon", "waitSeconds": wait_secs, "error": format!("probed moments ago; try again in {wait_secs}s") }),
+                ),
+            },
+        },
         (Method::GET, "/corrall/metrics") => {
             let mut r = Response::new(Full::new(Bytes::from(render_metrics(ctx))).map_err(|e| match e {}).boxed());
             r.headers_mut().insert("content-type", HeaderValue::from_static("text/plain; version=0.0.4"));
@@ -608,6 +692,48 @@ async fn control(ctx: &Ctx, req: Request<Incoming>, auth: &Auth, asked_pool: Opt
 /// on an empty/absent body. Returns a ready error response on an oversized or
 /// unreadable body, matching the other control routes' conventions. The error
 /// is boxed so the `Ok` path does not carry a full `Response` in its size.
+/// A comment line this often keeps an idle activity stream from being cut by
+/// anything between the daemon and its watcher.
+const ACTIVITY_PING: Duration = Duration::from_secs(15);
+
+/// `GET /corrall/activity` — the activity feed as server-sent events: one
+/// `data:` line per event carrying [`Activity::to_json`], a `: ping` comment
+/// every [`ACTIVITY_PING`]. Open until the client goes away. This is what
+/// `corrall attach` tails.
+fn activity_stream(ctx: &Ctx) -> Response<BoxBody> {
+    use tokio::sync::broadcast::error::RecvError;
+    let mut rx = ctx.activity.subscribe();
+    let titles = ctx.titles.clone();
+    let (tx, body_rx) = tokio::sync::mpsc::channel::<std::result::Result<Frame<Bytes>, std::io::Error>>(64);
+    tokio::spawn(async move {
+        if tx.send(Ok(Frame::data(Bytes::from_static(b": corrall activity\n\n")))).await.is_err() {
+            return;
+        }
+        let mut ping = tokio::time::interval(ACTIVITY_PING);
+        ping.tick().await;
+        loop {
+            let frame = tokio::select! {
+                r = rx.recv() => match r {
+                    Ok(a) => format!("data: {}\n\n", a.to_json(&titles, crate::quota::now_ms())),
+                    Err(RecvError::Lagged(n)) => format!("data: {}\n\n", Activity::Log(format!("activity feed lagged; {n} events dropped")).to_json(&titles, 0)),
+                    Err(RecvError::Closed) => break,
+                },
+                _ = ping.tick() => ": ping\n\n".to_string(),
+            };
+            if tx.send(Ok(Frame::data(Bytes::from(frame)))).await.is_err() {
+                break; // watcher gone
+            }
+        }
+    });
+    let stream = futures_util::stream::unfold(body_rx, |mut rx| async move { rx.recv().await.map(|item| (item, rx)) });
+    let body = StreamBody::new(stream).map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>).boxed();
+    let mut r = Response::new(body);
+    r.headers_mut().insert("content-type", HeaderValue::from_static("text/event-stream"));
+    r.headers_mut().insert("cache-control", HeaderValue::from_static("no-store"));
+    r.headers_mut().insert("x-accel-buffering", HeaderValue::from_static("no"));
+    r
+}
+
 async fn control_body(req: Request<Incoming>) -> std::result::Result<Value, Box<Response<BoxBody>>> {
     match read_body(req.into_body(), CONTROL_BODY_LIMIT).await {
         Ok(b) => Ok(serde_json::from_slice(&b).unwrap_or(json!({}))),
