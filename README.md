@@ -48,6 +48,7 @@ Then:
 corrall login       # browser OAuth, once per account
 corrall server      # start the proxy; shows the TUI on a terminal
 corrall run         # in another terminal: Claude Code through the proxy
+corrall attach      # the same TUI for a server already running (e.g. the service)
 ```
 
 Already logged into Claude Code? `corrall import` copies its credentials.
@@ -130,7 +131,8 @@ rather than create an empty config beside your accounts.
 - Repairs orphaned `tool_use`/`tool_result` pairs so a compacted transcript
   cannot wedge a session with a non-retryable 400.
 - TUI with quota bars, reset countdowns, live activity log, account switching,
-  config reload and a one-shot quota probe.
+  config reload and a one-shot quota probe. `corrall attach` shows the same
+  dashboard for a server that is already running, over its control API.
 - OpenAI Codex subscriptions pooled alongside Claude accounts (`login --codex`,
   `import --codex`), rotating independently on the same port.
 - Expiry-pressure routing (`expiry on`): prefer the account whose ample weekly
@@ -140,7 +142,8 @@ rather than create an empty config beside your accounts.
 - Client-side OAuth token refresh and Remote Control (`/v1/code/*`, including
   its WebSocket) pass through untouched with the client's own credentials.
 - Browser dashboard at `/corrall/dashboard`, plus `/corrall/status`,
-  `/corrall/quota`, `/corrall/metrics` (Prometheus) and `/corrall/health`.
+  `/corrall/quota`, `/corrall/metrics` (Prometheus), `/corrall/health` and
+  `/corrall/activity` (the request/log feed as server-sent events).
 
 ## Everyday commands
 
@@ -148,6 +151,7 @@ rather than create an empty config beside your accounts.
 corrall accounts -v          # accounts with tier and token status
 corrall status               # live proxy status (needs a running server)
 corrall status --json
+corrall attach               # live TUI for the running server (q to leave it running)
 corrall switch <name>        # make the server prefer one account
 corrall disable <name>       # pause an account without removing it
 corrall priority <name> 1    # rotation order, lower = preferred
@@ -349,14 +353,14 @@ Added: named pools with `/pool/<name>` routing and launch-context
 auto-selection, Prometheus metrics, health endpoint, JSON logs
 (`--log-format json`),
 `config check`, `import --link`, `requireKeyOnLoopback`, `maxBodyBytes`,
+`attach` (the TUI over the control API, replacing the original's remote TUI),
 tunnel allow-lists, graceful shutdown with state persistence, signed release
 builds with provenance attestations, a verifying `update` subcommand, and the
 security changes above.
 
 Not ported (by choice): the unattended daily self-update (`update` is manual
 and verifying), the sx.org residential egress
-integration, the egress-IP guard, the remote TUI (`attach`), shell alias
-installation, the launchd service file, warm-up wall-clock schedules (interval
+integration, the egress-IP guard, shell alias installation, the launchd service file, warm-up wall-clock schedules (interval
 mode only), and the Nix packaging.
 
 ## Paseo plugin

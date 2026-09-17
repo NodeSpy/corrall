@@ -196,12 +196,23 @@ refused.
 | `GET status` | Full account, quota, route, session and client-usage view. One entry per pool under `pools`; the default pool's view is also flattened onto the top level |
 | `GET quota` | Tier-weighted fleet quota for status lines, for the addressed pool |
 | `GET metrics` | Prometheus text format. Per-account series carry a `pool="…"` label |
+| `GET activity` | The activity feed as server-sent events: one JSON object per `data:` line (`type` is `start`, `account`, `end` or `log`), a `: ping` comment every 15 s. Stays open until the client leaves. What `corrall attach` tails |
 | `POST reload` | Re-read the config |
+| `POST probe` | Start a quota probe of every OAuth account now. `{ ok: true, result: "started" }`, or `ok: false` with `result` `already-running` / `too-soon` (and `waitSeconds`) |
 | `POST switch` `{ "account": "…", "pool"? }` | Prefer one account. Without a pool, every pool is searched |
 | `POST route-pin` `{ "route": "…", "account": "…", "pool"? }` | Pin a route (omit `account` to clear) |
 
 A `/pool/<name>` prefix on the control path selects the pool too, so
 `/pool/work/corrall/quota` reads the `work` fleet.
+
+### Attaching a dashboard
+
+`corrall attach` draws the server's TUI in another terminal without starting
+a second server: it polls `status` every 2 s, tails `activity`, and sends
+`switch`, `reload` and `probe` on the `s`, `R` and `p` keys. The address and
+key come from the config; `--url http://host:port` and `--key` override them
+for a server elsewhere. Quitting leaves the server running. If the server
+stops answering, the header says so and the table keeps the last state it saw.
 
 ## Passthrough paths
 
