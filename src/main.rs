@@ -135,6 +135,7 @@ async fn server(args: ServerArgs, interactive: bool) -> Result<()> {
     let ctx_cell: Arc<parking_lot::Mutex<Option<Ctx>>> = Arc::new(parking_lot::Mutex::new(None));
     let reload: Box<dyn Fn() -> Result<usize> + Send + Sync> = {
         let pools = pools.clone();
+        let prober = prober.clone();
         let warmer = warmer.clone();
         let titles = titles.clone();
         let cell = ctx_cell.clone();
@@ -144,9 +145,11 @@ async fn server(args: ServerArgs, interactive: bool) -> Result<()> {
             // The listener is already bound; re-applying the override keeps the
             // config everything else reads agreeing with the address in use.
             cli::apply_listen_override(&mut cfg, listen.as_deref(), port)?;
-            // Per-pool probe intervals ride along on each manager, so the
-            // prober needs no separate notification.
+            // Per-pool probe intervals ride along on each manager; the kick
+            // only cuts the prober's tick short so an account a login just
+            // added is probed now rather than a few seconds from now.
             let added = pools.sync_config(&cfg);
+            prober.kick();
             warmer.set_interval(cfg.warmup_seconds);
             warmer.set_api_key(&cfg.proxy.api_key);
             titles.configure(&cfg.session_titles);

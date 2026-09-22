@@ -157,7 +157,7 @@ corrall disable <name>       # pause an account without removing it
 corrall priority <name> 1    # rotation order, lower = preferred
 corrall threshold 90         # switch at 90% (or: threshold unified7d=90)
 corrall distribute on        # spread sessions across equal-priority accounts
-corrall probe 300            # background quota probe every 300s (zero-spend)
+corrall probe 300            # probe each account's quota every 300s, staggered (zero-spend)
 corrall warmup 600           # keep idle accounts' 5h windows running (spends a little)
 corrall expiry on            # expiry-pressure routing (--tolerance 1.5 --preempt on)
 corrall titles on            # name activity rows after the Claude Code session
