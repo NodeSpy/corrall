@@ -348,6 +348,10 @@ pub struct ProbeState {
     pub last_run_finished_at: Option<i64>,
     pub next_run_at: Option<i64>,
     pub accounts: HashMap<String, ProbeAccount>,
+    /// Accounts whose credential a reload replaced (a re-login, a rotated
+    /// key) since the prober last asked. The prober drains this and probes
+    /// them ahead of their turn, since the old quota reading may be stale.
+    pub recheck: HashSet<String>,
 }
 
 pub const DIMENSION_MAX_VALUES: usize = 500;
@@ -456,6 +460,7 @@ impl Manager {
             f.probe.interval_secs = p.quota_probe_seconds;
             f.warmup_secs = cfg.warmup_seconds;
             let mut next: Vec<Account> = Vec::with_capacity(p.accounts.len());
+            let mut recheck: Vec<String> = Vec::new();
             for c in &p.accounts {
                 let id = c.id.clone().unwrap_or_default();
                 if let Some(pos) = f.accounts.iter().position(|a| a.id == id) {
@@ -489,6 +494,7 @@ impl Manager {
                         a.credential = fresh.credential;
                         a.refresh_token = fresh.refresh_token;
                         a.expires_at = fresh.expires_at;
+                        recheck.push(a.id.clone());
                         if a.status == Status::Error {
                             a.status = Status::Active;
                             a.error_message = None;
@@ -514,6 +520,7 @@ impl Manager {
                 tracing::info!("account \"{}\" removed", gone.name);
             }
             f.accounts = next;
+            f.probe.recheck.extend(recheck);
             let ids: Vec<String> = f.accounts.iter().map(|a| a.id.clone()).collect();
             f.sessions.remap_accounts(&ids);
             f.route_pins.retain(|_, v| ids.contains(v));
@@ -1017,6 +1024,12 @@ impl Manager {
 
     pub fn update_available(&self) -> Option<String> {
         self.with(|f| f.update_available.clone())
+    }
+
+    /// Accounts whose credential changed since the last call, and clear the
+    /// list. See [`ProbeState::recheck`].
+    pub fn take_probe_recheck(&self) -> Vec<String> {
+        self.with(|f| f.probe.recheck.drain().collect())
     }
 
     pub fn probe_run_started(&self, now: i64, next: Option<i64>) {
@@ -2240,8 +2253,12 @@ mod tests {
         rotated.expires_at = Some(base.expires_at.unwrap() + 60_000);
         m.sync_config(&cfg_with(vec![rotated]), crate::config::DEFAULT_POOL);
         assert_eq!(m.credential_of(&id).as_deref(), Some("tok2"));
+        // The change is flagged for the prober, once.
+        assert_eq!(m.take_probe_recheck(), vec![id.clone()]);
+        assert!(m.take_probe_recheck().is_empty());
 
-        // We refreshed in memory after the file was written: keep ours.
+        // We refreshed in memory after the file was written: keep ours, and
+        // there is nothing to re-probe.
         m.with(|f| {
             let a = f.account_mut(&id).unwrap();
             a.credential = Some("tok3".into());
@@ -2249,5 +2266,20 @@ mod tests {
         });
         m.sync_config(&cfg_with(vec![base]), crate::config::DEFAULT_POOL);
         assert_eq!(m.credential_of(&id).as_deref(), Some("tok3"));
+        assert!(m.take_probe_recheck().is_empty(), "a kept credential is not a change");
+    }
+
+    /// A plain reload with nothing changed must not flag anyone: the prober
+    /// would otherwise re-probe the whole fleet on every `corrall pool set`.
+    #[test]
+    fn reload_without_a_credential_change_flags_no_recheck() {
+        let mut base = acct("a", 0);
+        base.id = Some("acct-a".into());
+        let m = mgr(&cfg_with(vec![base.clone()]));
+        // Construction adds the account (not a change); a reload of the same
+        // file must not flag it either.
+        assert!(m.take_probe_recheck().is_empty());
+        m.sync_config(&cfg_with(vec![base]), crate::config::DEFAULT_POOL);
+        assert!(m.take_probe_recheck().is_empty());
     }
 }

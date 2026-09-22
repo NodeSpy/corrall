@@ -7,7 +7,9 @@
 //! interval: with six accounts on a 300s interval one is probed every 50s, so
 //! the fleet's quota is never all the same age. An account that arrives later
 //! (a `corrall login` while the server runs) is probed on the next tick, which
-//! a reload wakes up early, and then joins the rotation from that moment.
+//! a reload wakes up early, and then joins the rotation from that moment. So
+//! is an account whose credential a reload replaced (a re-login, a rotated
+//! key): its last reading was taken on the old credential.
 //!
 //! The usage endpoint rate-limits the caller, not the account: when it says
 //! 429 it says so for every account of the fleet within the same second. A
@@ -123,7 +125,8 @@ impl Prober {
         loop {
             for (name, m) in self.pools.each() {
                 let secs = m.probe_seconds();
-                let Some(claim) = self.claim_due(&name, secs, &m.oauth_accounts(), Instant::now()) else { continue };
+                let recheck = m.take_probe_recheck();
+                let Some(claim) = self.claim_due(&name, secs, &m.oauth_accounts(), &recheck, Instant::now()) else { continue };
                 if claim.newly_on {
                     m.log(format!("Quota probe enabled for pool \"{name}\" (every {secs}s, accounts staggered)"));
                 }
@@ -147,12 +150,13 @@ impl Prober {
     /// are spread across the interval: account `i` of `n` is next due at
     /// `now + interval + i * interval / n`, and every `interval` after that.
     /// An account without a booking (added since the last tick) is due now and
-    /// then keeps the phase of its arrival. A booking that has slipped more
-    /// than a whole interval (a long backoff) restarts from `now`.
+    /// then keeps the phase of its arrival; so is one named in `recheck`,
+    /// whose credential a reload just replaced. A booking that has slipped
+    /// more than a whole interval (a long backoff) restarts from `now`.
     ///
     /// Sync on purpose: it keeps the lock guard out of `run`'s future, which
     /// otherwise would not be `Send`.
-    fn claim_due(&self, pool: &str, secs: u64, accounts: &[(String, String)], now: Instant) -> Option<Claim> {
+    fn claim_due(&self, pool: &str, secs: u64, accounts: &[(String, String)], recheck: &[String], now: Instant) -> Option<Claim> {
         let mut seen = self.seen.lock();
         if secs == 0 {
             seen.remove(pool);
@@ -165,7 +169,7 @@ impl Prober {
         let interval = Duration::from_secs(secs.max(MIN_INTERVAL));
         let newly_on = !entry.on;
         entry.on = true;
-        entry.due.retain(|id, _| accounts.iter().any(|(a, _)| a == id));
+        entry.due.retain(|id, _| accounts.iter().any(|(a, _)| a == id) && !recheck.contains(id));
         let n = accounts.len().max(1) as u32;
         let mut picked = Vec::new();
         for (i, (id, name)) in accounts.iter().enumerate() {
@@ -349,22 +353,22 @@ mod tests {
         let p = prober();
         let t0 = Instant::now();
         let a = accts(&["a", "b", "c"]);
-        let c = p.claim_due("default", 300, &a, t0).expect("first tick is due");
+        let c = p.claim_due("default", 300, &a, &[], t0).expect("first tick is due");
         assert!(c.newly_on, "first claim after enabling logs");
         assert_eq!(ids(&c), ["a", "b", "c"]);
         assert_eq!(c.next, Some(t0 + Duration::from_secs(300)), "the first account is next, a whole interval on");
         // Nobody is due again before the interval.
-        assert_eq!(p.claim_due("default", 300, &a, t0 + Duration::from_secs(299)), None);
+        assert_eq!(p.claim_due("default", 300, &a, &[], t0 + Duration::from_secs(299)), None);
         // Then one at a time, 100s apart: a at 300, b at 400, c at 500.
-        let c = p.claim_due("default", 300, &a, t0 + Duration::from_secs(300)).unwrap();
+        let c = p.claim_due("default", 300, &a, &[], t0 + Duration::from_secs(300)).unwrap();
         assert!(!c.newly_on);
         assert_eq!(ids(&c), ["a"]);
         assert_eq!(c.next, Some(t0 + Duration::from_secs(400)));
-        assert_eq!(p.claim_due("default", 300, &a, t0 + Duration::from_secs(350)), None);
-        assert_eq!(ids(&p.claim_due("default", 300, &a, t0 + Duration::from_secs(400)).unwrap()), ["b"]);
-        assert_eq!(ids(&p.claim_due("default", 300, &a, t0 + Duration::from_secs(500)).unwrap()), ["c"]);
+        assert_eq!(p.claim_due("default", 300, &a, &[], t0 + Duration::from_secs(350)), None);
+        assert_eq!(ids(&p.claim_due("default", 300, &a, &[], t0 + Duration::from_secs(400)).unwrap()), ["b"]);
+        assert_eq!(ids(&p.claim_due("default", 300, &a, &[], t0 + Duration::from_secs(500)).unwrap()), ["c"]);
         // Each keeps its phase: a is back at 600, not at 300 after its late tick.
-        let c = p.claim_due("default", 300, &a, t0 + Duration::from_secs(603)).unwrap();
+        let c = p.claim_due("default", 300, &a, &[], t0 + Duration::from_secs(603)).unwrap();
         assert_eq!(ids(&c), ["a"]);
         assert_eq!(c.next, Some(t0 + Duration::from_secs(700)));
     }
@@ -373,18 +377,36 @@ mod tests {
     fn a_new_account_is_due_at_once_and_a_removed_one_is_forgotten() {
         let p = prober();
         let t0 = Instant::now();
-        p.claim_due("default", 300, &accts(&["a", "b"]), t0).unwrap();
+        p.claim_due("default", 300, &accts(&["a", "b"]), &[], t0).unwrap();
         // A login lands "c" between ticks: it is probed now, nobody else is.
-        let c = p.claim_due("default", 300, &accts(&["a", "b", "c"]), t0 + Duration::from_secs(20)).unwrap();
+        let c = p.claim_due("default", 300, &accts(&["a", "b", "c"]), &[], t0 + Duration::from_secs(20)).unwrap();
         assert!(!c.newly_on);
         assert_eq!(ids(&c), ["c"]);
         // and it then keeps the phase of its arrival, behind a's turn at 300.
-        assert_eq!(p.claim_due("default", 300, &accts(&["a", "b", "c"]), t0 + Duration::from_secs(299)), None);
-        assert_eq!(ids(&p.claim_due("default", 300, &accts(&["a", "b", "c"]), t0 + Duration::from_secs(300)).unwrap()), ["a"]);
-        assert_eq!(ids(&p.claim_due("default", 300, &accts(&["a", "b", "c"]), t0 + Duration::from_secs(320)).unwrap()), ["c"]);
+        assert_eq!(p.claim_due("default", 300, &accts(&["a", "b", "c"]), &[], t0 + Duration::from_secs(299)), None);
+        assert_eq!(ids(&p.claim_due("default", 300, &accts(&["a", "b", "c"]), &[], t0 + Duration::from_secs(300)).unwrap()), ["a"]);
+        assert_eq!(ids(&p.claim_due("default", 300, &accts(&["a", "b", "c"]), &[], t0 + Duration::from_secs(320)).unwrap()), ["c"]);
         // Dropping "b" forgets its booking; adding it back treats it as new.
-        assert_eq!(p.claim_due("default", 300, &accts(&["a", "c"]), t0 + Duration::from_secs(330)), None);
-        assert_eq!(ids(&p.claim_due("default", 300, &accts(&["a", "b", "c"]), t0 + Duration::from_secs(340)).unwrap()), ["b"]);
+        assert_eq!(p.claim_due("default", 300, &accts(&["a", "c"]), &[], t0 + Duration::from_secs(330)), None);
+        assert_eq!(ids(&p.claim_due("default", 300, &accts(&["a", "b", "c"]), &[], t0 + Duration::from_secs(340)).unwrap()), ["b"]);
+    }
+
+    #[test]
+    fn a_changed_credential_is_probed_at_once_and_rebooked() {
+        let p = prober();
+        let t0 = Instant::now();
+        let a = accts(&["a", "b"]);
+        p.claim_due("default", 300, &a, &[], t0).unwrap();
+        // A re-login of "b" lands at 20: b is probed now, a waits for 300.
+        let c = p.claim_due("default", 300, &a, &["b".to_string()], t0 + Duration::from_secs(20)).unwrap();
+        assert_eq!(ids(&c), ["b"]);
+        assert_eq!(c.next, Some(t0 + Duration::from_secs(300)));
+        // b's old booking of 450 is gone; it is next due at 320.
+        assert_eq!(ids(&p.claim_due("default", 300, &a, &[], t0 + Duration::from_secs(300)).unwrap()), ["a"]);
+        assert_eq!(ids(&p.claim_due("default", 300, &a, &[], t0 + Duration::from_secs(320)).unwrap()), ["b"]);
+        assert_eq!(p.claim_due("default", 300, &a, &[], t0 + Duration::from_secs(450)), None);
+        // A recheck for an account the pool no longer has is ignored.
+        assert_eq!(p.claim_due("default", 300, &a, &["zz".to_string()], t0 + Duration::from_secs(460)), None);
     }
 
     #[test]
@@ -392,19 +414,19 @@ mod tests {
         let p = prober();
         let t0 = Instant::now();
         let a = accts(&["a"]);
-        assert!(p.claim_due("default", 5, &a, t0).unwrap().newly_on);
+        assert!(p.claim_due("default", 5, &a, &[], t0).unwrap().newly_on);
         // Below the floor the floor wins.
-        assert_eq!(p.claim_due("default", 5, &a, t0 + Duration::from_secs(10)), None);
-        assert_eq!(ids(&p.claim_due("default", 5, &a, t0 + Duration::from_secs(30)).unwrap()), ["a"]);
+        assert_eq!(p.claim_due("default", 5, &a, &[], t0 + Duration::from_secs(10)), None);
+        assert_eq!(ids(&p.claim_due("default", 5, &a, &[], t0 + Duration::from_secs(30)).unwrap()), ["a"]);
         // Switching off forgets the pool; switching back on logs again and
         // probes everyone.
-        assert_eq!(p.claim_due("default", 0, &a, t0 + Duration::from_secs(40)), None);
-        let c = p.claim_due("default", 300, &a, t0 + Duration::from_secs(41)).unwrap();
+        assert_eq!(p.claim_due("default", 0, &a, &[], t0 + Duration::from_secs(40)), None);
+        let c = p.claim_due("default", 300, &a, &[], t0 + Duration::from_secs(41)).unwrap();
         assert!(c.newly_on);
         assert_eq!(ids(&c), ["a"]);
         // A pool with no OAuth accounts still logs that it is on, once.
-        assert!(p.claim_due("empty", 300, &[], t0).unwrap().newly_on);
-        assert_eq!(p.claim_due("empty", 300, &[], t0 + Duration::from_secs(1)), None);
+        assert!(p.claim_due("empty", 300, &[], &[], t0).unwrap().newly_on);
+        assert_eq!(p.claim_due("empty", 300, &[], &[], t0 + Duration::from_secs(1)), None);
     }
 
     #[test]
@@ -412,21 +434,21 @@ mod tests {
         let p = prober();
         let t0 = Instant::now();
         let a = accts(&["a", "b"]);
-        assert!(p.claim_due("default", 300, &a, t0).unwrap().newly_on);
+        assert!(p.claim_due("default", 300, &a, &[], t0).unwrap().newly_on);
         let until = p.back_off("default", 300, t0);
         assert_eq!(until, t0 + Duration::from_secs(600));
         // Due by the plain schedule, but still backing off.
-        assert_eq!(p.claim_due("default", 300, &a, t0 + Duration::from_secs(301)), None);
-        assert_eq!(p.claim_due("default", 300, &a, t0 + Duration::from_secs(599)), None);
+        assert_eq!(p.claim_due("default", 300, &a, &[], t0 + Duration::from_secs(301)), None);
+        assert_eq!(p.claim_due("default", 300, &a, &[], t0 + Duration::from_secs(599)), None);
         // When it lifts, both overdue accounts run in one (staggered) run: a's
         // booking of 300 has slipped a whole interval and restarts from now;
         // b's of 450 keeps its phase.
-        let c = p.claim_due("default", 300, &a, t0 + Duration::from_secs(600)).unwrap();
+        let c = p.claim_due("default", 300, &a, &[], t0 + Duration::from_secs(600)).unwrap();
         assert_eq!(ids(&c), ["a", "b"]);
         assert_eq!(c.next, Some(t0 + Duration::from_secs(750)));
         // The backoff is spent once a run happens: b at 750, a at 900.
-        assert_eq!(ids(&p.claim_due("default", 300, &a, t0 + Duration::from_secs(800)).unwrap()), ["b"]);
-        assert_eq!(ids(&p.claim_due("default", 300, &a, t0 + Duration::from_secs(900)).unwrap()), ["a"]);
+        assert_eq!(ids(&p.claim_due("default", 300, &a, &[], t0 + Duration::from_secs(800)).unwrap()), ["b"]);
+        assert_eq!(ids(&p.claim_due("default", 300, &a, &[], t0 + Duration::from_secs(900)).unwrap()), ["a"]);
     }
 
     #[test]
