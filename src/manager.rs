@@ -38,6 +38,10 @@ const THROTTLE_PROBE_FLOOR_MS: i64 = 30 * 1000;
 /// Without this margin several long turns admitted at 96-97% took accounts
 /// past 100% before any reading reached the switch threshold.
 pub const OPEN_REQUEST_HEADROOM: f64 = 0.01;
+/// Headerless 429s on this many accounts within `FLEET_429_WINDOW_MS` mean
+/// the limit is upstream-wide rather than per account.
+const FLEET_429_ACCOUNTS: usize = 2;
+const FLEET_429_WINDOW_MS: i64 = 30 * 1000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -121,6 +125,8 @@ pub struct Account {
     /// window already reset may lift it early.
     pub quota_hold: bool,
     pub throttled_at: Option<i64>,
+    /// When this account last answered a 429 with no `retry-after`.
+    pub headerless_429_at: Option<i64>,
     pub last_probe_at: Option<i64>,
     pub entitlement_denied_until: Option<i64>,
     pub dead_refresh_token: Option<String>,
@@ -167,6 +173,7 @@ impl Account {
             rate_limited_until: None,
             quota_hold: false,
             throttled_at: None,
+            headerless_429_at: None,
             last_probe_at: None,
             entitlement_denied_until: None,
             dead_refresh_token: None,
@@ -920,6 +927,22 @@ impl Manager {
         if let Some(n) = name {
             self.log(format!("Account \"{n}\" rate limited for {secs}s"));
         }
+    }
+
+    /// Record a 429 with no `retry-after` on `id` and report whether enough
+    /// accounts of the fleet have had one recently that the limit is
+    /// upstream-wide. On 2026-09-23 four accounts answered bare
+    /// `rate_limit_error`s within the same seconds; retrying each inline
+    /// every 5s sent five attempts per client request into a throttle no
+    /// account could get past.
+    pub fn note_headerless_429(&self, id: &str) -> bool {
+        let now = now_ms();
+        self.with(|f| {
+            if let Some(a) = f.account_mut(id) {
+                a.headerless_429_at = Some(now);
+            }
+            f.accounts.iter().filter(|a| a.headerless_429_at.is_some_and(|t| now - t < FLEET_429_WINDOW_MS)).count() >= FLEET_429_ACCOUNTS
+        })
     }
 
     pub fn clear_rate_limited(&self, id: &str) {

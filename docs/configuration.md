@@ -346,7 +346,11 @@ and retries the same account; longer than that it fails over once. Without a
 assuming 60s. A request rate-limited on two accounts in a row is answered 429
 with the upstream `retry-after` instead of trying a third: a limit that follows
 the request across accounts is not per-account, and each further hop only
-marked another account unavailable to every other session. Every such 429 is
+marked another account unavailable to every other session. Once two accounts
+have answered a 429 without `retry-after` within 30s, the next such 429 is
+passed to the client at once with `retry-after: 10` and no inline retry: the
+throttle is in front of the whole fleet, and each retry only added load to it
+on top of the client's own retries. Every such 429 is
 logged at `warn` with its `retry-after`, `content-type`, `cf-ray`,
 `request-id` and the start of its body.
 
