@@ -310,6 +310,25 @@ fn parse_retry_after(v: &str, now: chrono::DateTime<chrono::Utc>) -> Option<i64>
     Some((at.with_timezone(&chrono::Utc) - now).num_seconds().max(1))
 }
 
+/// How long to hold an account whose quota was rejected: until the latest
+/// reset among the rejected windows (`unified-5h`/`unified-7d`, epoch
+/// seconds), so it stays out of rotation until it can serve again. A flat
+/// hour let a 5h window with three hours left come back as "active" at 100%.
+/// Without a usable reset header, `retry-after` capped at an hour.
+fn quota_hold_secs(rl: &BTreeMap<String, String>, retry_after: i64, now_secs: i64) -> u64 {
+    let rejected = |b: &str| rl.get(&format!("anthropic-ratelimit-unified-{b}-status")).map(|s| s == "rejected").unwrap_or(false);
+    let reset = |b: &str| rl.get(&format!("anthropic-ratelimit-unified-{b}-reset")).and_then(|v| v.trim().parse::<i64>().ok());
+    ["5h", "7d"]
+        .into_iter()
+        .filter(|b| rejected(b))
+        .filter_map(reset)
+        .max()
+        .map(|r| r - now_secs)
+        .filter(|s| *s > 0)
+        .map(|s| s as u64)
+        .unwrap_or(retry_after.clamp(1, 3600) as u64)
+}
+
 fn is_entitlement_denied(body: &[u8]) -> bool {
     serde_json::from_slice::<Value>(body)
         .ok()
@@ -376,11 +395,18 @@ async fn attempt(ctx: &Ctx, mgr: &Manager, info: &ReqInfo, account: &Selected, h
         req = req.header("content-length", send.len().to_string()).body(send.clone());
     }
 
-    mgr.admit(&account.id).await;
+    let slot = mgr.admit(&account.id).await;
     if info.pin.is_none() && mgr.is_entitlement_denied(&account.id) {
-        mgr.release(&account.id);
         return Attempt::Failover { reason: "oauth not allowed for organization (cooldown)".into(), transient: false };
     }
+    // Selection happened before the ramp wait; responses that landed since
+    // may have taken this account to its threshold. Re-check before sending.
+    if info.pin.is_none() {
+        if let Some(r) = mgr.unavailable_now(&account.id, info.model.as_deref(), info.advisor_model.as_deref()) {
+            return Attempt::Failover { reason: r, transient: false };
+        }
+    }
+    let open = mgr.open(&account.id);
     let started = std::time::Instant::now();
     // The headers budget covers connect through response headers only. It is
     // applied around `send()` rather than with `RequestBuilder::timeout`,
@@ -388,7 +414,7 @@ async fn attempt(ctx: &Ctx, mgr: &Manager, info: &ReqInfo, account: &Selected, h
     // streams and would cut every response longer than the budget mid-stream.
     // The body has its own idle-gap timer below.
     let res = tokio::time::timeout(headers_timeout(), req.send()).await;
-    mgr.release(&account.id);
+    drop(slot);
 
     // A failure before the request left this side (DNS, TCP, TLS) cost
     // nothing upstream and moves to a sibling. Once the body is on the wire
@@ -423,6 +449,7 @@ async fn attempt(ctx: &Ctx, mgr: &Manager, info: &ReqInfo, account: &Selected, h
 
     let status = res.status();
     let rl = rl_headers(res.headers());
+    let prior_5h = mgr.utilization_5h(&account.id);
     mgr.update_quota(&account.id, &rl);
     if status.as_u16() != 429 {
         mgr.clear_rate_limited(&account.id);
@@ -446,9 +473,13 @@ async fn attempt(ctx: &Ctx, mgr: &Manager, info: &ReqInfo, account: &Selected, h
                 if family_rejected {
                     mgr.log(format!("Family weekly quota exhausted on \"{}\"; switching account for this request", account.name));
                 } else {
-                    let hold = retry_after.clamp(1, 3600) as u64;
-                    mgr.log(format!("Quota rejection (429) on \"{}\"; throttling {hold}s and switching account", account.name));
-                    mgr.mark_rate_limited(&account.id, hold);
+                    let hold = quota_hold_secs(&rl, retry_after, chrono::Utc::now().timestamp());
+                    let prior = prior_5h.map(|u| format!("{:.0}%", u * 100.0)).unwrap_or_else(|| "unknown".into());
+                    mgr.log(format!(
+                        "Quota rejection (429) on \"{}\" (5h read {prior} before it); holding {hold}s until the window resets and switching account",
+                        account.name
+                    ));
+                    mgr.mark_quota_exhausted(&account.id, hold);
                 }
                 return Attempt::Failover { reason: "quota rejected".into(), transient: false };
             }
@@ -557,6 +588,7 @@ async fn attempt(ctx: &Ctx, mgr: &Manager, info: &ReqInfo, account: &Selected, h
         let mut upstream_stream = res.bytes_stream();
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, std::io::Error>>(32);
         tokio::spawn(async move {
+            let _open = open;
             let mut buf = Vec::new();
             let mut logged_body: Vec<u8> = Vec::new();
             let mut ok = true;
@@ -728,6 +760,37 @@ mod tests {
         assert_eq!(parse_retry_after("Tue, 15 Sep 2026 09:00:00 GMT", now), Some(1), "a date in the past still means retry");
         assert_eq!(parse_retry_after("soon", now), None);
         assert_eq!(parse_retry_after("", now), None);
+    }
+
+    #[test]
+    fn quota_hold_runs_to_the_rejected_window_reset() {
+        let now = 1_790_800_000;
+        let h = |pairs: &[(&str, &str)]| pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<BTreeMap<_, _>>();
+        let five_h = (now + 3 * 3600).to_string();
+        let seven_d = (now + 3 * 86_400).to_string();
+        // 5h rejected three hours out: hold the whole three hours, not one.
+        let rl = h(&[
+            ("anthropic-ratelimit-unified-5h-status", "rejected"),
+            ("anthropic-ratelimit-unified-5h-reset", &five_h),
+            ("anthropic-ratelimit-unified-7d-status", "allowed"),
+            ("anthropic-ratelimit-unified-7d-reset", &seven_d),
+        ]);
+        assert_eq!(quota_hold_secs(&rl, 60, now), 3 * 3600);
+        // Both rejected: the later reset governs.
+        let rl = h(&[
+            ("anthropic-ratelimit-unified-5h-status", "rejected"),
+            ("anthropic-ratelimit-unified-5h-reset", &five_h),
+            ("anthropic-ratelimit-unified-7d-status", "rejected"),
+            ("anthropic-ratelimit-unified-7d-reset", &seven_d),
+        ]);
+        assert_eq!(quota_hold_secs(&rl, 60, now), 3 * 86_400);
+        // No usable reset (absent or already past): retry-after, capped at an hour.
+        let rl = h(&[("anthropic-ratelimit-unified-5h-status", "rejected")]);
+        assert_eq!(quota_hold_secs(&rl, 90, now), 90);
+        assert_eq!(quota_hold_secs(&rl, 99_999, now), 3600);
+        let past = (now - 10).to_string();
+        let rl = h(&[("anthropic-ratelimit-unified-5h-status", "rejected"), ("anthropic-ratelimit-unified-5h-reset", &past)]);
+        assert_eq!(quota_hold_secs(&rl, 60, now), 60);
     }
 
     #[test]

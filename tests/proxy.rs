@@ -182,7 +182,7 @@ async fn mock_handler(mock: Mock, req: Request<Incoming>) -> Result<Response<Moc
         Behaviour::QuotaRejected { retry_after } => base(429)
             .header("anthropic-ratelimit-unified-5h-status", "rejected")
             .header("anthropic-ratelimit-unified-5h-utilization", "1.0")
-            .header("anthropic-ratelimit-unified-5h-reset", (now + 600).to_string())
+            .header("anthropic-ratelimit-unified-5h-reset", (now + retry_after as i64).to_string())
             .header("retry-after", retry_after.to_string())
             .body(Full::new(Bytes::from(r#"{"type":"error","error":{"type":"rate_limit_error","message":"spent"}}"#)))
             .unwrap(),
