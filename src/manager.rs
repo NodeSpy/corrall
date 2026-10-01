@@ -31,6 +31,13 @@ pub enum OnRefreshFail {
 
 const ENTITLEMENT_COOLDOWN_MS: i64 = 5 * 60 * 1000;
 const THROTTLE_PROBE_FLOOR_MS: i64 = 30 * 1000;
+/// Usage a request still open on an account is assumed to add before any
+/// response reports it. Utilization arrives in response headers, which carry
+/// the usage as of the request's start, so every open request (waiting on
+/// headers or streaming its body) is spend the reading does not include yet.
+/// Without this margin several long turns admitted at 96-97% took accounts
+/// past 100% before any reading reached the switch threshold.
+pub const OPEN_REQUEST_HEADROOM: f64 = 0.01;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -109,6 +116,10 @@ pub struct Account {
     pub status: Status,
     pub error_message: Option<String>,
     pub rate_limited_until: Option<i64>,
+    /// The hold in `rate_limited_until` is a quota rejection running to the
+    /// window's reset, not a short per-minute pause; a probe showing the
+    /// window already reset may lift it early.
+    pub quota_hold: bool,
     pub throttled_at: Option<i64>,
     pub last_probe_at: Option<i64>,
     pub entitlement_denied_until: Option<i64>,
@@ -116,6 +127,8 @@ pub struct Account {
     pub last_refresh_at: Option<i64>,
     pub ramp_started_at: Option<i64>,
     pub in_flight: u32,
+    /// Requests admitted and not yet finished (headers and body).
+    pub open: u32,
     pub usage: Usage,
     pub probing: bool,
     pub requalify: bool,
@@ -152,6 +165,7 @@ impl Account {
             status: Status::Active,
             error_message: None,
             rate_limited_until: None,
+            quota_hold: false,
             throttled_at: None,
             last_probe_at: None,
             entitlement_denied_until: None,
@@ -159,6 +173,7 @@ impl Account {
             last_refresh_at: None,
             ramp_started_at: None,
             in_flight: 0,
+            open: 0,
             usage: Usage::default(),
             probing: false,
             requalify: false,
@@ -640,17 +655,41 @@ impl Manager {
 
     /// Storm-control admission: wait until the account's concurrency cap
     /// admits this request, or the ramp window ends (fail-open).
-    pub async fn admit(&self, id: &str) {
+    /// Wait for a storm-ramp slot on `id`. The slot is released when the
+    /// returned guard drops, so a request whose client went away mid-send
+    /// cannot leave the account's `in_flight` count raised for good.
+    pub async fn admit(&self, id: &str) -> Slot {
         loop {
             let (ok, wait) = self.with(|f| f.try_admit(id, now_ms()));
             if ok {
-                return;
+                return Slot { mgr: self.clone(), id: id.to_string() };
             }
             tokio::time::sleep(Duration::from_millis(wait)).await;
         }
     }
 
-    pub fn release(&self, id: &str) {
+    /// Count a request as open on `id` until the guard drops (end of body).
+    pub fn open(&self, id: &str) -> Open {
+        self.with(|f| {
+            if let Some(a) = f.account_mut(id) {
+                a.open += 1;
+            }
+        });
+        Open { mgr: self.clone(), id: id.to_string() }
+    }
+
+    /// Why `id` cannot serve `model` right now, re-checked at send time.
+    pub fn unavailable_now(&self, id: &str, model: Option<&str>, advisor: Option<&str>) -> Option<String> {
+        let now = now_ms();
+        self.with(|f| f.account(id).and_then(|a| f.unavailable_reason(a, model, advisor, now)))
+    }
+
+    /// Last known 5h utilization of `id`.
+    pub fn utilization_5h(&self, id: &str) -> Option<f64> {
+        self.with(|f| f.account(id).and_then(|a| a.quota.unified5h.utilization))
+    }
+
+    fn release(&self, id: &str) {
         self.with(|f| {
             if let Some(a) = f.account_mut(id) {
                 a.in_flight = a.in_flight.saturating_sub(1);
@@ -775,8 +814,9 @@ impl Manager {
     pub fn update_quota(&self, id: &str, headers: &BTreeMap<String, String>) {
         let now = now_ms();
         let mut learned = None;
-        self.with(|f| {
+        let crossed = self.with(|f| {
             let th = f.threshold.clone();
+            let before = f.account(id).map(|a| f.near_quota(a, None).is_some()).unwrap_or(true);
             if let Some(a) = f.account_mut(id) {
                 match a.provider {
                     Provider::Anthropic => a.quota.apply_headers(headers, now),
@@ -794,11 +834,15 @@ impl Manager {
                     a.requalify = true;
                     learned = Some(a.name.clone());
                 }
-                let key = weekly_bucket_for(None);
                 let _ = a.quota.clear_expired(now, |b| th.for_bucket(b));
-                let _ = key;
             }
+            let a = f.account(id)?;
+            let why = f.near_quota(a, None).filter(|_| !before)?;
+            Some(format!("\"{}\" reached the switch threshold ({why}); new requests go elsewhere", a.name))
         });
+        if let Some(line) = crossed {
+            self.log(line);
+        }
         if let Some(n) = learned {
             self.log(format!("Learned weekly quota for \"{n}\", re-evaluating selection"));
         }
@@ -806,12 +850,30 @@ impl Manager {
 
     pub fn apply_usage(&self, id: &str, u: &UsagePayload) {
         let now = now_ms();
-        self.with(|f| {
-            if let Some(a) = f.account_mut(id) {
-                a.quota.apply_usage(u, now);
-                a.last_probe_at = Some(now);
+        let lifted = self.with(|f| {
+            let a = f.account_mut(id)?;
+            a.quota.apply_usage(u, now);
+            a.last_probe_at = Some(now);
+            let held = a.quota_hold && a.rate_limited_until.map(|t| t > now).unwrap_or(false);
+            if !held {
+                return None;
             }
+            let a = f.account(id)?;
+            if f.near_quota(a, None).is_some() {
+                return None;
+            }
+            let name = a.name.clone();
+            let a = f.account_mut(id)?;
+            a.rate_limited_until = None;
+            a.quota_hold = false;
+            if a.status == Status::Throttled {
+                a.status = Status::Active;
+            }
+            Some(name)
         });
+        if let Some(n) = lifted {
+            self.log(format!("Quota window of \"{n}\" reset early; lifting its hold"));
+        }
     }
 
     pub fn apply_profile(&self, id: &str, p: &oauth::Profile) {
@@ -836,11 +898,21 @@ impl Manager {
     }
 
     pub fn mark_rate_limited(&self, id: &str, secs: u64) {
+        self.hold(id, secs, false);
+    }
+
+    /// Hold an account whose quota was rejected until the window resets.
+    pub fn mark_quota_exhausted(&self, id: &str, secs: u64) {
+        self.hold(id, secs, true);
+    }
+
+    fn hold(&self, id: &str, secs: u64, quota: bool) {
         let now = now_ms();
         let name = self.with(|f| {
             f.account_mut(id).map(|a| {
                 a.status = Status::Throttled;
                 a.rate_limited_until = Some(now + secs as i64 * 1000);
+                a.quota_hold = quota;
                 a.throttled_at = Some(now);
                 a.name.clone()
             })
@@ -857,6 +929,7 @@ impl Manager {
                     a.status = Status::Active;
                 }
                 a.rate_limited_until = None;
+                a.quota_hold = false;
             }
         });
     }
@@ -901,6 +974,7 @@ impl Manager {
                 a.error_message = None;
                 a.dead_refresh_token = None;
                 a.rate_limited_until = None;
+                a.quota_hold = false;
             }
         });
     }
@@ -1200,15 +1274,17 @@ impl Fleet {
 
     fn near_quota(&self, a: &Account, model: Option<&str>) -> Option<String> {
         let q = &a.quota;
+        let margin = a.open as f64 * OPEN_REQUEST_HEADROOM;
+        let at = |u: f64| if a.open > 0 { format!("{:.0}% with {} open", u * 100.0, a.open) } else { format!("{:.0}%", u * 100.0) };
         if let Some(u) = q.unified5h.utilization {
-            if u >= self.threshold_for(BUCKET_5H) {
-                return Some(format!("5h at {:.0}%", u * 100.0));
+            if u + margin >= self.threshold_for(BUCKET_5H) {
+                return Some(format!("5h at {}", at(u)));
             }
         }
         let key = self.weekly_key_for(model);
         if let Some(u) = q.gating_weekly(key) {
-            if u >= self.threshold_for(key) {
-                return Some(format!("{key} at {:.0}%", u * 100.0));
+            if u + margin >= self.threshold_for(key) {
+                return Some(format!("{key} at {}", at(u)));
             }
         }
         if let Some(u) = q.tokens_used() {
@@ -1364,6 +1440,7 @@ impl Fleet {
             if let Some(until) = a.rate_limited_until {
                 if until <= now {
                     a.rate_limited_until = None;
+                    a.quota_hold = false;
                     if a.status == Status::Throttled {
                         a.status = Status::Active;
                     }
@@ -1527,7 +1604,15 @@ impl Fleet {
                 // New session: least loaded eligible account (ranked_available already sorts by load).
                 if let Some(best) = self.ranked_available(req, now).first().cloned() {
                     let id = best.id.clone();
-                    if self.current.is_none() {
+                    // Keep the cursor on a usable account so status shows where
+                    // traffic goes: leave it alone unless it can no longer serve.
+                    let cur_ok = self
+                        .current
+                        .as_deref()
+                        .and_then(|c| self.account(c))
+                        .map(|c| self.unavailable_reason_for(c, None, None, req.provider, now).is_none())
+                        .unwrap_or(false);
+                    if !cur_ok {
                         self.set_current(&id, now, mgr, false);
                     } else {
                         self.ramp_if_cold(&id, now);
@@ -1744,6 +1829,7 @@ impl Fleet {
                 })).unwrap_or(json!({ "status": "never" })),
             },
             "inFlight": a.in_flight,
+            "open": a.open,
             "quota": {
                 "unified5h": b(&a.quota.unified5h),
                 "unified7d": b(&a.quota.unified7d),
@@ -1923,6 +2009,34 @@ impl Fleet {
 
 /// Map an internal unavailability reason to the original's stable keys so the
 /// status renderer can phrase it in the operator's terms.
+/// A storm-ramp slot from [`Manager::admit`], released on drop.
+pub struct Slot {
+    mgr: Manager,
+    id: String,
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.mgr.release(&self.id);
+    }
+}
+
+/// An open request from [`Manager::open`], closed on drop.
+pub struct Open {
+    mgr: Manager,
+    id: String,
+}
+
+impl Drop for Open {
+    fn drop(&mut self) {
+        self.mgr.with(|f| {
+            if let Some(a) = f.account_mut(&self.id) {
+                a.open = a.open.saturating_sub(1);
+            }
+        });
+    }
+}
+
 pub fn unavailable_key(reason: &str) -> &'static str {
     if reason.starts_with("disabled") {
         "disabled"
@@ -2093,6 +2207,75 @@ mod tests {
             assert_eq!(a.status, Status::Error);
             assert!(a.error_message.as_deref().unwrap().contains("corrall login"));
         });
+    }
+
+    #[test]
+    fn quota_hold_lifts_only_when_a_probe_shows_the_window_reset() {
+        use crate::quota::{Bucket, UsagePayload};
+        let cfg = cfg_with(vec![acct("a", 0), acct("b", 0)]);
+        let m = mgr(&cfg);
+        let ids = m.account_ids();
+        let a = ids[0].0.clone();
+        let usage = |u: f64| UsagePayload { five_hour: Some(Bucket { utilization: Some(u), ..Default::default() }), ..Default::default() };
+        m.mark_quota_exhausted(&a, 3 * 3600);
+        // Still spent: the hold stays and a never serves.
+        m.apply_usage(&a, &usage(1.0));
+        m.with(|f| assert!(f.account(&a).unwrap().rate_limited_until.is_some()));
+        assert_eq!(select_name(&m, None).as_deref(), Some("b"));
+        // The window reset early: the probe lifts the hold.
+        m.apply_usage(&a, &usage(0.05));
+        m.with(|f| {
+            let acc = f.account(&a).unwrap();
+            assert!(acc.rate_limited_until.is_none() && !acc.quota_hold);
+            assert_eq!(acc.status, Status::Active);
+        });
+        // A per-minute pause is not the probe's to lift, whatever the usage says.
+        m.mark_rate_limited(&a, 60);
+        m.apply_usage(&a, &usage(0.05));
+        m.with(|f| assert!(f.account(&a).unwrap().rate_limited_until.is_some()));
+    }
+
+    /// The bug behind adam@ running to 101% at a 98% threshold: a session
+    /// pinned to an account at 97% kept sending long turns, each admitted on
+    /// a reading that did not yet include the turns still open.
+    #[test]
+    fn open_requests_count_against_the_threshold_and_pinned_sessions_move() {
+        let mut cfg = cfg_with(vec![acct("a", 0), acct("b", 0)]);
+        pool_of(&mut cfg).distribute_sessions = true;
+        let m = mgr(&cfg);
+        let ids = m.account_ids();
+        let (a, b) = (ids[0].0.clone(), ids[1].0.clone());
+        let sid = "11111111-1111-1111-1111-111111111111";
+        let sel = || match m.select(&SelectRequest { session_id: Some(sid), allow_probe: true, ..Default::default() }) {
+            Selection::Account(s) => s.id,
+            other => panic!("{other:?}"),
+        };
+        m.with(|f| {
+            f.current = Some(a.clone());
+            f.account_mut(&a).unwrap().quota.unified5h.utilization = Some(0.96);
+            f.account_mut(&b).unwrap().quota.unified5h.utilization = Some(0.10);
+        });
+        m.record_session(Some(sid), &a, None);
+        assert_eq!(sel(), a, "96% with nothing open is under 98%");
+        let one = m.open(&a);
+        assert_eq!(sel(), a, "one open turn: 97%");
+        let two = m.open(&a);
+        assert_eq!(sel(), b, "two open turns reach 98%: the pinned session moves");
+        m.with(|f| assert_eq!(f.current.as_deref(), Some(b.as_str()), "the cursor follows the traffic in distribute mode"));
+        drop((one, two));
+        m.with(|f| assert_eq!(f.account(&a).unwrap().open, 0, "the guards close their requests"));
+    }
+
+    #[tokio::test]
+    async fn a_dropped_slot_releases_the_ramp_count() {
+        let cfg = cfg_with(vec![acct("a", 0)]);
+        let m = mgr(&cfg);
+        let id = m.account_ids()[0].0.clone();
+        let slot = m.admit(&id).await;
+        m.with(|f| assert_eq!(f.account(&id).unwrap().in_flight, 1));
+        // A client that hangs up mid-send drops the future holding the slot.
+        drop(slot);
+        m.with(|f| assert_eq!(f.account(&id).unwrap().in_flight, 0));
     }
 
     #[test]

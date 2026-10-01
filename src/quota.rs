@@ -33,6 +33,10 @@ impl Bucket {
     }
 }
 
+/// Two reset times this close describe the same window: headers carry whole
+/// epoch seconds, the usage endpoint an ISO time with milliseconds.
+pub const SAME_WINDOW_SLOP_MS: i64 = 5 * 60 * 1000;
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Quota {
@@ -185,9 +189,21 @@ impl Quota {
     }
 
     /// Apply a normalized `/api/oauth/usage` payload.
+    ///
+    /// Utilization only grows within a window, and response headers report it
+    /// on every request while the usage endpoint can lag behind. A probe that
+    /// reads lower than what is held for the same window (same reset, within
+    /// [`SAME_WINDOW_SLOP_MS`]) is stale and must not pull an account back
+    /// under its switch threshold; a lower reading is taken only once the
+    /// window has moved on.
     pub fn apply_usage(&mut self, u: &UsagePayload, now: i64) {
         let set = |dst: &mut Bucket, src: &Option<Bucket>| {
             if let Some(b) = src {
+                let same_window = matches!((dst.reset_at, b.reset_at), (Some(d), Some(s)) if (s - d).abs() <= SAME_WINDOW_SLOP_MS);
+                let lower = matches!((dst.utilization, b.utilization), (Some(d), Some(s)) if s < d);
+                if same_window && lower {
+                    return;
+                }
                 if b.utilization.is_some() {
                     dst.utilization = b.utilization;
                     dst.seen_at = Some(now);
@@ -357,6 +373,22 @@ mod tests {
         assert_eq!(q.unified7d_fable.utilization, Some(1.02));
         assert_eq!(q.gating_weekly(BUCKET_7D_FABLE), Some(1.02));
         assert_eq!(q.unified_status.as_deref(), Some("allowed_warning"));
+    }
+
+    #[test]
+    fn a_lagging_probe_cannot_lower_the_reading_within_a_window() {
+        let reset = 1_790_838_000_000;
+        let mut q = Quota { unified5h: Bucket { utilization: Some(0.98), reset_at: Some(reset), seen_at: Some(1) }, ..Default::default() };
+        let probe = |u: f64, r: i64| UsagePayload { five_hour: Some(Bucket { utilization: Some(u), reset_at: Some(r), seen_at: None }), ..Default::default() };
+        // Same window (the endpoint's ISO reset carries milliseconds): ignored.
+        q.apply_usage(&probe(0.93, reset + 349), 2);
+        assert_eq!(q.unified5h.utilization, Some(0.98));
+        // Higher in the same window: taken.
+        q.apply_usage(&probe(0.99, reset), 3);
+        assert_eq!(q.unified5h.utilization, Some(0.99));
+        // A new window (later reset): the lower reading is the truth now.
+        q.apply_usage(&probe(0.02, reset + 5 * 3_600_000), 4);
+        assert_eq!(q.unified5h.utilization, Some(0.02));
     }
 
     #[test]
