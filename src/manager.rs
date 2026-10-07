@@ -22,11 +22,21 @@ const FORCED_REFRESH_FLOOR_MS: i64 = 30 * 1000;
 
 /// What a failed refresh should do to the account's health. Live request
 /// traffic disables the account and fails over (`MarkDead`); background
-/// diagnostics like the quota probe must never disable an account (`Keep`).
+/// diagnostics like the quota probe must never disable an account whose access
+/// token is still usable (`Keep`). Once that token has expired too, a rejected
+/// refresh leaves nothing to serve with, so `Keep` disables it as well.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum OnRefreshFail {
     MarkDead,
     Keep,
+}
+
+impl OnRefreshFail {
+    /// Whether a rejected refresh token should take the account out of
+    /// rotation. An unknown expiry counts as still usable.
+    fn kills(self, expires_at: Option<i64>) -> bool {
+        self == OnRefreshFail::MarkDead || expires_at.is_some_and(|e| e <= now_ms())
+    }
 }
 
 const ENTITLEMENT_COOLDOWN_MS: i64 = 5 * 60 * 1000;
@@ -717,7 +727,7 @@ impl Manager {
             }
             let Some(rt) = a.refresh_token.clone() else { return (false, lock, a.name.clone(), None) };
             if a.dead_refresh_token.as_deref() == Some(rt.as_str()) {
-                if on_fail == OnRefreshFail::MarkDead && a.status != Status::Error {
+                if on_fail.kills(a.expires_at) && a.status != Status::Error {
                     a.status = Status::Error;
                     a.error_message = Some("refresh token rejected; run: corrall login".into());
                 }
@@ -802,9 +812,9 @@ impl Manager {
             }
             Err(e) => {
                 self.log(format!("Token refresh failed for \"{name}\": {e}"));
-                if e.is_auth_rejection() && on_fail == OnRefreshFail::MarkDead {
+                if e.is_auth_rejection() {
                     self.with(|f| {
-                        if let Some(a) = f.account_mut(id) {
+                        if let Some(a) = f.account_mut(id).filter(|a| on_fail.kills(a.expires_at)) {
                             a.status = Status::Error;
                             a.error_message = Some("refresh token rejected; run: corrall login".into());
                             a.dead_refresh_token = Some(rt.clone());
@@ -1175,6 +1185,16 @@ impl Manager {
 
     pub fn credential_of(&self, id: &str) -> Option<String> {
         self.with(|f| f.account(id).and_then(|a| a.credential.clone()))
+    }
+
+    /// Why `id` cannot be used until someone logs it in again: its refresh
+    /// token was rejected and the account was taken out of rotation for it.
+    pub fn needs_login(&self, id: &str) -> Option<String> {
+        self.with(|f| {
+            let a = f.account(id)?;
+            let dead = a.status == Status::Error && a.dead_refresh_token.is_some() && a.dead_refresh_token == a.refresh_token;
+            dead.then(|| a.error_message.clone().unwrap_or_else(|| "needs re-login".into()))
+        })
     }
 
     pub fn needs_profile(&self, id: &str) -> bool {
@@ -2230,6 +2250,34 @@ mod tests {
             assert_eq!(a.status, Status::Error);
             assert!(a.error_message.as_deref().unwrap().contains("corrall login"));
         });
+    }
+
+    #[tokio::test]
+    async fn probe_refresh_disables_account_once_its_access_token_has_expired() {
+        // The refresh token is dead and the access token expired with it, so
+        // there is nothing left to serve with: even the probe's Keep takes the
+        // account out of rotation rather than reporting it active for good.
+        let cfg = cfg_with(vec![acct("a", 0)]);
+        let m = mgr(&cfg);
+        let id = m.account_ids()[0].0.clone();
+        m.with(|f| {
+            let a = f.account_mut(&id).unwrap();
+            a.dead_refresh_token = Some("rt".into());
+            a.expires_at = Some(now_ms() - 1);
+        });
+        assert_eq!(m.needs_login(&id), None);
+
+        let _ = m.ensure_token_fresh(&id, false, OnRefreshFail::Keep).await;
+        m.with(|f| {
+            let a = f.account(&id).unwrap();
+            assert_eq!(a.status, Status::Error);
+            assert!(f.unavailable_reason(a, None, None, now_ms()).is_some(), "out of rotation");
+        });
+        assert!(m.needs_login(&id).unwrap().contains("corrall login"));
+
+        // A new login replaces the refresh token: it no longer needs one.
+        m.with(|f| f.account_mut(&id).unwrap().refresh_token = Some("rt2".into()));
+        assert_eq!(m.needs_login(&id), None);
     }
 
     #[test]
