@@ -281,12 +281,19 @@ impl Prober {
         }
         m.probe_account_status(&id, "running", started, None, None);
         // The probe is diagnostic: it may refresh, but a failure must never
-        // disable the account (OnRefreshFail::Keep). Only live request traffic
-        // marks a refresh token dead.
+        // disable an account whose access token still works
+        // (OnRefreshFail::Keep). Live request traffic marks a refresh token
+        // dead outright.
         let Some(cred) = m.ensure_token_fresh(&id, false, OnRefreshFail::Keep).await else {
             m.probe_account_status(&id, "error", started, Some(crate::quota::now_ms()), Some("no usable token".into()));
             return RunOutcome::Completed;
         };
+        // A dead login only draws a 401 (or a bare 429) from the usage
+        // endpoint every run; wait for a re-login to replace the token.
+        if let Some(why) = m.needs_login(&id) {
+            m.probe_account_status(&id, "error", started, Some(crate::quota::now_ms()), Some(why));
+            return RunOutcome::Completed;
+        }
         let mut result = tokio::time::timeout(Duration::from_secs(15), fetch_usage(&cred)).await.unwrap_or(UsageResult::Error("probe timed out".into()));
         if matches!(result, UsageResult::Unauthorized) {
             if let Some(c2) = m.ensure_token_fresh(&id, true, OnRefreshFail::Keep).await {
