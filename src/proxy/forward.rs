@@ -28,6 +28,9 @@ const HEADERLESS_429_PAUSE_SECONDS: u64 = 5;
 /// per-account limit; a further hop would only mark another account
 /// unavailable to everyone else.
 const MAX_RATE_LIMIT_HOPS: usize = 2;
+/// `retry-after` given to the client when headerless 429s span the fleet:
+/// long enough that parallel sessions do not re-trip the throttle at once.
+const FLEET_429_RETRY_AFTER_SECONDS: u64 = 10;
 const ERROR_BODY_INSPECTION_LIMIT: usize = 64 * 1024;
 
 /// Headers that never cross the proxy as received. Besides the RFC 7230
@@ -101,6 +104,10 @@ fn transient_exhaustion(tried: usize) -> Response<BoxBody> {
 /// Outcome of one upstream attempt.
 enum Attempt {
     Done(Response<BoxBody>),
+    /// The proxy answers the client with this response itself and tries
+    /// nothing else.
+    /// Not an account failure.
+    Reject(Response<BoxBody>),
     /// Try another account (this one is added to `tried`).
     Failover {
         reason: String,
@@ -271,6 +278,7 @@ pub async fn forward(ctx: &Ctx, mgr: &Manager, info: &ReqInfo, mut headers: Head
                     );
                 }
             }
+            Attempt::Reject(r) => return fail(r, &account.name),
             Attempt::Abort { response, reason } => {
                 mgr.record_failure(&account.id);
                 mgr.log(format!("\"{}\" did not answer request {} ({reason}); not resending a request already sent", account.name, info.id));
@@ -498,6 +506,19 @@ async fn attempt(ctx: &Ctx, mgr: &Manager, info: &ReqInfo, account: &Selected, h
                 rl,
                 body_snip
             );
+            // The same bare 429 on several accounts at once is a throttle
+            // in front of all of them: another attempt on any account only
+            // adds load to it, and the client retries on its own anyway.
+            if retry_after_parsed.is_none() && mgr.note_headerless_429(&account.id) {
+                mgr.log(format!(
+                    "Headerless 429 on \"{}\" with another account in the last 30s; upstream-wide, answering request {} without retrying",
+                    account.name, info.id
+                ));
+                return Attempt::Reject(with_retry_after(
+                    error_response(StatusCode::TOO_MANY_REQUESTS, "rate_limit_error", "Upstream rate limit across several accounts; the proxy did not retry"),
+                    FLEET_429_RETRY_AFTER_SECONDS,
+                ));
+            }
             let ra = match retry_after_parsed {
                 Some(v) => v.clamp(1, 300) as u64,
                 None => HEADERLESS_429_PAUSE_SECONDS,

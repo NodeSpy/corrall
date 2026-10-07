@@ -460,6 +460,30 @@ async fn headerless_429_pauses_briefly_and_retries_the_same_account() {
 }
 
 #[tokio::test]
+async fn headerless_429s_on_two_accounts_are_answered_without_retrying() {
+    let mock = spawn_mock().await;
+    let p = spawn_proxy(cfg_with(vec![account("a", "tok-a", 0, &mock.url()), account("b", "tok-b", 0, &mock.url())])).await;
+    // a's bare 429 alone is retried in place. While it waits, b answers one
+    // too: the throttle is in front of both, so the second request gets the
+    // 429 back at once instead of five attempts over twenty seconds.
+    mock.queue("tok-a", Behaviour::RateLimitedNoHeader);
+    mock.queue("tok-b", Behaviour::RateLimitedNoHeader);
+    let second = async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let started = std::time::Instant::now();
+        let r = post(&p, "/v1/messages", msg("claude-opus-5")).await;
+        (r, started.elapsed())
+    };
+    let ((st1, v1, _), ((st2, _, h2), took2)) = tokio::join!(post(&p, "/v1/messages", msg("claude-opus-5")), second);
+    assert_eq!(st2, 429);
+    assert_eq!(h2.get("retry-after").unwrap(), "10");
+    assert!(took2 < Duration::from_secs(2), "answered without an inline retry: {took2:?}");
+    assert_eq!(mock.seen().iter().filter(|s| token_of(&s.headers) == "tok-b").count(), 1, "b was sent the request once");
+    assert_eq!(st1, 200, "the first request's own retry still went ahead");
+    assert_eq!(v1["served_by"], "tok-a");
+}
+
+#[tokio::test]
 async fn two_rate_limited_accounts_in_a_row_stop_the_cascade() {
     let mock = spawn_mock().await;
     let p =
