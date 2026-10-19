@@ -536,13 +536,21 @@ async fn attempt(ctx: &Ctx, mgr: &Manager, info: &ReqInfo, account: &Selected, h
         401 => {
             let bytes = res.bytes().await.unwrap_or_default();
             if account.kind == AccountType::Oauth {
-                mgr.log(format!("401 from upstream on \"{}\"; refreshing token", account.name));
+                let linked = mgr.linked_source(&account.id);
+                let verb = if linked.is_some() { "re-reading its credentials file" } else { "refreshing token" };
+                mgr.log(format!("401 from upstream on \"{}\"; {verb}", account.name));
                 let before = account.credential.clone();
                 let after = mgr.ensure_token_fresh(&account.id, true, crate::manager::OnRefreshFail::MarkDead).await;
                 if after.is_some() && after.as_deref() != Some(before.as_str()) {
                     return Attempt::RetrySame { wait: Duration::ZERO };
                 }
-                mgr.mark_error(&account.id, "upstream rejected the token (401)");
+                // A linked account comes back once its owner refreshes the
+                // file (`Manager::recheck_linked`); the proxy never refreshes it.
+                let why = match linked {
+                    Some((path, owner)) => format!("upstream rejected the token in {path} (401); waiting for {owner} to refresh it"),
+                    None => "upstream rejected the token (401)".into(),
+                };
+                mgr.mark_error(&account.id, &why);
                 return Attempt::Failover { reason: "401 and refresh did not help".into(), transient: false };
             }
             mgr.mark_error(&account.id, "upstream rejected the API key (401)");

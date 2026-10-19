@@ -51,9 +51,12 @@ corrall run         # in another terminal: Claude Code through the proxy
 corrall attach      # the same TUI for a server already running (e.g. the service)
 ```
 
-Already logged into Claude Code? `corrall import` copies its credentials.
-`corrall import --link` keeps reading them from Claude Code's own store on
-every reload instead, so a `/login` there is picked up automatically.
+Already logged into Claude Code? `corrall import` links its login: Corrall
+reads `~/.claude/.credentials.json` and Claude Code keeps refreshing it, so the
+two never fight over one refresh token. A linked login goes stale while Claude
+Code is not used on that machine; on a dedicated proxy host, `corrall login`
+adds one Corrall refreshes itself. `corrall import --copy` takes the tokens
+over instead, after which that login must not be used anywhere else.
 
 Coming from [claudeacrobat](#coming-from-claudeacrobat)? `corrall
 import-claudeacrobat` brings its accounts and pools across.
