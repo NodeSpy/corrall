@@ -18,6 +18,9 @@ use crate::quota::{now_ms, Quota, UsagePayload};
 use crate::session::SessionTracker;
 
 const TOKEN_REFRESH_AHEAD_MS: i64 = 5 * 60 * 1000;
+/// How far ahead of a refresh token's hard expiry to start asking for a new
+/// login. Refreshing never extends it, so this is the operator's only notice.
+pub const LOGIN_EXPIRY_WARN_MS: i64 = 5 * 24 * 3600 * 1000;
 const FORCED_REFRESH_FLOOR_MS: i64 = 30 * 1000;
 
 /// What a failed refresh should do to the account's health. Live request
@@ -125,6 +128,11 @@ pub struct Account {
     pub credential: Option<String>,
     pub refresh_token: Option<String>,
     pub expires_at: Option<i64>,
+    /// When the refresh token stops working; past it only a new login helps.
+    pub refresh_expires_at: Option<i64>,
+    /// The `refresh_expires_at` the pool log last warned about, so the
+    /// warning is written once per login rather than on every tick.
+    pub login_warned_for: Option<i64>,
     /// Set for a linked account (see [`linked_path`]): its tokens are read
     /// from this file and never refreshed by the proxy.
     pub import_from: Option<String>,
@@ -174,6 +182,17 @@ fn linked_path(c: &AccountConfig) -> Option<String> {
     (!stored).then(|| crate::codex::DEFAULT_CREDENTIALS_PATH.to_string())
 }
 
+/// The pool-log warning for a login close to its hard expiry, with what to
+/// run. A linked login is renewed where its owner runs, not through Corrall.
+fn login_expiry_line(name: &str, linked: Option<&str>, provider: Provider, pool: &str, exp: i64, now: i64) -> String {
+    let left = crate::status::countdown(Some((exp - now) / 1000));
+    let fix = match linked {
+        Some(path) => format!("log in again in {} (it writes {path})", provider.cli_name()),
+        None => format!("run: corrall login --pool {pool}"),
+    };
+    format!("Account \"{name}\": login expires in {left} and cannot be refreshed past that; {fix}")
+}
+
 impl Account {
     fn from_config(c: &AccountConfig) -> Account {
         let mut a = Account {
@@ -193,6 +212,8 @@ impl Account {
             credential: None,
             refresh_token: None,
             expires_at: None,
+            refresh_expires_at: None,
+            login_warned_for: None,
             import_from: linked_path(c),
             upstream: c.upstream.clone(),
             model_map: c.model_map.clone().unwrap_or_default(),
@@ -236,6 +257,7 @@ impl Account {
                     self.credential = stored;
                     self.refresh_token = c.refresh_token.clone().filter(|t| !t.is_empty());
                     self.expires_at = c.expires_at;
+                    self.refresh_expires_at = c.refresh_token_expires_at;
                 } else {
                     let p = path.unwrap_or_else(|| crate::codex::DEFAULT_CREDENTIALS_PATH.to_string());
                     match crate::codex::import_credentials(&p) {
@@ -265,6 +287,7 @@ impl Account {
                             self.credential = ic.access_token;
                             self.refresh_token = ic.refresh_token;
                             self.expires_at = ic.expires_at;
+                            self.refresh_expires_at = ic.refresh_token_expires_at;
                             if self.subscription_type.is_none() {
                                 self.subscription_type = ic.subscription_type;
                             }
@@ -276,6 +299,7 @@ impl Account {
                     self.credential = c.access_token.clone().filter(|t| !t.is_empty());
                     self.refresh_token = c.refresh_token.clone().filter(|t| !t.is_empty());
                     self.expires_at = c.expires_at;
+                    self.refresh_expires_at = c.refresh_token_expires_at;
                 }
             }
         }
@@ -550,6 +574,7 @@ impl Manager {
                         a.credential = fresh.credential;
                         a.refresh_token = fresh.refresh_token;
                         a.expires_at = fresh.expires_at;
+                        a.refresh_expires_at = fresh.refresh_expires_at;
                         recheck.push(a.id.clone());
                         if a.status == Status::Error {
                             a.status = Status::Active;
@@ -799,11 +824,17 @@ impl Manager {
         match refreshed {
             Ok(t) => {
                 let (access, refresh, exp) = (t.access_token.clone(), t.refresh_token.clone().unwrap_or(rt), t.expires_at);
+                // A refresh that does not report the refresh token's expiry
+                // leaves the one from the login in place.
+                let refresh_exp = t.refresh_expires_at;
                 self.with(|f| {
                     if let Some(a) = f.account_mut(id) {
                         a.credential = Some(access.clone());
                         a.refresh_token = Some(refresh.clone());
                         a.expires_at = Some(exp);
+                        if refresh_exp.is_some() {
+                            a.refresh_expires_at = refresh_exp;
+                        }
                         a.last_refresh_at = Some(now_ms());
                         a.dead_refresh_token = None;
                         if a.status == Status::Error {
@@ -826,6 +857,9 @@ impl Manager {
                                 entry.access_token = Some(access);
                                 entry.refresh_token = Some(refresh);
                                 entry.expires_at = Some(exp);
+                                if refresh_exp.is_some() {
+                                    entry.refresh_token_expires_at = refresh_exp;
+                                }
                             }
                         } else {
                             tracing::warn!("account {id_owned} is not in pool \"{pool}\" on disk; the refreshed token was not persisted");
@@ -880,6 +914,7 @@ impl Manager {
                 a.credential = fresh.credential;
                 a.refresh_token = fresh.refresh_token;
                 a.expires_at = fresh.expires_at;
+                a.refresh_expires_at = fresh.refresh_expires_at;
                 a.dead_refresh_token = None;
                 let line = format!("Read a new token for \"{}\" from {path}", a.name);
                 if a.status == Status::Error {
@@ -917,6 +952,30 @@ impl Manager {
         });
         for (id, path) in errored {
             let _ = self.reread_linked(&id, &path, false);
+        }
+    }
+
+    /// Write one pool-log line per login once its refresh token is within
+    /// [`LOGIN_EXPIRY_WARN_MS`] of its hard expiry. The prober calls this
+    /// every tick; a new login (a later expiry) is warned about afresh.
+    pub fn warn_login_expiry(&self) {
+        let now = now_ms();
+        let lines: Vec<String> = self.with(|f| {
+            let pool = f.pool.clone();
+            f.accounts
+                .iter_mut()
+                .filter_map(|a| {
+                    let exp = a.refresh_expires_at.filter(|e| *e > now && *e - now <= LOGIN_EXPIRY_WARN_MS)?;
+                    if a.login_warned_for == Some(exp) {
+                        return None;
+                    }
+                    a.login_warned_for = Some(exp);
+                    Some(login_expiry_line(&a.name, a.import_from.as_deref(), a.provider, &pool, exp, now))
+                })
+                .collect()
+        });
+        for line in lines {
+            self.log(line);
         }
     }
 
@@ -1955,6 +2014,7 @@ impl Fleet {
             "upstream": a.upstream,
             "tier": a.rate_limit_tier.clone().or(a.seat_tier.clone()).or(a.subscription_type.clone()),
             "tokenExpiresAt": a.expires_at.map(iso),
+            "loginExpiresAt": a.refresh_expires_at.map(iso),
             "rateLimitedUntil": a.rate_limited_until.map(iso),
             "entitlementDeniedUntil": a.entitlement_denied_until.filter(|u| *u > now).map(iso),
             "unavailable": reason.as_deref().map(unavailable_key),
@@ -2330,6 +2390,49 @@ mod tests {
 
     fn linked_acct(name: &str, path: &std::path::Path) -> AccountConfig {
         AccountConfig { name: name.into(), kind: AccountType::Oauth, import_from: Some(path.display().to_string()), ..Default::default() }
+    }
+
+    #[test]
+    fn login_expiry_is_warned_once_per_login() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel(16);
+        let day = 24 * 3600 * 1000;
+        let mut a = acct("a", 0);
+        a.refresh_token_expires_at = Some(now_ms() + 3 * day);
+        let mut far = acct("far", 0);
+        far.refresh_token_expires_at = Some(now_ms() + 20 * day);
+        let m = Manager::with_events(&cfg_with(vec![a, far]), crate::config::DEFAULT_POOL, tx);
+        let drain = |rx: &mut tokio::sync::broadcast::Receiver<String>| std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+
+        m.warn_login_expiry();
+        let lines = drain(&mut rx);
+        assert_eq!(lines.len(), 1, "only the login inside the window: {lines:?}");
+        assert!(lines[0].contains("\"a\": login expires in 2d") || lines[0].contains("\"a\": login expires in 3d"), "{}", lines[0]);
+        assert!(lines[0].contains("run: corrall login --pool default"), "{}", lines[0]);
+
+        // Every prober tick calls this; the same login is not warned twice.
+        m.warn_login_expiry();
+        assert!(drain(&mut rx).is_empty());
+
+        // A new login with its own expiry is warned about afresh.
+        let id = m.account_ids().into_iter().find(|(_, n)| n == "a").unwrap().0;
+        m.with(|f| f.account_mut(&id).unwrap().refresh_expires_at = Some(now_ms() + day));
+        m.warn_login_expiry();
+        assert_eq!(drain(&mut rx).len(), 1);
+    }
+
+    #[test]
+    fn linked_login_expiry_comes_from_the_file_and_names_its_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(".credentials.json");
+        let exp = now_ms() + 2 * 24 * 3600 * 1000;
+        let body = json!({ "claudeAiOauth": { "accessToken": "t", "refreshToken": "r", "expiresAt": now_ms() + 3_600_000, "refreshTokenExpiresAt": exp } });
+        std::fs::write(&file, body.to_string()).unwrap();
+        let (tx, mut rx) = tokio::sync::broadcast::channel(16);
+        let m = Manager::with_events(&cfg_with(vec![linked_acct("a", &file)]), crate::config::DEFAULT_POOL, tx);
+        m.with(|f| assert_eq!(f.accounts[0].refresh_expires_at, Some(exp)));
+        m.warn_login_expiry();
+        let line = rx.try_recv().unwrap();
+        assert!(line.contains("log in again in Claude Code"), "{line}");
     }
 
     #[tokio::test]

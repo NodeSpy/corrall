@@ -155,6 +155,7 @@ directory, for a wrapper resolving a project it has not entered yet.
 | `priority` | Lower is preferred (default 0) |
 | `disabled` | Excluded from rotation |
 | `accessToken` / `refreshToken` / `expiresAt` | OAuth tokens (ms epoch). Written back on refresh |
+| `refreshTokenExpiresAt` | When the login itself expires (ms epoch), as the token endpoint reports it. Refreshing does not extend it, so past it the account needs `corrall login` again. From five days out, `corrall status`, the TUI and the pool log say so. Unknown (and not warned about) until a login or refresh reports it |
 | `importFrom` | Linked account: read tokens from this file (Claude Code's `~/.claude/.credentials.json`) instead of storing them. The proxy never refreshes a linked account; it re-reads the file near expiry, after a 401, and every few seconds while the account is in error, and leaves the refresh to the CLI that owns the file. Refreshing it here would rotate that CLI's refresh token and log it out |
 | `apiKey` | For `apikey` accounts |
 | `upstream` | Per-account base URL (third-party Anthropic-compatible API). Refused for `oauth` accounts pointing off Anthropic |

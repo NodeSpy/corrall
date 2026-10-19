@@ -42,6 +42,11 @@ pub struct Tokens {
     pub refresh_token: Option<String>,
     /// ms since epoch
     pub expires_at: i64,
+    /// When the refresh token itself stops working (ms since epoch), from
+    /// the token endpoint's `refresh_token_expires_in`. Refreshing does not
+    /// push it out: past it only a new login brings the account back.
+    #[serde(default)]
+    pub refresh_expires_at: Option<i64>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -74,7 +79,10 @@ fn tokens_from_response(data: &Value, fallback_refresh: Option<&str>) -> Result<
         let secs = data.get("expires_in").and_then(Value::as_i64).unwrap_or(3600);
         now_ms() + secs * 1000
     });
-    Ok(Tokens { access_token: access, refresh_token: refresh, expires_at })
+    // Seconds from now, as Claude Code reads it; absent on some refreshes,
+    // where the caller keeps the value it already has.
+    let refresh_expires_at = data.get("refresh_token_expires_in").and_then(Value::as_i64).filter(|s| *s > 0).map(|s| now_ms() + s * 1000);
+    Ok(Tokens { access_token: access, refresh_token: refresh, expires_at, refresh_expires_at })
 }
 
 pub fn is_expiring_soon(expires_at: Option<i64>, threshold_ms: i64) -> bool {
@@ -443,6 +451,7 @@ pub struct ImportedCredentials {
     pub access_token: Option<String>,
     pub refresh_token: Option<String>,
     pub expires_at: Option<i64>,
+    pub refresh_token_expires_at: Option<i64>,
     pub subscription_type: Option<String>,
     pub rate_limit_tier: Option<String>,
 }
@@ -478,6 +487,23 @@ pub fn parse_credentials(raw: &[u8]) -> Result<ImportedCredentials> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refresh_token_expiry_is_read_from_the_token_response() {
+        let before = now_ms();
+        let t = tokens_from_response(&json!({ "access_token": "a", "expires_in": 28800, "refresh_token_expires_in": 86400 }), None).unwrap();
+        let exp = t.refresh_expires_at.unwrap();
+        assert!(exp >= before + 86_400_000 && exp <= now_ms() + 86_400_000);
+        // Absent (some refreshes): unknown, and the caller keeps what it had.
+        let t = tokens_from_response(&json!({ "access_token": "a", "expires_in": 28800 }), Some("r")).unwrap();
+        assert_eq!(t.refresh_expires_at, None);
+    }
+
+    #[test]
+    fn imported_credentials_carry_the_refresh_token_expiry() {
+        let raw = br#"{"claudeAiOauth":{"accessToken":"a","refreshToken":"r","expiresAt":1788610267763,"refreshTokenExpiresAt":1791104941763}}"#;
+        assert_eq!(parse_credentials(raw).unwrap().refresh_token_expires_at, Some(1791104941763));
+    }
 
     #[test]
     fn parse_codes() {

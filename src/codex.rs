@@ -109,6 +109,7 @@ pub async fn refresh_access_token(refresh_token: &str) -> std::result::Result<To
         access_token: c.access_token.ok_or_else(|| RefreshError::Transient("no access_token".into()))?,
         refresh_token: c.refresh_token.or_else(|| Some(refresh_token.to_string())),
         expires_at: c.expires_at.unwrap_or_else(|| now_ms() + 3600 * 1000),
+        refresh_expires_at: None,
     })
 }
 

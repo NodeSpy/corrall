@@ -222,6 +222,10 @@ pub struct AccountConfig {
     /// ms since epoch
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<i64>,
+    /// When the refresh token expires (ms since epoch); past it the account
+    /// needs a new login. Unknown until a login or refresh reports it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refresh_token_expires_at: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
     /// Read tokens from this file (Claude Code credential store) instead of

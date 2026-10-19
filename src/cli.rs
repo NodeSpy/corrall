@@ -599,6 +599,7 @@ pub(crate) fn upsert_oauth_at(cfg: &mut Config, pool: &str, name: &str, tokens: 
     entry.access_token = Some(tokens.access_token.clone());
     entry.refresh_token = tokens.refresh_token.clone();
     entry.expires_at = Some(tokens.expires_at);
+    entry.refresh_token_expires_at = tokens.refresh_expires_at;
     if let Some(p) = profile {
         entry.account_uuid = p.account_uuid.clone().or(entry.account_uuid.take());
         entry.org_uuid = p.org_uuid.clone().or(entry.org_uuid.take());
@@ -629,6 +630,7 @@ pub(crate) fn apply_import(
         a.access_token = None;
         a.refresh_token = None;
         a.expires_at = None;
+        a.refresh_token_expires_at = None;
     }
     if a.subscription_type.is_none() {
         a.subscription_type = subscription_type.map(str::to_string);
@@ -819,7 +821,12 @@ pub async fn import(args: ImportArgs) -> Result<()> {
         Err(e) => bail!("profile lookup failed: {e}. Pass --name to import without profile detection"),
     };
     let name = args.name.clone().unwrap_or_else(|| display_name(profile.as_ref().unwrap(), &cfg));
-    let tokens = oauth::Tokens { access_token: access, refresh_token: creds.refresh_token.clone(), expires_at: creds.expires_at.unwrap_or(0) };
+    let tokens = oauth::Tokens {
+        access_token: access,
+        refresh_token: creds.refresh_token.clone(),
+        expires_at: creds.expires_at.unwrap_or(0),
+        refresh_expires_at: creds.refresh_token_expires_at,
+    };
     let cfg = Config::update(|c| {
         let pool = target_pool(c, args.pool.as_deref())?;
         apply_import(c, &pool, &name, &tokens, profile.as_ref(), link.then_some(args.from.as_str()), creds.subscription_type.as_deref());
@@ -1011,6 +1018,11 @@ pub fn accounts(verbose: bool, pool: Option<String>) -> Result<()> {
                 let left = (e - crate::quota::now_ms()) / 1000;
                 details
                     .push_str(&format!("token {} ", if left > 0 { format!("expires in {}", crate::status::countdown(Some(left))) } else { "expired".into() }));
+            }
+            if let Some(e) = a.refresh_token_expires_at {
+                let left = (e - crate::quota::now_ms()) / 1000;
+                details
+                    .push_str(&format!("login {} ", if left > 0 { format!("expires in {}", crate::status::countdown(Some(left))) } else { "expired".into() }));
             }
             if let Some(u) = &a.account_uuid {
                 details.push_str(&format!("uuid={u} "));
@@ -1989,7 +2001,7 @@ mod tests {
     /// account already had — rather than adding a second one beside it.
     #[test]
     fn a_relogin_with_an_empty_profile_refreshes_the_account_it_named() {
-        let tokens = |t: &str| oauth::Tokens { access_token: t.into(), refresh_token: Some(format!("r-{t}")), expires_at: 1 };
+        let tokens = |t: &str| oauth::Tokens { access_token: t.into(), refresh_token: Some(format!("r-{t}")), expires_at: 1, refresh_expires_at: None };
         let mut cfg = Config::default();
         let pool = cfg.default_pool.clone();
         let first = oauth::Profile {
@@ -2068,7 +2080,7 @@ mod tests {
             org_name: Some("Acme".into()),
             ..Default::default()
         };
-        let old = oauth::Tokens { access_token: "acme-access".into(), refresh_token: Some("acme-refresh".into()), expires_at: 1 };
+        let old = oauth::Tokens { access_token: "acme-access".into(), refresh_token: Some("acme-refresh".into()), expires_at: 1, refresh_expires_at: None };
         upsert_oauth(&mut cfg, &pool, "me@x.com (Acme)", &old, Some(&acme));
         cfg.pools.get_mut(&pool).unwrap().accounts[0].subscription_type = Some("max".into());
 
@@ -2076,7 +2088,7 @@ mod tests {
             oauth::Profile { account_uuid: Some("u1".into()), email: Some("me@x.com".into()), org_uuid: Some("org-other".into()), ..Default::default() };
         let name = display_name(&other, &cfg);
         assert_eq!(name, "me@x.com", "no org name to disambiguate with");
-        let fresh = oauth::Tokens { access_token: "other-access".into(), refresh_token: Some("other-refresh".into()), expires_at: 2 };
+        let fresh = oauth::Tokens { access_token: "other-access".into(), refresh_token: Some("other-refresh".into()), expires_at: 2, refresh_expires_at: None };
         let i = apply_import(&mut cfg, &pool, &name, &fresh, Some(&other), Some("/home/me/.claude/.credentials.json"), Some("pro"));
 
         let accounts = &cfg.pools[&pool].accounts;
