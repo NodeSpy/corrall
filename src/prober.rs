@@ -124,6 +124,8 @@ impl Prober {
     pub async fn run(self) {
         loop {
             for (name, m) in self.pools.each() {
+                // Before the schedule check, so it runs with probing off too.
+                m.recheck_linked();
                 let secs = m.probe_seconds();
                 let recheck = m.take_probe_recheck();
                 let Some(claim) = self.claim_due(&name, secs, &m.oauth_accounts(), &recheck, Instant::now()) else { continue };

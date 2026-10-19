@@ -215,9 +215,15 @@ pub struct ImportArgs {
     /// Credentials path (default ~/.claude/.credentials.json)
     #[arg(long, default_value = oauth::DEFAULT_CREDENTIALS_PATH)]
     pub from: String,
-    /// Keep reading tokens from the file on every reload instead of copying them
-    #[arg(long)]
+    /// Read tokens from the file instead of copying them; the CLI that owns the
+    /// file keeps refreshing them (default for the CLI's own credentials file)
+    #[arg(long, conflicts_with = "copy")]
     pub link: bool,
+    /// Copy the tokens and let the proxy refresh them (default for any other
+    /// path). Stop using that login anywhere else afterwards: a refresh here
+    /// rotates its refresh token and logs the other copy out
+    #[arg(long)]
+    pub copy: bool,
     /// Import a Codex CLI login (default path ~/.codex/auth.json)
     #[arg(long)]
     pub codex: bool,
@@ -738,11 +744,35 @@ fn read_secret() -> Result<String> {
     Ok(s.trim().to_string())
 }
 
+/// Whether `import` links the file rather than copying it. `--link`/`--copy`
+/// decide when given; otherwise the CLI's own credentials file is linked, since
+/// that CLI keeps refreshing the login and a copy refreshed here would race it
+/// for one refresh token, and any other path is copied.
+fn import_links(args: &ImportArgs, from: &str, own_file: &str) -> bool {
+    !args.copy && (args.link || oauth::expand_home(from) == oauth::expand_home(own_file))
+}
+
+/// What a linked or copied import means for the login it came from.
+fn import_note(link: bool, from: &str, owner: &str) {
+    if link {
+        eprintln!(
+            "Linked to {from}: {owner} keeps refreshing this login and Corrall reads the file. \
+             It goes stale while {owner} is not used here; `corrall login` adds a login Corrall refreshes itself."
+        );
+    } else {
+        eprintln!(
+            "Copied from {from}: Corrall now refreshes this login. Stop using {from} with {owner}, \
+             or each refresh logs the other one out; `--link` shares it instead."
+        );
+    }
+}
+
 pub async fn import(args: ImportArgs) -> Result<()> {
     let cfg = Config::load_or_create()?;
     crate::upstream::init(&cfg)?;
     if args.codex {
         let from = if args.from == oauth::DEFAULT_CREDENTIALS_PATH { crate::codex::DEFAULT_CREDENTIALS_PATH.to_string() } else { args.from.clone() };
+        let link = import_links(&args, &from, crate::codex::DEFAULT_CREDENTIALS_PATH);
         let c = crate::codex::import_credentials(&from)?;
         let access = c.access_token.clone().filter(|t| !t.is_empty()).ok_or_else(|| anyhow!("{from} carries no access token"))?;
         let name = args.name.clone().or(c.email.clone()).unwrap_or_else(|| "codex".into());
@@ -756,7 +786,7 @@ pub async fn import(args: ImportArgs) -> Result<()> {
                 ..Default::default()
             });
             entry.name = name.clone();
-            if args.link {
+            if link {
                 entry.import_from = Some(from.clone());
                 entry.access_token = None;
                 entry.refresh_token = None;
@@ -772,10 +802,12 @@ pub async fn import(args: ImportArgs) -> Result<()> {
             entry.plan_type = c.plan_type.clone().or(entry.plan_type.take());
             Ok(())
         })?;
-        eprintln!("Imported Codex account \"{name}\"{}{}", if args.link { " (linked)" } else { "" }, pool_note(args.pool.as_deref()));
+        eprintln!("Imported Codex account \"{name}\"{}", pool_note(args.pool.as_deref()));
+        import_note(link, &from, "the Codex CLI");
         notify_reload(&cfg).await;
         return Ok(());
     }
+    let link = import_links(&args, &args.from, oauth::DEFAULT_CREDENTIALS_PATH);
     let creds = oauth::import_credentials(&args.from)?;
     let access = creds.access_token.clone().filter(|t| !t.is_empty()).ok_or_else(|| anyhow!("{} carries no access token", args.from))?;
     let profile = match oauth::fetch_profile(&access).await {
@@ -790,10 +822,11 @@ pub async fn import(args: ImportArgs) -> Result<()> {
     let tokens = oauth::Tokens { access_token: access, refresh_token: creds.refresh_token.clone(), expires_at: creds.expires_at.unwrap_or(0) };
     let cfg = Config::update(|c| {
         let pool = target_pool(c, args.pool.as_deref())?;
-        apply_import(c, &pool, &name, &tokens, profile.as_ref(), args.link.then_some(args.from.as_str()), creds.subscription_type.as_deref());
+        apply_import(c, &pool, &name, &tokens, profile.as_ref(), link.then_some(args.from.as_str()), creds.subscription_type.as_deref());
         Ok(())
     })?;
-    eprintln!("Imported \"{name}\"{}{}", if args.link { " (linked to the credential file)" } else { "" }, pool_note(args.pool.as_deref()));
+    eprintln!("Imported \"{name}\"{}", pool_note(args.pool.as_deref()));
+    import_note(link, &args.from, "Claude Code");
     notify_reload(&cfg).await;
     Ok(())
 }
@@ -1994,6 +2027,29 @@ mod tests {
         let bob = oauth::Profile { account_uuid: Some("u2".into()), email: Some("bob@example.com".into()), ..Default::default() };
         assert_eq!(upsert_oauth_at(&mut cfg, &pool, "bob@example.com", &tokens("bob"), Some(&bob)), (1, false));
         assert_eq!(cfg.pools[&pool].accounts.len(), 2);
+    }
+
+    /// The CLI's own credentials file is linked unless `--copy` says otherwise:
+    /// that CLI keeps refreshing the login, and a copy refreshed here as well
+    /// would rotate the refresh token out from under it.
+    #[test]
+    fn import_links_the_clis_own_file_and_copies_others() {
+        use clap::Parser;
+        let parse = |argv: &[&str]| match Cli::parse_from(argv).command {
+            Some(Command::Import(a)) => a,
+            other => panic!("not an import: {other:?}"),
+        };
+        let own = oauth::DEFAULT_CREDENTIALS_PATH;
+        let a = parse(&["corrall", "import"]);
+        assert!(import_links(&a, &a.from, own));
+        assert!(!import_links(&parse(&["corrall", "import", "--copy"]), own, own));
+        let other = parse(&["corrall", "import", "--from", "/tmp/acct2/.credentials.json"]);
+        assert!(!import_links(&other, &other.from, own));
+        let other = parse(&["corrall", "import", "--from", "/tmp/acct2/.credentials.json", "--link"]);
+        assert!(import_links(&other, &other.from, own));
+        assert!(Cli::try_parse_from(["corrall", "import", "--link", "--copy"]).is_err());
+        let codex = parse(&["corrall", "import", "--codex", "--from", "~/.codex/auth.json"]);
+        assert!(import_links(&codex, &codex.from, crate::codex::DEFAULT_CREDENTIALS_PATH));
     }
 
     /// `import --link` of the same user's credentials for a second org, where

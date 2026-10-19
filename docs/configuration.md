@@ -155,7 +155,7 @@ directory, for a wrapper resolving a project it has not entered yet.
 | `priority` | Lower is preferred (default 0) |
 | `disabled` | Excluded from rotation |
 | `accessToken` / `refreshToken` / `expiresAt` | OAuth tokens (ms epoch). Written back on refresh |
-| `importFrom` | Read tokens from this file (Claude Code's `~/.claude/.credentials.json`) on every reload instead of storing them |
+| `importFrom` | Linked account: read tokens from this file (Claude Code's `~/.claude/.credentials.json`) instead of storing them. The proxy never refreshes a linked account; it re-reads the file near expiry, after a 401, and every few seconds while the account is in error, and leaves the refresh to the CLI that owns the file. Refreshing it here would rotate that CLI's refresh token and log it out |
 | `apiKey` | For `apikey` accounts |
 | `upstream` | Per-account base URL (third-party Anthropic-compatible API). Refused for `oauth` accounts pointing off Anthropic |
 | `modelMap` | `{ "claude-sonnet-4-6": "deepseek-v4-pro" }` |

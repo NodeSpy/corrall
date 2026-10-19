@@ -81,6 +81,13 @@ pub enum Provider {
 }
 
 impl Provider {
+    /// The program that owns a linked credentials file and refreshes it.
+    pub fn cli_name(self) -> &'static str {
+        match self {
+            Provider::Anthropic => "Claude Code",
+            Provider::Codex => "the Codex CLI",
+        }
+    }
     pub fn for_path(path: &str) -> Provider {
         if crate::codex::is_codex_path(path) {
             Provider::Codex
@@ -118,6 +125,8 @@ pub struct Account {
     pub credential: Option<String>,
     pub refresh_token: Option<String>,
     pub expires_at: Option<i64>,
+    /// Set for a linked account (see [`linked_path`]): its tokens are read
+    /// from this file and never refreshed by the proxy.
     pub import_from: Option<String>,
     pub upstream: Option<String>,
     pub model_map: BTreeMap<String, String>,
@@ -150,6 +159,21 @@ pub struct Account {
     pub requalify: bool,
 }
 
+/// The credentials file a linked account reads its tokens from: `importFrom`,
+/// or for a Codex account with no stored token, the Codex CLI's own file
+/// (which `apply_credentials` falls back to). `None` for an account whose
+/// tokens the proxy holds and refreshes itself.
+fn linked_path(c: &AccountConfig) -> Option<String> {
+    if c.kind != AccountType::Oauth {
+        return None;
+    }
+    if c.import_from.is_some() || !c.is_codex() {
+        return c.import_from.clone();
+    }
+    let stored = c.access_token.as_deref().is_some_and(|t| !t.is_empty());
+    (!stored).then(|| crate::codex::DEFAULT_CREDENTIALS_PATH.to_string())
+}
+
 impl Account {
     fn from_config(c: &AccountConfig) -> Account {
         let mut a = Account {
@@ -169,7 +193,7 @@ impl Account {
             credential: None,
             refresh_token: None,
             expires_at: None,
-            import_from: c.import_from.clone(),
+            import_from: linked_path(c),
             upstream: c.upstream.clone(),
             model_map: c.model_map.clone().unwrap_or_default(),
             strip_request_fields: c.strip_request_fields.clone(),
@@ -510,7 +534,7 @@ impl Manager {
                     a.org_name = c.org_name.clone().or(a.org_name);
                     a.email = c.email.clone().or(a.email);
                     a.account_id = c.account_id.clone().or(a.account_id);
-                    a.import_from = c.import_from.clone();
+                    a.import_from = linked_path(c);
                     // Take the on-disk credential when it differs from what we
                     // hold: a re-login or a rotated API key. An OAuth pair we
                     // refreshed more recently than the file (a later expiry) is
@@ -717,8 +741,12 @@ impl Manager {
     // ── token freshness ──────────────────────────────────────
 
     /// Refresh the OAuth token when it is close to expiry (or `force`d by a
-    /// 401). Concurrent callers coalesce on one refresh per account.
+    /// 401). Concurrent callers coalesce on one refresh per account. A linked
+    /// account is re-read from its file instead ([`Self::reread_linked`]).
     pub async fn ensure_token_fresh(&self, id: &str, force: bool, on_fail: OnRefreshFail) -> Option<String> {
+        if let Some(path) = self.with(|f| f.account(id).filter(|a| a.kind == AccountType::Oauth).and_then(|a| a.import_from.clone())) {
+            return self.reread_linked(id, &path, force);
+        }
         let (needs, lock, name, refresh_token) = self.with(|f| {
             let lock = f.refresh_locks.entry(id.to_string()).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))).clone();
             let Some(a) = f.account_mut(id) else { return (false, lock, String::new(), None) };
@@ -824,6 +852,77 @@ impl Manager {
             }
         }
         self.with(|f| f.account(id).and_then(|a| a.credential.clone()))
+    }
+
+    /// The token of a linked account, re-read from its file when it is near
+    /// expiry, after a 401 (`force`), or while the account is in error.
+    ///
+    /// The proxy never refreshes a linked account. Its refresh token belongs
+    /// to the program that writes the file (Claude Code, or the Codex CLI),
+    /// and the provider rotates it on every refresh: a refresh here would
+    /// leave that program holding a dead token, so its own next refresh fails
+    /// and it logs out ("OAuth session expired and could not be refreshed").
+    /// The owner refreshes, writes the file, and the proxy reads it again.
+    fn reread_linked(&self, id: &str, path: &str, force: bool) -> Option<String> {
+        let held = self.with(|f| f.account(id).cloned())?;
+        if !force && held.status != Status::Error && !oauth::is_expiring_soon(held.expires_at, TOKEN_REFRESH_AHEAD_MS) {
+            return held.credential;
+        }
+        // Outside the lock: this reads a file.
+        let mut fresh = held.clone();
+        fresh.apply_credentials(&AccountConfig { import_from: Some(path.to_string()), ..Default::default() });
+        let changed = fresh.credential.is_some() && (fresh.credential != held.credential || fresh.refresh_token != held.refresh_token);
+        let expired = fresh.expires_at.is_some_and(|e| e <= now_ms());
+        let (cred, line) = self.with(|f| {
+            let Some(a) = f.account_mut(id) else { return (None, None) };
+            let owner = a.provider.cli_name();
+            if changed {
+                a.credential = fresh.credential;
+                a.refresh_token = fresh.refresh_token;
+                a.expires_at = fresh.expires_at;
+                a.dead_refresh_token = None;
+                let line = format!("Read a new token for \"{}\" from {path}", a.name);
+                if a.status == Status::Error {
+                    a.status = Status::Active;
+                    a.error_message = None;
+                    f.probe.recheck.insert(id.to_string());
+                }
+                (f.account(id).and_then(|a| a.credential.clone()), Some(line))
+            } else if expired {
+                let why = format!("{owner}'s login in {path} has expired; run {owner} there to refresh it");
+                let line = (a.error_message.as_deref() != Some(why.as_str())).then(|| format!("Account \"{}\": {why}", a.name));
+                a.status = Status::Error;
+                a.error_message = Some(why);
+                (None, line)
+            } else {
+                (a.credential.clone(), None)
+            }
+        });
+        if let Some(line) = line {
+            self.log(line);
+        }
+        cred
+    }
+
+    /// Re-read the file of every linked account in error, so one comes back
+    /// as soon as its owner has refreshed it rather than at the next reload.
+    /// The prober calls this every tick; the files are small and local.
+    pub fn recheck_linked(&self) {
+        let errored: Vec<(String, String)> = self.with(|f| {
+            f.accounts
+                .iter()
+                .filter(|a| a.kind == AccountType::Oauth && a.status == Status::Error)
+                .filter_map(|a| a.import_from.clone().map(|p| (a.id.clone(), p)))
+                .collect()
+        });
+        for (id, path) in errored {
+            let _ = self.reread_linked(&id, &path, false);
+        }
+    }
+
+    /// The file a linked account reads its tokens from, and who refreshes it.
+    pub fn linked_source(&self, id: &str) -> Option<(String, &'static str)> {
+        self.with(|f| f.account(id).and_then(|a| a.import_from.clone().map(|p| (p, a.provider.cli_name()))))
     }
 
     // ── quota / status updates ───────────────────────────────
@@ -2221,6 +2320,94 @@ mod tests {
         let second = sel("22222222-2222-2222-2222-222222222222");
         assert_eq!(second, other, "new session spreads to the idle account");
         m.with(|f| assert!(f.account(&other).unwrap().ramp_started_at.is_some(), "an idle account ramps up"));
+    }
+
+    /// Write a Claude Code credentials file the way Claude Code does.
+    fn write_claude_creds(path: &std::path::Path, access: &str, refresh: &str, expires_at: i64) {
+        let body = json!({ "claudeAiOauth": { "accessToken": access, "refreshToken": refresh, "expiresAt": expires_at } });
+        std::fs::write(path, body.to_string()).unwrap();
+    }
+
+    fn linked_acct(name: &str, path: &std::path::Path) -> AccountConfig {
+        AccountConfig { name: name.into(), kind: AccountType::Oauth, import_from: Some(path.display().to_string()), ..Default::default() }
+    }
+
+    #[tokio::test]
+    async fn linked_account_is_reread_never_refreshed() {
+        // Claude Code owns a linked login and its refresh token. A refresh
+        // here would rotate that token and log Claude Code out, so a token
+        // near expiry only sends the proxy back to the file.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(".credentials.json");
+        write_claude_creds(&file, "tok1", "rt1", now_ms() + 60_000);
+        let m = mgr(&cfg_with(vec![linked_acct("a", &file)]));
+        let id = m.account_ids()[0].0.clone();
+
+        let cred = m.ensure_token_fresh(&id, false, OnRefreshFail::MarkDead).await;
+        assert_eq!(cred.as_deref(), Some("tok1"));
+        m.with(|f| {
+            let a = f.account(&id).unwrap();
+            assert_eq!(a.refresh_token.as_deref(), Some("rt1"), "the refresh token is left alone");
+            assert!(a.last_refresh_at.is_none(), "no refresh was attempted");
+            assert_eq!(a.status, Status::Active);
+        });
+
+        // Claude Code refreshes and rewrites the file: the next use reads it.
+        write_claude_creds(&file, "tok2", "rt2", now_ms() + 3_600_000);
+        assert_eq!(m.ensure_token_fresh(&id, false, OnRefreshFail::MarkDead).await.as_deref(), Some("tok2"));
+
+        // A 401 with the file unchanged gives back the same token, which the
+        // caller takes as "nothing new" and fails over.
+        assert_eq!(m.ensure_token_fresh(&id, true, OnRefreshFail::MarkDead).await.as_deref(), Some("tok2"));
+        m.with(|f| assert!(f.account(&id).unwrap().last_refresh_at.is_none()));
+    }
+
+    #[tokio::test]
+    async fn linked_account_waits_for_its_owner_then_comes_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(".credentials.json");
+        write_claude_creds(&file, "tok1", "rt1", now_ms() - 1);
+        let m = mgr(&cfg_with(vec![linked_acct("a", &file)]));
+        let id = m.account_ids()[0].0.clone();
+
+        // Expired on disk: out of rotation, with who has to act and where.
+        assert_eq!(m.ensure_token_fresh(&id, false, OnRefreshFail::Keep).await, None);
+        m.with(|f| {
+            let a = f.account(&id).unwrap();
+            assert_eq!(a.status, Status::Error);
+            assert!(a.error_message.as_deref().unwrap().contains("Claude Code's login in"));
+            assert!(f.unavailable_reason(a, None, None, now_ms()).is_some());
+        });
+        assert_eq!(m.needs_login(&id), None, "not a dead login: the owner can still refresh it");
+
+        // Nothing new yet: still waiting.
+        m.recheck_linked();
+        m.with(|f| assert_eq!(f.account(&id).unwrap().status, Status::Error));
+
+        // Claude Code runs and refreshes: the next tick picks it up and the
+        // probe looks at it again.
+        write_claude_creds(&file, "tok2", "rt2", now_ms() + 3_600_000);
+        m.recheck_linked();
+        m.with(|f| {
+            let a = f.account(&id).unwrap();
+            assert_eq!(a.status, Status::Active);
+            assert_eq!(a.credential.as_deref(), Some("tok2"));
+        });
+        assert_eq!(m.take_probe_recheck(), vec![id.clone()]);
+    }
+
+    #[test]
+    fn codex_account_without_stored_tokens_is_linked_to_the_cli_file() {
+        let codex = |token: Option<&str>| AccountConfig {
+            name: "c".into(),
+            kind: AccountType::Oauth,
+            provider: Some("codex".into()),
+            access_token: token.map(str::to_string),
+            ..Default::default()
+        };
+        assert_eq!(linked_path(&codex(None)).as_deref(), Some(crate::codex::DEFAULT_CREDENTIALS_PATH));
+        assert_eq!(linked_path(&codex(Some("tok"))), None, "stored tokens are the proxy's own");
+        assert_eq!(linked_path(&acct("a", 0)), None);
     }
 
     #[tokio::test]
