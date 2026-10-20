@@ -25,7 +25,7 @@ use crate::attach::{Link, Remote};
 use crate::prober::{ManualProbe, Prober};
 use crate::proxy::server::{Activity, Ctx};
 use crate::security::safe_text;
-use crate::status::{bar, countdown, format_duration, ts as parse_ts};
+use crate::status::{countdown, format_duration, gradient, ts as parse_ts};
 
 /// How loudly a log line is drawn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +56,21 @@ fn severity_of(line: &str) -> Severity {
 
 /// The `probe` column for one account row: what the last probe said and how
 /// long ago, in a few characters.
+/// Compact quota bar: filled cells run green → yellow → red across the width,
+/// so a full bar ends in red.
+fn bar(v: Option<f64>, width: usize) -> Vec<Span<'static>> {
+    let Some(u) = v.filter(|u| u.is_finite()) else { return vec![Span::raw("·".repeat(width))] };
+    let filled = (u.clamp(0.0, 1.0) * width as f64).round() as usize;
+    let mut spans: Vec<Span> = (0..filled)
+        .map(|i| {
+            let (r, g, b) = gradient(i, width);
+            Span::styled("█", Style::default().fg(Color::Rgb(r, g, b)))
+        })
+        .collect();
+    spans.push(Span::raw("░".repeat(width - filled)));
+    spans
+}
+
 fn probe_cell(account: &Value, now: i64) -> String {
     let Some(p) = account.get("probe") else { return "never".into() };
     let status = p.get("status").and_then(Value::as_str).unwrap_or("never");
@@ -455,7 +470,9 @@ impl Tui {
             let q = |b: &str| {
                 let u = a.pointer(&format!("/quota/{b}/utilization")).and_then(Value::as_f64);
                 let r = a.pointer(&format!("/quota/{b}/resetInSeconds")).and_then(Value::as_i64);
-                format!("{} {} {}", bar(u, 10), u.map(|x| format!("{:>3.0}%", x * 100.0)).unwrap_or("  ?%".into()), countdown(r))
+                let mut spans = bar(u, 10);
+                spans.push(Span::raw(format!(" {} {}", u.map(|x| format!("{:>3.0}%", x * 100.0)).unwrap_or("  ?%".into()), countdown(r))));
+                Line::from(spans)
             };
             let blocked = a.get("blocked").and_then(Value::as_str);
             let status = if a.get("disabled").and_then(Value::as_bool).unwrap_or(false) {
@@ -560,6 +577,16 @@ mod tests {
         assert_eq!(severity_of("Quota rejection (429) on \"a\"; throttling 60s"), Severity::Warn);
         assert_eq!(severity_of("Switched to account \"a\""), Severity::Info);
         assert_eq!(severity_of("Quota probe enabled for pool \"default\" (every 300s)"), Severity::Info);
+    }
+
+    #[test]
+    fn bar_runs_green_to_red() {
+        let text = |spans: &[Span]| spans.iter().map(|s| s.content.as_ref()).collect::<String>();
+        assert_eq!(text(&bar(None, 10)), "·".repeat(10));
+        assert_eq!(text(&bar(Some(0.5), 10)), format!("{}{}", "█".repeat(5), "░".repeat(5)));
+        let full = bar(Some(1.0), 10);
+        assert_eq!(full[0].style.fg, Some(Color::Rgb(35, 209, 96)));
+        assert_eq!(full[9].style.fg, Some(Color::Rgb(239, 68, 68)));
     }
 
     #[test]
