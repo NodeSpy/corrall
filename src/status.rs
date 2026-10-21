@@ -166,7 +166,8 @@ fn format_number(n: i64) -> String {
     }
 }
 
-fn gradient(index: usize, width: usize) -> (u8, u8, u8) {
+/// Green → yellow → red colour for cell `index` of a `width`-cell bar.
+pub fn gradient(index: usize, width: usize) -> (u8, u8, u8) {
     let t = if width <= 1 { 1.0 } else { index as f64 / (width - 1) as f64 };
     let (from, to, p) =
         if t < 0.5 { ([35.0, 209.0, 96.0], [245.0, 185.0, 40.0], t * 2.0) } else { ([245.0, 185.0, 40.0], [239.0, 68.0, 68.0], (t - 0.5) * 2.0) };
@@ -195,17 +196,6 @@ fn usage_bar(ratio: Option<f64>, paint: Paint, cap: Option<f64>) -> String {
         cells[at] = if safe >= c { paint.red("┃") } else { paint.yellow("┃") };
     }
     format!("[{}]", cells.join(""))
-}
-
-/// Compact bar used by the TUI.
-pub fn bar(v: Option<f64>, width: usize) -> String {
-    match v {
-        None => "·".repeat(width),
-        Some(u) => {
-            let filled = ((u.clamp(0.0, 1.0)) * width as f64).round() as usize;
-            format!("{}{}", "█".repeat(filled), "░".repeat(width.saturating_sub(filled)))
-        }
-    }
 }
 
 /// Short countdown used by the TUI.
