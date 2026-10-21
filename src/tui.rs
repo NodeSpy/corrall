@@ -47,7 +47,7 @@ fn severity_of(line: &str) -> Severity {
     if t.starts_with("WARN") {
         return Severity::Warn;
     }
-    const WARN_WORDS: [&str; 6] = ["429", "failed", "rejected", "rate-limited", "exhausted", "not persisted"];
+    const WARN_WORDS: [&str; 7] = ["429", "failed", "rejected", "rate-limited", "exhausted", "not persisted", "login expires"];
     if WARN_WORDS.iter().any(|w| t.contains(w)) {
         return Severity::Warn;
     }
@@ -458,10 +458,15 @@ impl Tui {
                 format!("{} {} {}", bar(u, 10), u.map(|x| format!("{:>3.0}%", x * 100.0)).unwrap_or("  ?%".into()), countdown(r))
             };
             let blocked = a.get("blocked").and_then(Value::as_str);
+            let login = crate::status::login_expiry(a, now);
             let status = if a.get("disabled").and_then(Value::as_bool).unwrap_or(false) {
                 "disabled".into()
+            } else if let Some(b) = blocked {
+                safe_text(b, 30)
+            } else if let Some(left) = login.filter(|l| *l > 0) {
+                format!("ready, login expires {}", format_duration(left))
             } else {
-                blocked.map(|b| safe_text(b, 30)).unwrap_or_else(|| "ready".into())
+                "ready".into()
             };
             let style = if self.selecting == Some(i) {
                 Style::default().bg(Color::Blue).fg(Color::White)
@@ -469,6 +474,8 @@ impl Tui {
                 Style::default().fg(Color::Green).bold()
             } else if blocked.is_some() {
                 Style::default().fg(Color::DarkGray)
+            } else if login.is_some() {
+                Style::default().fg(Color::Yellow)
             } else {
                 Style::default()
             };

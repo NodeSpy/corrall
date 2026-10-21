@@ -437,6 +437,25 @@ fn unavailable_text(key: &str, raw: &str) -> String {
     }
 }
 
+/// How long the account's login has left, once that is within the warning
+/// window: refreshing never extends it, so this is the notice to log in again.
+pub fn login_expiry(account: &Value, now: i64) -> Option<i64> {
+    let exp = ts(account.get("loginExpiresAt"))?;
+    (exp - now <= crate::manager::LOGIN_EXPIRY_WARN_MS).then_some(exp - now)
+}
+
+/// `pool` names the account's pool in the hint: a login without `--pool`
+/// lands in the default pool and would move the account there.
+fn login_line(account: &Value, pool: Option<&str>, now: i64, paint: Paint) -> Option<String> {
+    let left = login_expiry(account, now)?;
+    let run = match pool {
+        Some(p) => format!("run: corrall login --pool {}", safe_text(p, 24)),
+        None => "run: corrall login".to_string(),
+    };
+    let text = if left > 0 { format!("expires in {} — {run}", format_duration(left)) } else { format!("expired — {run}") };
+    Some(format!("{} {}", paint.dim(&pad("Login", 8)), if left > 0 { paint.yellow(&text) } else { paint.red(&text) }))
+}
+
 fn unavailable_line(account: &Value, paint: Paint) -> Option<String> {
     let key = s(account, "unavailable")?;
     let raw = s(account, "blocked").unwrap_or(key);
@@ -709,6 +728,9 @@ fn render_pool(st: &Value, heading: &str, paint: Paint, now: i64, daemon: bool) 
         if let Some(w) = unavailable_line(account, paint) {
             lines.push(format!("  {w}"));
         }
+        if let Some(l) = login_line(account, s(st, "pool"), now, paint) {
+            lines.push(format!("  {l}"));
+        }
         if let Some(sp) = spend_line(account, paint) {
             lines.push(format!("  {sp}"));
         }
@@ -743,6 +765,18 @@ fn render_pool(st: &Value, heading: &str, paint: Paint, now: i64, daemon: bool) 
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn login_line_shows_only_inside_the_warning_window() {
+        let p = Paint { on: false };
+        let now = 1_000_000_000_000;
+        let day = 24 * 3600 * 1000;
+        let at = |ms: i64| json!({ "loginExpiresAt": crate::manager::iso(ms) });
+        assert_eq!(login_line(&at(now + 3 * day), Some("work"), now, p).as_deref(), Some("Login    expires in 3d — run: corrall login --pool work"));
+        assert_eq!(login_line(&at(now - 1000), None, now, p).as_deref(), Some("Login    expired — run: corrall login"));
+        assert_eq!(login_line(&at(now + 20 * day), None, now, p), None);
+        assert_eq!(login_line(&json!({}), None, now, p), None, "unknown expiry: no line");
+    }
 
     #[test]
     fn durations_match_original() {
