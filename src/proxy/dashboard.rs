@@ -10,7 +10,7 @@ pub const HTML: &str = r#"<!doctype html>
 :root{color-scheme:light dark;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px}
 body{margin:1.5rem;max-width:1100px}h1{font-size:1.1rem;margin:0 0 .5rem}
 table{border-collapse:collapse;width:100%;margin-top:1rem}th,td{text-align:left;padding:.3rem .5rem;border-bottom:1px solid #8884}
-.bar{display:inline-block;width:80px;height:8px;background:#8883;vertical-align:middle;margin-right:.4rem}.bar i{display:block;height:100%;background:linear-gradient(90deg,#23d160,#f5b928 50%,#ef4444);background-size:80px 100%}
+.bar{display:inline-block;width:80px;height:8px;background:#8883;vertical-align:middle;margin-right:.4rem}.bar i{display:block;height:100%;background:linear-gradient(90deg,#23d160 35%,#f5b928 75%,#ef4444);background-size:80px 100%}
 .cur{font-weight:700}.dim{opacity:.6}button{font:inherit;cursor:pointer}#err{color:#c44}
 #log{white-space:pre-wrap;max-height:14rem;overflow:auto;background:#8881;padding:.5rem;margin-top:1rem}
 </style></head><body>
