@@ -166,11 +166,18 @@ fn format_number(n: i64) -> String {
     }
 }
 
+/// Quota bar colour stops as (position, rgb): green holds through the first
+/// third so yellow only shows from about half-way, then red at the end.
+/// The browser dashboard's CSS gradient in `proxy/dashboard.rs` mirrors these.
+const GRADIENT_STOPS: [(f64, [f64; 3]); 4] =
+    [(0.0, [35.0, 209.0, 96.0]), (0.35, [35.0, 209.0, 96.0]), (0.75, [245.0, 185.0, 40.0]), (1.0, [239.0, 68.0, 68.0])];
+
 /// Green → yellow → red colour for cell `index` of a `width`-cell bar.
 pub fn gradient(index: usize, width: usize) -> (u8, u8, u8) {
     let t = if width <= 1 { 1.0 } else { index as f64 / (width - 1) as f64 };
-    let (from, to, p) =
-        if t < 0.5 { ([35.0, 209.0, 96.0], [245.0, 185.0, 40.0], t * 2.0) } else { ([245.0, 185.0, 40.0], [239.0, 68.0, 68.0], (t - 0.5) * 2.0) };
+    let i = GRADIENT_STOPS.windows(2).position(|w| t <= w[1].0).unwrap_or(GRADIENT_STOPS.len() - 2);
+    let ((t0, from), (t1, to)) = (GRADIENT_STOPS[i], GRADIENT_STOPS[i + 1]);
+    let p = ((t - t0) / (t1 - t0)).clamp(0.0, 1.0);
     let c = |i: usize| (from[i] + (to[i] - from[i]) * p).round() as u8;
     (c(0), c(1), c(2))
 }
@@ -830,6 +837,7 @@ mod tests {
         assert!(usage_bar(Some(0.5), p, Some(0.6)).contains('┃'));
         assert_eq!(gradient(0, 18), (35, 209, 96));
         assert_eq!(gradient(17, 18), (239, 68, 68));
+        assert_eq!(gradient(5, 18), (35, 209, 96));
     }
 
     #[test]
