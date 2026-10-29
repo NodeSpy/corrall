@@ -71,6 +71,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Command::Probe { value, pool } => cli::probe(value, pool).await,
         Command::Warmup { value } => cli::warmup(value).await,
         Command::Expiry { value, tolerance, preempt, pool } => cli::expiry(value, tolerance, preempt, pool).await,
+        Command::SoonestReset { value, pool } => cli::soonest_reset(value, pool).await,
         Command::Titles { value } => cli::titles(value).await,
         Command::Route { cmd, pool } => cli::route(cmd, pool).await,
         Command::Pool { cmd } => cli::pool(cmd).await,
