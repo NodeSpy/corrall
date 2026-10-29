@@ -140,9 +140,9 @@ rather than create an empty config beside your accounts.
   `import --codex`), rotating independently on the same port.
 - Expiry-pressure routing (`expiry on`): prefer the account whose ample weekly
   quota is about to be forfeited, and re-rank when a window rolls over.
-- Soonest-reset routing (`soonest-reset on`): spend first the quota that is
-  forfeited first, whether a 5h window or a week about to roll over, and start
-  a fresh 5h window on an idle account only when nothing resets sooner.
+- Soonest-reset routing (`soonest-reset on`): spend first the week that ends
+  first, then within weeks ending about the same time the 5h window that
+  resets first, spreading sessions only across accounts that tie on both.
 - Keep-warm (`warmup N`), quota probe (`probe N`), session titles from Claude
   Code's own files (`titles on`), usage dimensions for per-project attribution.
 - Client-side OAuth token refresh and Remote Control (`/v1/code/*`, including
@@ -166,7 +166,7 @@ corrall distribute on        # spread sessions across equal-priority accounts
 corrall probe 300            # probe each account's quota every 300s, staggered (zero-spend)
 corrall warmup 600           # keep idle accounts' 5h windows running (spends a little)
 corrall expiry on            # expiry-pressure routing (--tolerance 1.5 --preempt on)
-corrall soonest-reset on     # use the account whose 5h or weekly quota resets soonest first
+corrall soonest-reset on     # spend the soonest-ending week first, then the soonest 5h window
 corrall titles on            # name activity rows after the Claude Code session
 corrall login --codex        # add an OpenAI Codex subscription
 corrall import --codex       # or import the Codex CLI's login

@@ -113,7 +113,7 @@ pub enum Command {
         #[arg(long)]
         pool: Option<String>,
     },
-    /// Use the account whose 5h or weekly quota resets soonest first (on|off)
+    /// Spend the soonest-ending week first, then the soonest 5h window (on|off)
     SoonestReset {
         value: Option<String>,
         #[arg(long)]

@@ -432,9 +432,10 @@ impl Tui {
 
         let sessions = st.get("sessions");
         let header = format!(
-            " Corrall v{}   current: {}   sessions: {} active / {} known   threshold: {}   probe: {}",
+            " Corrall v{}   current: {}   routing: {}   sessions: {} active / {} known   threshold: {}   probe: {}",
             st.get("version").and_then(Value::as_str).unwrap_or("?"),
             st.get("current").and_then(Value::as_str).unwrap_or("-"),
+            routing_summary(st),
             sessions.and_then(|s| s.get("active")).and_then(Value::as_u64).unwrap_or(0),
             sessions.and_then(|s| s.get("known")).and_then(Value::as_u64).unwrap_or(0),
             st.get("switchThreshold").map(|t| t.to_string()).unwrap_or_default(),
@@ -553,6 +554,23 @@ impl Tui {
     }
 }
 
+/// The header's routing summary for the default pool (the status document's
+/// top level): every ranking strategy that is on, or `sticky` when none is.
+fn routing_summary(st: &Value) -> String {
+    let on = |v: Option<&Value>| v.and_then(Value::as_bool).unwrap_or(false);
+    let strategies = [
+        ("soonest-reset", on(st.get("soonestReset"))),
+        ("expiry", on(st.get("expiryRouting").and_then(|e| e.get("enabled")))),
+        ("distribute", on(st.get("distributeSessions"))),
+    ];
+    let names: Vec<&str> = strategies.iter().filter(|(_, enabled)| *enabled).map(|(name, _)| *name).collect();
+    if names.is_empty() {
+        "sticky".into()
+    } else {
+        names.join(" + ")
+    }
+}
+
 /// The header's probe summary: the default pool's interval (the status
 /// document's top level), plus whether a run is on or when the next one is
 /// due.
@@ -607,6 +625,18 @@ mod tests {
         assert_eq!(probe_cell(&json!({ "probe": { "status": "skipped" } }), now), "skipped");
         assert_eq!(probe_cell(&json!({ "probe": { "status": "not-applicable" } }), now), "-");
         assert_eq!(probe_cell(&json!({}), now), "never");
+    }
+
+    #[test]
+    fn header_routing_summary() {
+        assert_eq!(routing_summary(&json!({})), "sticky");
+        assert_eq!(routing_summary(&json!({ "soonestReset": false, "expiryRouting": { "enabled": false }, "distributeSessions": false })), "sticky");
+        assert_eq!(routing_summary(&json!({ "soonestReset": true })), "soonest-reset");
+        assert_eq!(
+            routing_summary(&json!({ "soonestReset": true, "expiryRouting": { "enabled": true }, "distributeSessions": true })),
+            "soonest-reset + expiry + distribute"
+        );
+        assert_eq!(routing_summary(&json!({ "distributeSessions": true })), "distribute");
     }
 
     #[test]
