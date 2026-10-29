@@ -55,22 +55,51 @@ pub const OPEN_REQUEST_HEADROOM: f64 = 0.01;
 /// the limit is upstream-wide rather than per account.
 const FLEET_429_ACCOUNTS: usize = 2;
 const FLEET_429_WINDOW_MS: i64 = 30 * 1000;
-/// Soonest-reset routing moves a sticky or pinned account's traffic only to
-/// an account whose quota is forfeited at least this much sooner.
-const SOONEST_RESET_PREEMPT_MARGIN_MS: i64 = 15 * 60 * 1000;
+/// Soonest-reset routing treats weekly resets within this long of the
+/// soonest one in their priority tier as equal, so the 5h reset decides
+/// between them.
+const WEEKLY_BAND_MS: i64 = 24 * 3600 * 1000;
+/// ...and 5h resets within this long of the soonest one in their weekly band
+/// as equal, so load decides between them. It is also the least gain that
+/// moves a sticky or pinned account and its warm prompt cache.
+const FIVE_HOUR_BAND_MS: i64 = 15 * 60 * 1000;
 const FIVE_HOUR_WINDOW_MS: i64 = 5 * 3600 * 1000;
-
-/// When an account's unspent quota is next forfeited: the sooner of its 5h
-/// reset and its governing weekly reset. An account with no running 5h window
-/// counts as starting one now, so it trails every running window unless its
-/// weekly reset comes first.
-fn forfeit_at(a: &Account, model: Option<&str>, now: i64) -> i64 {
-    let five = a.quota.unified5h.reset_at.filter(|r| *r > now).unwrap_or(now + FIVE_HOUR_WINDOW_MS);
-    five.min(weekly_reset_key(a, model, now))
-}
 
 fn weekly_reset_key(a: &Account, model: Option<&str>, now: i64) -> i64 {
     a.weekly_reset_for(model).filter(|r| *r > now).unwrap_or(i64::MAX)
+}
+
+/// When the 5h window resets. An account with no running window counts as
+/// starting one now, so it trails every running window.
+fn five_hour_deadline(a: &Account, now: i64) -> i64 {
+    a.quota.unified5h.reset_at.filter(|r| *r > now).unwrap_or(now + FIVE_HOUR_WINDOW_MS)
+}
+
+/// Soonest-reset rank of each account in `pool` by id: priority, then the
+/// weekly band (whole [`WEEKLY_BAND_MS`] steps after the soonest weekly reset
+/// in the priority tier, unknown last), then the 5h band ([`FIVE_HOUR_BAND_MS`]
+/// steps after the soonest 5h reset in that weekly band). Weekly quota comes
+/// first because it is what an unspent reset actually forfeits; a 5h window
+/// that resets unused costs nothing while the week has room to spare.
+fn soonest_reset_bands(pool: &[&Account], model: Option<&str>, now: i64) -> HashMap<String, (i32, i64, i64)> {
+    let steps = |t: i64, from: i64, width: i64| if t == i64::MAX { i64::MAX } else { (t - from) / width };
+    let mut weekly_min: HashMap<i32, i64> = HashMap::new();
+    for a in pool {
+        let w = weekly_min.entry(a.priority).or_insert(i64::MAX);
+        *w = (*w).min(weekly_reset_key(a, model, now));
+    }
+    let weekly_band = |a: &Account| steps(weekly_reset_key(a, model, now), weekly_min[&a.priority], WEEKLY_BAND_MS);
+    let mut five_min: HashMap<(i32, i64), i64> = HashMap::new();
+    for a in pool {
+        let f = five_min.entry((a.priority, weekly_band(a))).or_insert(i64::MAX);
+        *f = (*f).min(five_hour_deadline(a, now));
+    }
+    pool.iter()
+        .map(|a| {
+            let wb = weekly_band(a);
+            (a.id.clone(), (a.priority, wb, steps(five_hour_deadline(a, now), five_min[&(a.priority, wb)], FIVE_HOUR_BAND_MS)))
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -1694,28 +1723,47 @@ impl Fleet {
 
     /// Ranking: lowest priority number, then fewest active sessions when
     /// distributing, then soonest governing weekly reset (unknown last). With
-    /// soonest-reset routing on, priority is followed by [`forfeit_at`], then
-    /// the weekly reset, and the rest only break their ties.
+    /// soonest-reset routing on: priority, the weekly band, the 5h band (see
+    /// [`soonest_reset_bands`]), then fewest sessions when distributing, then
+    /// the exact weekly and 5h resets.
     fn ranked_available(&self, req: &SelectRequest, now: i64) -> Vec<&Account> {
         let mut v = self.ranked_by_default(req, now);
         if self.soonest_reset {
-            // Stable, so full ties (idle accounts on the same week) keep the order above.
-            let key = |a: &Account| (a.priority, forfeit_at(a, req.model, now), weekly_reset_key(a, req.model, now));
-            v.sort_by_key(|a| key(a));
+            let bands = soonest_reset_bands(&v, req.model, now);
+            let stats = if self.distribute_sessions { Some(self.sessions.stats(now)) } else { None };
+            let load = |a: &Account| match &stats {
+                Some(st) => (st.per_account_active.get(&a.id).copied().unwrap_or(0), st.per_account_in_flight.get(&a.id).copied().unwrap_or(0) + a.in_flight),
+                None => (0, 0),
+            };
+            v.sort_by(|a, b| {
+                bands[&a.id]
+                    .cmp(&bands[&b.id])
+                    .then_with(|| load(a).cmp(&load(b)))
+                    .then_with(|| weekly_reset_key(a, req.model, now).cmp(&weekly_reset_key(b, req.model, now)))
+                    .then_with(|| five_hour_deadline(a, now).cmp(&five_hour_deadline(b, now)))
+            });
         }
         v
     }
 
-    /// With soonest-reset routing on: is `best`'s quota forfeited enough
-    /// sooner than `cur`'s to move traffic off `cur`? The margin keeps two
-    /// resets a few minutes apart from trading a warm prompt cache for nothing.
-    fn soonest_reset_preempts(&self, best: &Account, cur: &Account, model: Option<&str>, now: i64) -> bool {
-        self.soonest_reset && best.id != cur.id && forfeit_at(best, model, now) < forfeit_at(cur, model, now).saturating_sub(SOONEST_RESET_PREEMPT_MARGIN_MS)
+    /// With soonest-reset routing on: does `best` sit in an earlier weekly or
+    /// 5h band than `cur`? Load alone never moves a sticky or pinned account.
+    fn soonest_reset_preempts(&self, best: &Account, cur: &Account, req: &SelectRequest, now: i64) -> bool {
+        if !self.soonest_reset || best.id == cur.id {
+            return false;
+        }
+        let pool = self.available(req, now);
+        let bands = soonest_reset_bands(&pool, req.model, now);
+        matches!((bands.get(&best.id), bands.get(&cur.id)), (Some(b), Some(c)) if b < c)
+    }
+
+    fn available(&self, req: &SelectRequest, now: i64) -> Vec<&Account> {
+        self.accounts.iter().filter(|a| !req.exclude.contains(&a.id) && self.is_available_for(a, req, now)).collect()
     }
 
     fn ranked_by_default(&self, req: &SelectRequest, now: i64) -> Vec<&Account> {
         let stats = if self.distribute_sessions { Some(self.sessions.stats(now)) } else { None };
-        let v: Vec<&Account> = self.accounts.iter().filter(|a| !req.exclude.contains(&a.id) && self.is_available_for(a, req, now)).collect();
+        let v = self.available(req, now);
         if self.expiry.enabled {
             return self.band(v, req.model, now);
         }
@@ -1826,11 +1874,11 @@ impl Fleet {
                     if !req.exclude.contains(&id) && self.is_available_for(&a, req, now) {
                         // Priority still wins: a strictly better-priority account preempts the pin,
                         // and so do a rollover of the governing weekly window (expiry routing)
-                        // and quota forfeited well before this one's (soonest-reset routing).
+                        // and an account in an earlier weekly or 5h band (soonest-reset routing).
                         let better = self
                             .ranked_available(req, now)
                             .first()
-                            .map(|b| b.priority < a.priority || self.soonest_reset_preempts(b, &a, req.model, now))
+                            .map(|b| b.priority < a.priority || self.soonest_reset_preempts(b, &a, req, now))
                             .unwrap_or(false);
                         let rolled = self.rolled_over(&a, req.model);
                         if !better && !rolled {
@@ -1888,11 +1936,11 @@ impl Fleet {
                 if !req.exclude.contains(&cur) && self.is_available_for(&a, req, now) {
                     // A strictly lower priority number elsewhere preempts, and so do
                     // a rollover of the governing weekly window (expiry routing) and
-                    // quota forfeited well before this one's (soonest-reset routing).
+                    // an account in an earlier weekly or 5h band (soonest-reset routing).
                     let better = self
                         .ranked_available(req, now)
                         .first()
-                        .map(|b| b.priority < a.priority || self.soonest_reset_preempts(b, &a, req.model, now))
+                        .map(|b| b.priority < a.priority || self.soonest_reset_preempts(b, &a, req, now))
                         .unwrap_or(false);
                     let rolled = self.rolled_over(&a, req.model);
                     if !better && !rolled {
@@ -2431,56 +2479,96 @@ mod tests {
         assert_eq!(select_name(&m, None).as_deref(), Some("idle"));
     }
 
-    /// Soonest-reset routing, weekly side: an account's quota is forfeited at
-    /// the sooner of its 5h and weekly resets, so a week about to roll over is
-    /// spent ahead of a 5h window that has longer to run, even on an idle
-    /// account, and between two idle accounts the sooner week goes first.
+    /// Soonest-reset routing, weekly side, on the fleet this was built for:
+    /// the week that ends first is spent first, even ahead of a 5h window that
+    /// resets sooner. Weeks ending within a day of the soonest one count as
+    /// equal and the 5h reset decides between them, so a running window goes
+    /// ahead of an idle account a few hours sooner on the week. The bands are
+    /// measured from whatever is still available.
     #[test]
-    fn soonest_reset_weighs_the_weekly_reset_with_the_5h_one() {
+    fn soonest_reset_spends_the_soonest_week_first() {
+        let names = ["adam", "c2", "c3", "c4", "c5", "c6"];
+        let mut cfg = cfg_with(names.iter().map(|n| acct(n, 0)).collect());
+        pool_of(&mut cfg).soonest_reset = true;
+        let m = mgr(&cfg);
+        let id = |n: &str| m.account_ids().into_iter().find(|(_, x)| x == n).unwrap().0;
+        let now = now_ms();
+        // (name, 5h reset in, weekly used, weekly reset in); None = no running 5h window.
+        let fleet = [
+            ("adam", Some(3 * HOUR + 12 * 60_000), 0.16, 68 * HOUR),
+            ("c2", Some(4 * HOUR + 42 * 60_000), 0.45, 40 * HOUR),
+            ("c3", None, 0.06, 75 * HOUR),
+            ("c4", None, 0.06, 101 * HOUR),
+            ("c5", None, 0.49, 62 * HOUR),
+            ("c6", Some(3 * HOUR + 12 * 60_000), 0.31, 6 * HOUR),
+        ];
+        // Ids first: `id` takes the fleet lock that `with` holds.
+        let fleet = fleet.map(|(n, five, used, week)| (id(n), five, used, week));
+        m.with(|f| {
+            for (acct, five, used, week) in &fleet {
+                let a = f.account_mut(acct).unwrap();
+                if let Some(r) = five {
+                    a.quota.unified5h = window(0.05, *r, now);
+                }
+                a.quota.unified7d = window(*used, *week, now);
+            }
+        });
+        // Each pick is spent to the threshold before the next is chosen.
+        for want in ["c6", "c2", "adam", "c5", "c3", "c4"] {
+            assert_eq!(select_name(&m, None).as_deref(), Some(want));
+            let spent = id(want);
+            m.with(|f| f.account_mut(&spent).unwrap().quota.unified5h = window(0.99, 2 * HOUR, now));
+        }
+
+        // A week ending first beats a 5h window resetting first.
         let mut cfg = cfg_with(vec![acct("running", 0), acct("week-ends", 0)]);
         pool_of(&mut cfg).soonest_reset = true;
         let m = mgr(&cfg);
         let id = |n: &str| m.account_ids().into_iter().find(|(_, x)| x == n).unwrap().0;
         let (running, week_ends) = (id("running"), id("week-ends"));
-        let now = now_ms();
         m.with(|f| {
             let r = f.account_mut(&running).unwrap();
-            r.quota.unified5h = window(0.2, 4 * HOUR, now);
+            r.quota.unified5h = window(0.2, 30 * 60_000, now);
             r.quota.unified7d = window(0.3, 6 * 24 * HOUR, now);
-            // No running 5h window, but its week ends in 3h.
-            f.account_mut(&week_ends).unwrap().quota.unified7d = window(0.4, 3 * HOUR, now);
+            f.account_mut(&week_ends).unwrap().quota.unified7d = window(0.4, 3 * 24 * HOUR, now);
         });
         assert_eq!(select_name(&m, None).as_deref(), Some("week-ends"));
+    }
 
-        // A 5h window resetting before that week ends goes first.
-        m.with(|f| f.account_mut(&running).unwrap().quota.unified5h = window(0.2, 30 * 60_000, now));
-        assert_eq!(select_name(&m, None).as_deref(), Some("running"));
-
-        // Two idle accounts: the sooner week, even when distributing would
-        // otherwise pick the one with fewer sessions.
-        let mut cfg = cfg_with(vec![acct("next-week", 0), acct("this-week", 0)]);
+    /// With `distributeSessions`, new sessions spread by load only across
+    /// accounts that share both bands; a sooner band still takes them all.
+    #[test]
+    fn soonest_reset_distributes_within_a_band() {
+        let mut cfg = cfg_with(vec![acct("a", 0), acct("b", 0), acct("c", 0)]);
         pool_of(&mut cfg).soonest_reset = true;
         pool_of(&mut cfg).distribute_sessions = true;
         let m = mgr(&cfg);
         let id = |n: &str| m.account_ids().into_iter().find(|(_, x)| x == n).unwrap().0;
-        let (next_week, this_week) = (id("next-week"), id("this-week"));
+        let (a, b, c) = (id("a"), id("b"), id("c"));
+        let now = now_ms();
         m.with(|f| {
-            f.account_mut(&next_week).unwrap().quota.unified7d = window(0.1, 6 * 24 * HOUR, now);
-            f.account_mut(&this_week).unwrap().quota.unified7d = window(0.1, 2 * 24 * HOUR, now);
+            for (acct, five) in [(&a, 2 * HOUR), (&b, 2 * HOUR + 10 * 60_000), (&c, 4 * HOUR)] {
+                let x = f.account_mut(acct).unwrap();
+                x.quota.unified5h = window(0.1, five, now);
+                x.quota.unified7d = window(0.2, 3 * 24 * HOUR, now);
+            }
         });
-        let sid = "11111111-1111-1111-1111-111111111111";
-        m.record_session(Some(sid), &this_week, None);
         let sel = |sid: &str| match m.select(&SelectRequest { session_id: Some(sid), allow_probe: true, ..Default::default() }) {
             Selection::Account(s) => s.name,
             other => panic!("{other:?}"),
         };
-        assert_eq!(sel("22222222-2222-2222-2222-222222222222"), "this-week");
+        let s1 = "11111111-1111-1111-1111-111111111111";
+        assert_eq!(sel(s1), "a", "same load: the sooner 5h reset");
+        m.record_session(Some(s1), &a, None);
+        assert_eq!(sel("22222222-2222-2222-2222-222222222222"), "b", "a and b share a band: spread by load");
+        m.record_session(Some("22222222-2222-2222-2222-222222222222"), &b, None);
+        assert_eq!(sel("33333333-3333-3333-3333-333333333333"), "a", "c is in a later 5h band despite no load");
     }
 
-    /// A sticky account, or a session pinned to one, moves to an account whose
-    /// quota is forfeited well before its own, from either window, but not to
-    /// one only minutes apart: that would throw away a warm prompt cache for
-    /// nothing.
+    /// A sticky account, or a session pinned to one, moves to an account in an
+    /// earlier weekly or 5h band, but not to one in the same band, whether it
+    /// is a few minutes sooner or just less loaded: that would throw away a
+    /// warm prompt cache for nothing.
     #[test]
     fn soonest_reset_preempts_sticky_and_pinned_accounts() {
         for distribute in [false, true] {
@@ -2496,22 +2584,28 @@ mod tests {
                 other => panic!("{other:?}"),
             };
             let now = now_ms();
-            m.with(|f| f.account_mut(&a).unwrap().quota.unified5h = window(0.3, 3 * HOUR, now));
+            m.with(|f| {
+                for x in [&a, &b, &c] {
+                    f.account_mut(x).unwrap().quota.unified7d = window(0.2, 4 * 24 * HOUR, now);
+                }
+                f.account_mut(&a).unwrap().quota.unified5h = window(0.3, 3 * HOUR, now);
+            });
             assert_eq!(sel(), "a", "distribute={distribute}");
             m.record_session(Some(sid), &a, None);
 
-            // b's 5h window turns up resetting only minutes earlier: stay put.
+            // b's 5h window turns up resetting only minutes earlier (and b
+            // carries no sessions): stay put.
             m.with(|f| f.account_mut(&b).unwrap().quota.unified5h = window(0.3, 3 * HOUR - 5 * 60_000, now));
-            assert_eq!(sel(), "a", "distribute={distribute}: within the margin");
+            assert_eq!(sel(), "a", "distribute={distribute}: same band");
 
-            // c's week ends well before a's 5h window: move.
-            m.with(|f| f.account_mut(&c).unwrap().quota.unified7d = window(0.5, HOUR, now));
-            assert_eq!(sel(), "c", "distribute={distribute}: soonest weekly reset wins");
-            m.record_session(Some(sid), &c, None);
+            // Now well before a's: move.
+            m.with(|f| f.account_mut(&b).unwrap().quota.unified5h = window(0.3, 30 * 60_000, now));
+            assert_eq!(sel(), "b", "distribute={distribute}: earlier 5h band");
+            m.record_session(Some(sid), &b, None);
 
-            // Then b's 5h window, once it resets well before c's week ends.
-            m.with(|f| f.account_mut(&b).unwrap().quota.unified5h = window(0.3, 20 * 60_000, now));
-            assert_eq!(sel(), "b", "distribute={distribute}: soonest 5h reset wins");
+            // c's week ends days earlier: move, though c has no 5h window yet.
+            m.with(|f| f.account_mut(&c).unwrap().quota.unified7d = window(0.5, 20 * HOUR, now));
+            assert_eq!(sel(), "c", "distribute={distribute}: earlier weekly band");
         }
     }
 
