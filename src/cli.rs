@@ -113,6 +113,12 @@ pub enum Command {
         #[arg(long)]
         pool: Option<String>,
     },
+    /// Use the account whose 5h or weekly quota resets soonest first (on|off)
+    SoonestReset {
+        value: Option<String>,
+        #[arg(long)]
+        pool: Option<String>,
+    },
     /// Session titles in the activity log (on|off)
     Titles { value: Option<String> },
     /// Per-model routing rules
@@ -1312,6 +1318,26 @@ pub async fn expiry(value: Option<String>, tolerance: Option<f64>, preempt: Opti
         eprintln!("expiryRouting = {}", serde_json::to_string(&p.expiry_routing)?);
         Ok(())
     })?;
+    notify_reload(&cfg).await;
+    Ok(())
+}
+
+pub async fn soonest_reset(value: Option<String>, pool: Option<String>) -> Result<()> {
+    let cfg = match value {
+        None => {
+            let c = Config::load()?.unwrap_or_default();
+            println!("soonestReset: {}", if pool_of(&c, pool.as_deref())?.soonest_reset { "on" } else { "off" });
+            return Ok(());
+        }
+        Some(v) => {
+            let on = parse_on_off(&v)?;
+            Config::update(|c| {
+                pool_mut_of(c, pool.as_deref())?.soonest_reset = on;
+                eprintln!("soonestReset: {}", if on { "on" } else { "off" });
+                Ok(())
+            })?
+        }
+    };
     notify_reload(&cfg).await;
     Ok(())
 }

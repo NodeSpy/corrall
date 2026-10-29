@@ -381,6 +381,10 @@ pub struct PoolConfig {
     pub routes: Vec<RouteConfig>,
     pub storm_ramp: StormRamp,
     pub expiry_routing: ExpiryRouting,
+    /// Rank accounts by when their unspent quota is forfeited: the sooner of
+    /// the 5h and weekly resets, soonest first. An account with no running 5h
+    /// window counts as starting one now.
+    pub soonest_reset: bool,
     /// When set, `corrall env`/`run` can select this pool from the launch
     /// context instead of being told which one to use. The default pool is the
     /// catch-all and needs no rules.
