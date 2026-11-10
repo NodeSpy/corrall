@@ -132,9 +132,10 @@ enum Attempt {
     },
 }
 
-/// `mgr` is the manager of `info.pool` — resolved once by the caller so every
-/// attempt in this request stays inside the pool the client selected.
-pub async fn forward(ctx: &Ctx, mgr: &Manager, info: &ReqInfo, mut headers: HeaderMap, body: Bytes) -> Response<BoxBody> {
+/// `primary` is the manager of `info.pool` — resolved once by the caller so
+/// every attempt in this request stays inside the pool the client selected,
+/// until that pool is quota-exhausted and names a `fallbackPool`.
+pub async fn forward(ctx: &Ctx, primary: &Manager, info: &ReqInfo, mut headers: HeaderMap, body: Bytes) -> Response<BoxBody> {
     // Strip hop-by-hop, client credentials, dimension headers, and encodings
     // we cannot faithfully relay.
     let strip: HashSet<String> = ctx.dimension_headers();
@@ -153,6 +154,9 @@ pub async fn forward(ctx: &Ctx, mgr: &Manager, info: &ReqInfo, mut headers: Head
     let mut last_exhausted: Option<Option<u64>> = None;
     let started = std::time::Instant::now();
     let mut last_account = String::new();
+    // The pool currently serving, and every pool this request has been in.
+    let mut mgr = primary.clone();
+    let mut visited: Vec<String> = vec![info.pool.clone()];
     // A served response reports its own completion once the body ends. Every
     // other exit reports here, so a request the proxy gave up on still gets
     // its ✗ line and leaves the in-flight list.
@@ -191,11 +195,27 @@ pub async fn forward(ctx: &Ctx, mgr: &Manager, info: &ReqInfo, mut headers: Head
             }
             Selection::Exhausted { retry_after_secs, reason } => {
                 last_exhausted = Some(retry_after_secs);
+                // Quota, not an upstream failure: another pool's accounts
+                // can serve. A pin names an account of this pool only.
+                if retry_after_secs.is_some() && info.pin.is_none() {
+                    let here = visited.last().cloned().unwrap_or_default();
+                    if let Some((name, next)) = ctx.pools.fallback_for(&here, &visited) {
+                        mgr.log(format!("Pool \"{here}\" exhausted; serving request {} from fallback pool \"{name}\"", info.id));
+                        visited.push(name);
+                        mgr = next;
+                        tried.clear();
+                        continue;
+                    }
+                }
                 if let Some(deadline) = hold_deadline {
                     if tokio::time::Instant::now() < deadline {
                         let wait = Duration::from_secs(retry_after_secs.unwrap_or(HEADERLESS_429_PAUSE_SECONDS).clamp(2, 30));
                         mgr.log(format!("All accounts exhausted; holding request {} for {}s", info.id, wait.as_secs()));
                         tokio::time::sleep(wait).await;
+                        // Start over in the requested pool, which may have
+                        // recovered while the request waited.
+                        mgr = primary.clone();
+                        visited.truncate(1);
                         tried.clear();
                         continue;
                     }
@@ -220,7 +240,7 @@ pub async fn forward(ctx: &Ctx, mgr: &Manager, info: &ReqInfo, mut headers: Head
 
         last_account = account.name.clone();
         ctx.notify_account(info, &account.name);
-        match attempt(ctx, mgr, info, &account, &headers, &body).await {
+        match attempt(ctx, &mgr, info, &account, &headers, &body).await {
             Attempt::Done(r) => {
                 mgr.record_session(session, &account.id, model);
                 return r;

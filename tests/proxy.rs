@@ -827,6 +827,33 @@ async fn all_exhausted_returns_429_with_retry_after_then_hold_waits() {
     assert!(t0.elapsed() >= Duration::from_secs(2));
 }
 
+/// A quota-exhausted pool with a `fallbackPool` serves from that pool instead
+/// of answering 429, and the primary pool's own requests stay in it otherwise.
+#[tokio::test]
+async fn exhausted_pool_falls_back_to_its_fallback_pool() {
+    let mock = spawn_mock().await;
+    let mut cfg = cfg_with(vec![account("d", "tok-d", 0, &mock.url())]);
+    cfg.pools.insert(
+        "tap".into(),
+        PoolConfig { accounts: vec![account("t", "tok-t", 0, &mock.url())], fallback_pool: Some(DEFAULT_POOL.into()), ..Default::default() },
+    );
+    let p = spawn_proxy(cfg).await;
+
+    let (st, v, _) = post(&p, "/pool/tap/v1/messages", msg("claude-opus-5")).await;
+    assert_eq!(st, 200);
+    assert_eq!(v["served_by"], "tok-t", "a healthy pool serves its own requests");
+
+    mock.queue("tok-t", Behaviour::QuotaRejected { retry_after: 600 });
+    let (st, v, _) = post(&p, "/pool/tap/v1/messages", msg("claude-opus-5")).await;
+    assert_eq!(st, 200, "the fallback pool served instead of a 429");
+    assert_eq!(v["served_by"], "tok-d");
+
+    // The fallback is one-way: an exhausted default pool does not borrow "tap".
+    mock.queue("tok-d", Behaviour::QuotaRejected { retry_after: 600 });
+    let (st, _, _) = post(&p, "/v1/messages", msg("claude-opus-5")).await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS);
+}
+
 #[tokio::test]
 async fn storm_control_paces_a_fresh_account() {
     let mock = spawn_mock().await;

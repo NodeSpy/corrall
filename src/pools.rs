@@ -102,6 +102,8 @@ pub struct Pools {
 struct Registry {
     map: BTreeMap<String, Manager>,
     default: String,
+    /// Pool name → the pool that serves it while it is exhausted.
+    fallback: BTreeMap<String, String>,
     /// When each unknown pool name was last warned about.
     unknown: BTreeMap<String, Instant>,
 }
@@ -113,7 +115,7 @@ const UNKNOWN_WARN_MAX: usize = 64;
 
 impl Pools {
     pub fn new(cfg: &Config) -> Arc<Pools> {
-        let reg = Registry { map: BTreeMap::new(), default: cfg.default_pool.clone(), unknown: BTreeMap::new() };
+        let reg = Registry { map: BTreeMap::new(), default: cfg.default_pool.clone(), fallback: BTreeMap::new(), unknown: BTreeMap::new() };
         let (events, _) = tokio::sync::broadcast::channel(256);
         let pools = Arc::new(Pools { inner: RwLock::new(reg), events });
         pools.sync_config(cfg);
@@ -196,6 +198,22 @@ impl Pools {
         }
     }
 
+    /// The next pool to try once `from` has nothing to serve with: its
+    /// `fallbackPool`, followed past any pool already in `visited` so a chain
+    /// (or a cycle) of fallbacks ends rather than loops.
+    pub fn fallback_for(&self, from: &str, visited: &[String]) -> Option<(String, Manager)> {
+        let g = self.inner.read();
+        let mut at = from;
+        for _ in 0..=g.fallback.len() {
+            let next = g.fallback.get(at)?;
+            if !visited.iter().any(|v| v == next) && next != from {
+                return g.map.get(next).map(|m| (next.clone(), m.clone()));
+            }
+            at = next;
+        }
+        None
+    }
+
     /// Every pool with its manager, in display order.
     pub fn each(&self) -> Vec<(String, Manager)> {
         let g = self.inner.read();
@@ -218,6 +236,7 @@ impl Pools {
         let mut added = 0;
         let mut g = self.inner.write();
         g.default = cfg.default_pool.clone();
+        g.fallback = cfg.pools.iter().filter_map(|(name, p)| p.fallback_pool.clone().map(|f| (name.clone(), f))).collect();
         g.map.retain(|name, _| {
             let keep = cfg.pools.contains_key(name);
             if !keep {
@@ -278,6 +297,9 @@ impl Pools {
             .map(|(name, m)| {
                 let mut s = m.status(detail);
                 s["default"] = json!(name == default);
+                if let Some(f) = self.inner.read().fallback.get(&name) {
+                    s["fallbackPool"] = json!(f);
+                }
                 s
             })
             .collect();
@@ -386,6 +408,25 @@ mod tests {
         assert_eq!(s("me@example.com"), ("me@example.com".into(), String::new()));
         // A trailing separator names no pool; do not invent one.
         assert_eq!(s("acct1~"), ("acct1".into(), String::new()));
+    }
+
+    #[test]
+    fn fallback_chain_skips_visited_pools_and_ends_on_a_cycle() {
+        let mut cfg = Config::default();
+        let pool = |f: &str| crate::config::PoolConfig { fallback_pool: Some(f.into()), ..Default::default() };
+        cfg.pools.insert("a".into(), pool("b"));
+        cfg.pools.insert("b".into(), pool("a"));
+        cfg.pools.insert("c".into(), pool("a"));
+        let pools = Pools::new(&cfg);
+        let next = |from: &str, visited: &[&str]| {
+            let v: Vec<String> = visited.iter().map(|s| s.to_string()).collect();
+            pools.fallback_for(from, &v).map(|(n, _)| n)
+        };
+        assert_eq!(next("a", &["a"]), Some("b".into()));
+        assert_eq!(next("b", &["a", "b"]), None, "a cycle ends rather than loops");
+        assert_eq!(next("c", &["c"]), Some("a".into()));
+        assert_eq!(next("a", &["c", "a"]), Some("b".into()));
+        assert_eq!(next("default", &["default"]), None, "no fallback configured");
     }
 
     #[test]

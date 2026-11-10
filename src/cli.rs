@@ -342,6 +342,12 @@ pub struct PoolSetArgs {
     /// Drop this pool's auto-selection rules
     #[arg(long, conflicts_with_all = ["match_path", "match_remote", "match_env"])]
     pub no_match: bool,
+    /// Serve this pool's requests from POOL while all its accounts are out of quota
+    #[arg(long, value_name = "POOL")]
+    pub fallback: Option<String>,
+    /// Stop falling back to another pool
+    #[arg(long, conflicts_with = "fallback")]
+    pub no_fallback: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1475,6 +1481,9 @@ pub async fn pool(cmd: Option<PoolCmd>) -> Result<()> {
                 for rule in match_summary(p) {
                     println!("{:<18} {rule}", "");
                 }
+                if let Some(f) = &p.fallback_pool {
+                    println!("{:<18} fallback: {}", "", crate::security::safe_text(f, 40));
+                }
             }
             eprintln!("* serves requests with no /pool/<name> prefix");
             Ok(())
@@ -1514,6 +1523,12 @@ pub async fn pool(cmd: Option<PoolCmd>) -> Result<()> {
                     );
                 }
                 c.pools.remove(&name);
+                for (other, p) in c.pools.iter_mut() {
+                    if p.fallback_pool.as_deref() == Some(name.as_str()) {
+                        p.fallback_pool = None;
+                        eprintln!("pool \"{other}\" no longer falls back to \"{name}\"");
+                    }
+                }
                 eprintln!("pool \"{name}\" removed{}", if held > 0 { format!(" with {held} account(s)") } else { String::new() });
                 Ok(())
             })?;
@@ -1559,6 +1574,10 @@ fn apply_pool_set(c: &mut Config, name: &str, set: &PoolSetArgs) -> Result<()> {
     }
     let probe = set.probe.as_deref().map(|v| parse_secs(v, 30, "probe interval")).transpose()?;
     let distribute = set.distribute.as_deref().map(parse_on_off).transpose()?;
+    let fallback = set.fallback.as_deref().map(|f| pool_name(c, Some(f))).transpose()?;
+    if fallback.as_deref() == Some(name) {
+        bail!("pool \"{name}\" cannot fall back to itself");
+    }
     let p = c.pool_mut(name).expect("caller created the pool");
     if let Some(t) = &set.threshold {
         set_threshold(&mut p.switch_threshold, t)?;
@@ -1605,6 +1624,13 @@ fn apply_pool_set(c: &mut Config, name: &str, set: &PoolSetArgs) -> Result<()> {
         if m.is_empty() {
             p.match_rules = None;
         }
+    }
+    if set.no_fallback {
+        p.fallback_pool = None;
+        eprintln!("fallback cleared");
+    } else if let Some(f) = fallback {
+        eprintln!("falls back to pool \"{f}\" when exhausted");
+        p.fallback_pool = Some(f);
     }
     if set.make_default {
         c.default_pool = name.to_string();
@@ -2277,6 +2303,7 @@ mod tests {
             match_remote: remote.iter().map(|s| s.to_string()).collect(),
             match_env: env.iter().map(|s| s.to_string()).collect(),
             no_match: clear,
+            ..Default::default()
         };
 
         apply_pool_set(&mut cfg, "work", &set(&["/srv/a", "/srv/b"], &["acme/"], &["TC_CTX=^a", "TC_FLAG"], false)).unwrap();
@@ -2297,6 +2324,20 @@ mod tests {
 
         apply_pool_set(&mut cfg, "work", &set(&[], &[], &[], true)).unwrap();
         assert_eq!(cfg.pool("work").unwrap().match_rules, None);
+    }
+
+    #[test]
+    fn fallback_flag_sets_and_clears_the_fallback_pool() {
+        let mut cfg = Config::default();
+        cfg.ensure_pool("work").unwrap();
+        let fb = |f: Option<&str>, clear: bool| PoolSetArgs { fallback: f.map(str::to_string), no_fallback: clear, ..Default::default() };
+
+        apply_pool_set(&mut cfg, "work", &fb(Some("default"), false)).unwrap();
+        assert_eq!(cfg.pool("work").unwrap().fallback_pool.as_deref(), Some("default"));
+        assert!(apply_pool_set(&mut cfg, "work", &fb(Some("nope"), false)).is_err(), "an unknown pool is refused");
+        assert!(apply_pool_set(&mut cfg, "work", &fb(Some("work"), false)).is_err(), "a pool cannot fall back to itself");
+        apply_pool_set(&mut cfg, "work", &fb(None, true)).unwrap();
+        assert_eq!(cfg.pool("work").unwrap().fallback_pool, None);
     }
 
     #[test]

@@ -178,6 +178,7 @@ corrall pool set work --threshold 90 --hold 120
 corrall pool set work --account spare@example.com   # move an account in
 corrall pool set work --match-path ~/Projects/acme  # auto-select it there
 corrall pool set work --match-remote '(?i)acme/'    # ...or by git remote
+corrall pool set work --fallback default            # borrow default's accounts when work is spent
 corrall login --pool work    # add an account to that pool
 corrall env --pool work      # export lines pointing at that pool
 corrall env                  # export lines for eval "$(corrall env)"; keeps Claude Code in first-party mode (deferred tool loading on)
