@@ -40,7 +40,7 @@ which no real API path uses, so a pool may be called `v1` or `api`.
 
 Per-pool fields: `accounts`, `routes`, `switchThreshold`, `holdSeconds`,
 `distributeSessions`, `quotaProbeSeconds`, `blockedModels`, `stormRamp`,
-`expiryRouting`, `match`. Everything else in the table below is daemon-global.
+`expiryRouting`, `match`, `fallbackPool`. Everything else in the table below is daemon-global.
 
 ### Reaching a pool
 
@@ -329,6 +329,15 @@ gets a 502 `api_error` with no `retry-after`: those accounts are healthy, and
 their quota resets say nothing about when the upstream will answer again.
 `holdSeconds` holds either case for its duration and retries the whole fleet
 before answering.
+
+A pool with a `fallbackPool` (`corrall pool set tap --fallback default`)
+answers a **spent fleet** differently: the request is served by the fallback
+pool's accounts instead, and by that pool's own fallback if it is spent too,
+never visiting a pool twice. It happens per request, so the first request after
+the pool's quota resets is served from the pool again. Pinned requests and a
+failing upstream never fall back. When every pool in the chain is spent,
+`holdSeconds` (of the requested pool) applies and the retry starts again from
+the requested pool.
 
 A request that was **already sent** and then got no answer is different again:
 no response headers within `CORRALL_UPSTREAM_HEADERS_TIMEOUT_MS`, or a

@@ -389,6 +389,10 @@ pub struct PoolConfig {
     /// catch-all and needs no rules.
     #[serde(rename = "match", skip_serializing_if = "Option::is_none")]
     pub match_rules: Option<PoolMatch>,
+    /// Another pool to serve this pool's requests while every one of its
+    /// accounts is held back by quota. Followed transitively, never in a loop.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback_pool: Option<String>,
     /// Unknown keys are preserved so a hand-edited pool is never stripped.
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
@@ -746,6 +750,11 @@ impl Config {
         if self.default_pool == old {
             self.default_pool = new.to_string();
         }
+        for p in self.pools.values_mut() {
+            if p.fallback_pool.as_deref() == Some(old) {
+                p.fallback_pool = Some(new.to_string());
+            }
+        }
         Ok(())
     }
 
@@ -814,6 +823,14 @@ impl Config {
                 // on, so rules on it can only ever be dead weight.
                 if pool == &self.default_pool && !m.is_empty() {
                     tracing::warn!("pool \"{pool}\" is the default pool; its match rules are never consulted");
+                }
+            }
+            if let Some(f) = &p.fallback_pool {
+                if f == pool {
+                    bail!("pools.{pool}.fallbackPool names the pool itself");
+                }
+                if !self.pools.contains_key(f) {
+                    bail!("pools.{pool}.fallbackPool \"{f}\" is not one of the configured pools");
                 }
             }
             for a in &p.accounts {
@@ -1405,6 +1422,21 @@ mod tests {
         c.rename_pool(DEFAULT_POOL, "primary").unwrap();
         assert_eq!(c.default_pool, "primary");
         assert!(c.pools.contains_key("primary"));
+    }
+
+    #[test]
+    fn fallback_pool_is_validated_and_follows_renames() {
+        let mut c = Config::default();
+        c.pools.insert("work".into(), PoolConfig { fallback_pool: Some(DEFAULT_POOL.into()), ..Default::default() });
+        c.validate().unwrap();
+
+        c.rename_pool(DEFAULT_POOL, "primary").unwrap();
+        assert_eq!(c.pool("work").unwrap().fallback_pool.as_deref(), Some("primary"), "the reference follows the rename");
+
+        c.pool_mut("work").unwrap().fallback_pool = Some("nope".into());
+        assert!(c.validate().is_err(), "an unknown fallback is rejected");
+        c.pool_mut("work").unwrap().fallback_pool = Some("work".into());
+        assert!(c.validate().is_err(), "a pool cannot fall back to itself");
     }
 
     #[test]
