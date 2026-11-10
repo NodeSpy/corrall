@@ -916,7 +916,6 @@ async fn login_submit(ctx: &Ctx, v: &Value) -> Response<BoxBody> {
     let mut created = false;
     let mut account_name = String::new();
     match Config::update(|c| {
-        let pool = crate::cli::target_pool(c, pending.pool.as_deref())?;
         let name = match &pending.name {
             Some(n) => n.clone(),
             None => match &profile {
@@ -924,6 +923,8 @@ async fn login_submit(ctx: &Ctx, v: &Value) -> Response<BoxBody> {
                 None => "account".to_string(),
             },
         };
+        let found = crate::cli::locate_oauth(c, &name, profile.as_ref());
+        let pool = crate::cli::target_pool(c, pending.pool.as_deref(), found.as_ref())?;
         let updated = crate::cli::upsert_oauth(c, &pool, &name, &tokens, profile.as_ref());
         created = !updated;
         account_name = name;

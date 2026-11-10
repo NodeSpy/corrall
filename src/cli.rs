@@ -211,7 +211,8 @@ pub struct LoginArgs {
     /// Account name (default: email from the profile)
     #[arg(long)]
     pub name: Option<String>,
-    /// Pool to put the account in (created if new; moves an existing account)
+    /// Pool to put the account in (created if new; moves an existing account).
+    /// Without it an existing account stays in its pool and a new one goes to the default pool
     #[arg(long)]
     pub pool: Option<String>,
 }
@@ -235,7 +236,8 @@ pub struct ImportArgs {
     pub codex: bool,
     #[arg(long)]
     pub name: Option<String>,
-    /// Pool to put the account in (created if new; moves an existing account)
+    /// Pool to put the account in (created if new; moves an existing account).
+    /// Without it an existing account stays in its pool and a new one goes to the default pool
     #[arg(long)]
     pub pool: Option<String>,
 }
@@ -438,9 +440,11 @@ fn pool_name(cfg: &Config, pool: Option<&str>) -> Result<String> {
 
 /// The pool an account-adding command should write to. Unlike [`pool_name`],
 /// `--pool` may name a pool that does not exist yet: `login --pool work` is how
-/// you create one.
-pub(crate) fn target_pool(cfg: &mut Config, pool: Option<&str>) -> Result<String> {
-    let Some(p) = pool else { return Ok(cfg.default_pool.clone()) };
+/// you create one. Without `--pool`, an account corrall already has (`found`)
+/// stays in the pool it is in — a re-login only refreshes the credential — and
+/// only a new account lands in the default pool.
+pub(crate) fn target_pool(cfg: &mut Config, pool: Option<&str>, found: Option<&(String, usize)>) -> Result<String> {
+    let Some(p) = pool else { return Ok(found.map_or_else(|| cfg.default_pool.clone(), |(p, _)| p.clone())) };
     let fresh = !cfg.pools.contains_key(p);
     cfg.ensure_pool(p)?;
     if fresh {
@@ -507,6 +511,11 @@ pub fn parse_listen(addr: &str) -> Result<(Option<String>, u16)> {
 /// `" in pool \"x\""`, or nothing when the command did not name a pool.
 fn pool_note(pool: Option<&str>) -> String {
     pool.map(|p| format!(" in pool \"{p}\"")).unwrap_or_default()
+}
+
+/// `" in pool \"x\""` for where an account ended up, or nothing for the default pool.
+fn landed_note(cfg: &Config, pool: &str) -> String {
+    if pool == cfg.default_pool { String::new() } else { format!(" in pool \"{pool}\"") }
 }
 
 fn pool_of<'a>(cfg: &'a Config, pool: Option<&str>) -> Result<&'a PoolConfig> {
@@ -583,21 +592,25 @@ pub(crate) fn upsert_oauth(cfg: &mut Config, pool: &str, name: &str, tokens: &oa
     upsert_oauth_at(cfg, pool, name, tokens, profile).1
 }
 
-/// [`upsert_oauth`] that also returns the index the account now has in
-/// `pool`. Callers that need the entry afterwards must use the index: a fuzzy
-/// re-lookup by name can land on a sibling sharing the e-mail (the same user
-/// in another org, say) and edit that one instead.
-pub(crate) fn upsert_oauth_at(cfg: &mut Config, pool: &str, name: &str, tokens: &oauth::Tokens, profile: Option<&oauth::Profile>) -> (usize, bool) {
-    // Identify by uuid when the profile gave us one, and only fall back to the
-    // display name — an account first added with `--name` (no profile) has no
-    // uuid to match on yet.
-    let found = profile
+/// Where an OAuth login already lives, if corrall has it. Identify by uuid
+/// when the profile gave us one, and only fall back to the display name — an
+/// account first added with `--name` (no profile) has no uuid to match on yet.
+pub(crate) fn locate_oauth(cfg: &Config, name: &str, profile: Option<&oauth::Profile>) -> Option<(String, usize)> {
+    profile
         .and_then(|p| p.account_uuid.as_deref())
         .and_then(|au| {
             let ou = profile.and_then(|p| p.org_uuid.as_deref());
             locate_by(cfg, |a| a.account_uuid.as_deref() == Some(au) && (ou.is_none() || a.org_uuid.as_deref() == ou))
         })
-        .or_else(|| locate_by(cfg, |a| a.name == name));
+        .or_else(|| locate_by(cfg, |a| a.name == name))
+}
+
+/// [`upsert_oauth`] that also returns the index the account now has in
+/// `pool`. Callers that need the entry afterwards must use the index: a fuzzy
+/// re-lookup by name can land on a sibling sharing the e-mail (the same user
+/// in another org, say) and edit that one instead.
+pub(crate) fn upsert_oauth_at(cfg: &mut Config, pool: &str, name: &str, tokens: &oauth::Tokens, profile: Option<&oauth::Profile>) -> (usize, bool) {
+    let found = locate_oauth(cfg, name, profile);
     // `entry_at` edits in place when the account is already in `pool` and
     // appends otherwise (moved in from another pool, or brand new).
     let idx = match &found {
@@ -673,15 +686,17 @@ pub async fn login(args: LoginArgs) -> Result<()> {
             bail!("that does not look like an Anthropic API key");
         }
         let name = args.name.unwrap_or_else(|| format!("api-{}", &key[key.len().saturating_sub(6)..]));
-        Config::update(|c| {
-            let pool = target_pool(c, want_pool.as_deref())?;
+        let mut landed = String::new();
+        let cfg = Config::update(|c| {
             let found = locate_by(c, |a| a.name == name);
+            let pool = target_pool(c, want_pool.as_deref(), found.as_ref())?;
+            landed = pool.clone();
             let (entry, _) = entry_at(c, &pool, found, || AccountConfig { name: name.clone(), kind: AccountType::Apikey, priority: 10, ..Default::default() });
             entry.kind = AccountType::Apikey;
             entry.api_key = Some(key.clone());
             Ok(())
         })?;
-        eprintln!("Added API key account \"{name}\"{}", pool_note(want_pool.as_deref()));
+        eprintln!("Added API key account \"{name}\"{}", landed_note(&cfg, &landed));
         notify_reload(&cfg).await;
         return Ok(());
     }
@@ -689,9 +704,11 @@ pub async fn login(args: LoginArgs) -> Result<()> {
         let c = crate::codex::login_browser(!args.no_browser).await?;
         let access = c.access_token.clone().ok_or_else(|| anyhow!("OpenAI returned no access token"))?;
         let name = args.name.clone().or(c.email.clone()).unwrap_or_else(|| "codex".into());
+        let mut landed = String::new();
         let cfg = Config::update(|cfg| {
-            let pool = target_pool(cfg, want_pool.as_deref())?;
             let found = locate_by(cfg, |a| a.is_codex() && (a.account_id == c.account_id && c.account_id.is_some() || a.name == name));
+            let pool = target_pool(cfg, want_pool.as_deref(), found.as_ref())?;
+            landed = pool.clone();
             let (entry, _) = entry_at(cfg, &pool, found, || AccountConfig {
                 name: name.clone(),
                 kind: AccountType::Oauth,
@@ -711,7 +728,7 @@ pub async fn login(args: LoginArgs) -> Result<()> {
         eprintln!(
             "Added Codex account \"{name}\"{}{}",
             c.plan_type.as_ref().map(|p| format!(" (plan {p})")).unwrap_or_default(),
-            pool_note(want_pool.as_deref())
+            landed_note(&cfg, &landed)
         );
         notify_reload(&cfg).await;
         return Ok(());
@@ -726,26 +743,24 @@ pub async fn login(args: LoginArgs) -> Result<()> {
         Err(e) => bail!("profile lookup failed: {e}. Retry, or pass --name to add the account without profile detection"),
     };
     let name = args.name.clone().unwrap_or_else(|| display_name(profile.as_ref().unwrap(), &cfg));
-    let updated = Config::update(|c| {
-        let pool = target_pool(c, want_pool.as_deref())?;
+    let mut landed = String::new();
+    cfg = Config::update(|c| {
+        let found = locate_oauth(c, &name, profile.as_ref());
+        let pool = target_pool(c, want_pool.as_deref(), found.as_ref())?;
         upsert_oauth(c, &pool, &name, &tokens, profile.as_ref());
+        landed = pool;
         Ok(())
-    })
-    .map(|c| {
-        cfg = c;
-        true
     })?;
-    let _ = updated;
     if let Some(p) = &profile {
         eprintln!(
             "Logged in as {} ({}){}{}",
             name,
             p.org_name.clone().unwrap_or_else(|| "personal".into()),
             p.rate_limit_tier.as_ref().map(|t| format!(", tier {t}")).unwrap_or_default(),
-            pool_note(want_pool.as_deref())
+            landed_note(&cfg, &landed)
         );
     } else {
-        eprintln!("Added account \"{name}\"{}", pool_note(want_pool.as_deref()));
+        eprintln!("Added account \"{name}\"{}", landed_note(&cfg, &landed));
     }
     notify_reload(&cfg).await;
     Ok(())
@@ -790,9 +805,11 @@ pub async fn import(args: ImportArgs) -> Result<()> {
         let c = crate::codex::import_credentials(&from)?;
         let access = c.access_token.clone().filter(|t| !t.is_empty()).ok_or_else(|| anyhow!("{from} carries no access token"))?;
         let name = args.name.clone().or(c.email.clone()).unwrap_or_else(|| "codex".into());
+        let mut landed = String::new();
         let cfg = Config::update(|cfg| {
-            let pool = target_pool(cfg, args.pool.as_deref())?;
             let found = locate_by(cfg, |a| a.is_codex() && (a.account_id == c.account_id && c.account_id.is_some() || a.name == name));
+            let pool = target_pool(cfg, args.pool.as_deref(), found.as_ref())?;
+            landed = pool.clone();
             let (entry, _) = entry_at(cfg, &pool, found, || AccountConfig {
                 name: name.clone(),
                 kind: AccountType::Oauth,
@@ -816,7 +833,7 @@ pub async fn import(args: ImportArgs) -> Result<()> {
             entry.plan_type = c.plan_type.clone().or(entry.plan_type.take());
             Ok(())
         })?;
-        eprintln!("Imported Codex account \"{name}\"{}", pool_note(args.pool.as_deref()));
+        eprintln!("Imported Codex account \"{name}\"{}", landed_note(&cfg, &landed));
         import_note(link, &from, "the Codex CLI");
         notify_reload(&cfg).await;
         return Ok(());
@@ -839,12 +856,15 @@ pub async fn import(args: ImportArgs) -> Result<()> {
         expires_at: creds.expires_at.unwrap_or(0),
         refresh_expires_at: creds.refresh_token_expires_at,
     };
+    let mut landed = String::new();
     let cfg = Config::update(|c| {
-        let pool = target_pool(c, args.pool.as_deref())?;
+        let found = locate_oauth(c, &name, profile.as_ref());
+        let pool = target_pool(c, args.pool.as_deref(), found.as_ref())?;
+        landed = pool.clone();
         apply_import(c, &pool, &name, &tokens, profile.as_ref(), link.then_some(args.from.as_str()), creds.subscription_type.as_deref());
         Ok(())
     })?;
-    eprintln!("Imported \"{name}\"{}", pool_note(args.pool.as_deref()));
+    eprintln!("Imported \"{name}\"{}", landed_note(&cfg, &landed));
     import_note(link, &args.from, "Claude Code");
     notify_reload(&cfg).await;
     Ok(())
@@ -906,7 +926,7 @@ pub async fn import_claudeacrobat(args: ImportAcrobatArgs) -> Result<()> {
     let mut updated = 0usize;
     let cfg = Config::update(|c| {
         for r in &rows {
-            let pool = target_pool(c, Some(&r.pool))?;
+            let pool = target_pool(c, Some(&r.pool), None)?;
             if upsert_acrobat(c, &pool, &r.account) {
                 updated += 1;
             } else {
@@ -2091,6 +2111,33 @@ mod tests {
         let bob = oauth::Profile { account_uuid: Some("u2".into()), email: Some("bob@example.com".into()), ..Default::default() };
         assert_eq!(upsert_oauth_at(&mut cfg, &pool, "bob@example.com", &tokens("bob"), Some(&bob)), (1, false));
         assert_eq!(cfg.pools[&pool].accounts.len(), 2);
+    }
+
+    /// A re-login without `--pool` refreshes the account in the pool it
+    /// already lives in instead of dragging it back to the default pool; only
+    /// an explicit `--pool` moves it, and a new account still lands in the
+    /// default pool.
+    #[test]
+    fn a_relogin_without_pool_keeps_the_account_where_it_is() {
+        let tokens = |t: &str| oauth::Tokens { access_token: t.into(), refresh_token: None, expires_at: 1, refresh_expires_at: None };
+        let alice = oauth::Profile { account_uuid: Some("u1".into()), email: Some("alice@example.com".into()), ..Default::default() };
+        let mut cfg = Config::default();
+        let work = target_pool(&mut cfg, Some("work"), None).unwrap();
+        upsert_oauth(&mut cfg, &work, "alice@example.com", &tokens("old"), Some(&alice));
+
+        let found = locate_oauth(&cfg, "alice@example.com", Some(&alice));
+        let pool = target_pool(&mut cfg, None, found.as_ref()).unwrap();
+        assert_eq!(pool, "work");
+        assert!(upsert_oauth(&mut cfg, &pool, "alice@example.com", &tokens("fresh"), Some(&alice)));
+        assert_eq!(cfg.pools["work"].accounts[0].access_token.as_deref(), Some("fresh"));
+        assert!(cfg.pools[crate::config::DEFAULT_POOL].accounts.is_empty());
+
+        let bob = oauth::Profile { account_uuid: Some("u2".into()), ..Default::default() };
+        let found = locate_oauth(&cfg, "bob@example.com", Some(&bob));
+        assert_eq!(target_pool(&mut cfg, None, found.as_ref()).unwrap(), crate::config::DEFAULT_POOL, "a new account goes to the default pool");
+
+        let found = locate_oauth(&cfg, "alice@example.com", Some(&alice));
+        assert_eq!(target_pool(&mut cfg, Some(crate::config::DEFAULT_POOL), found.as_ref()).unwrap(), crate::config::DEFAULT_POOL, "an explicit --pool still moves it");
     }
 
     /// The CLI's own credentials file is linked unless `--copy` says otherwise:
