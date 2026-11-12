@@ -2,6 +2,7 @@
 //! tests can drive the proxy in-process.
 
 pub mod attach;
+pub mod claude_setup;
 pub mod cli;
 pub mod codex;
 pub mod config;
