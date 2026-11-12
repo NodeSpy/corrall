@@ -77,6 +77,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Command::Pool { cmd } => cli::pool(cmd).await,
         Command::Env(a) => cli::env(a),
         Command::Run(a) => cli::run(a).await,
+        Command::Setup { cmd } => cli::setup(cmd).await,
         Command::CaPath => cli::ca_path(),
         Command::Config { cmd } => cli::config_cmd(cmd),
         Command::Service { cmd } => cli::service(cmd),

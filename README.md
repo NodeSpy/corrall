@@ -51,6 +51,13 @@ corrall run         # in another terminal: Claude Code through the proxy
 corrall attach      # the same TUI for a server already running (e.g. the service)
 ```
 
+`corrall run` and `eval "$(corrall env)"` route one launch at a time. To send
+every Claude Code session through the proxy with no wrapper, `corrall setup
+claude` writes it into `~/.claude/settings.json` and removes any other gateway,
+forward proxy or cloud provider configured there; `corrall setup claude
+--remove` takes it back out. See
+[docs/configuration.md](docs/configuration.md#setting-claude-code-up).
+
 Already logged into Claude Code? `corrall import` links its login: Corrall
 reads `~/.claude/.credentials.json` and Claude Code keeps refreshing it, so the
 two never fight over one refresh token. A linked login goes stale while Claude
@@ -183,6 +190,9 @@ corrall login --pool work    # add an account to that pool
 corrall env --pool work      # export lines pointing at that pool
 corrall env                  # export lines for eval "$(corrall env)"; keeps Claude Code in first-party mode (deferred tool loading on)
 corrall env --api-key        # the pre-connectors form: ANTHROPIC_API_KEY, connectors off
+corrall setup claude         # point ~/.claude/settings.json at the proxy, replacing any other proxy set there
+corrall setup claude --pool work   # ...at one pool
+corrall setup claude --remove      # take it back out
 corrall ca-path              # where the MITM CA certificate lives
 corrall config check         # validate and print a redacted config
 corrall server --listen 127.0.0.1:3457   # bind elsewhere for one run

@@ -137,6 +137,11 @@ pub enum Command {
     Env(EnvArgs),
     /// Run Claude Code through the proxy
     Run(RunArgs),
+    /// Set a client up to use the proxy by editing its own settings
+    Setup {
+        #[command(subcommand)]
+        cmd: SetupCmd,
+    },
     /// Print the path of the MITM CA certificate
     CaPath,
     /// Validate the config file and print a redacted summary
@@ -373,6 +378,31 @@ pub enum PoolCmd {
         #[arg(long)]
         force: bool,
     },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SetupCmd {
+    /// Write the proxy into Claude Code's user settings (~/.claude/settings.json), replacing any other gateway, forward proxy, cloud provider or key helper set there
+    Claude(SetupClaudeArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct SetupClaudeArgs {
+    /// Take the proxy back out of the settings file
+    #[arg(long, conflicts_with_all = ["pool", "api_key"])]
+    pub remove: bool,
+    /// Route through this pool (default: the default pool)
+    #[arg(long)]
+    pub pool: Option<String>,
+    /// Hand Claude Code the proxy key as ANTHROPIC_API_KEY instead of a header of its own (claude.ai login and connectors off). The key is then stored in the settings file
+    #[arg(long)]
+    pub api_key: bool,
+    /// Settings file to edit (default: $CLAUDE_CONFIG_DIR/settings.json, else ~/.claude/settings.json)
+    #[arg(long, value_name = "FILE")]
+    pub settings: Option<PathBuf>,
+    /// Show what would change without writing anything
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1681,6 +1711,28 @@ impl KeyMode {
     }
 }
 
+/// One line of [`env_lines_with`], taken apart for a caller that sets
+/// variables somewhere other than a shell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnvOp {
+    Set(String, String),
+    Unset(String),
+}
+
+pub fn env_ops(lines: &[String]) -> Vec<EnvOp> {
+    lines
+        .iter()
+        .filter_map(|line| {
+            if let Some(rest) = line.strip_prefix("export ") {
+                let (k, v) = rest.split_once('=')?;
+                Some(EnvOp::Set(k.to_string(), v.trim_matches('\'').replace("'\"'\"'", "'")))
+            } else {
+                line.strip_prefix("unset ").map(|k| EnvOp::Unset(k.to_string()))
+            }
+        })
+        .collect()
+}
+
 pub fn env_lines(cfg: &Config, use_mitm: bool, pin: Option<&str>, pool: Option<&str>) -> Vec<String> {
     env_lines_with(cfg, use_mitm, pin, pool, KeyMode::Header)
 }
@@ -1833,19 +1885,96 @@ pub async fn run(args: RunArgs) -> Result<()> {
         if !args.no_mitm {
             crate::proxy::mitm::ensure_certs(&["api.anthropic.com".to_string()])?;
         }
-        for line in env_lines_with(&cfg, !args.no_mitm, pin.as_deref(), pool.as_deref(), KeyMode::from_flag(args.api_key)) {
-            if let Some(rest) = line.strip_prefix("export ") {
-                if let Some((k, v)) = rest.split_once('=') {
-                    let v = v.trim_matches('\'').replace("'\"'\"'", "'");
-                    cmd.env(k, v);
-                }
-            } else if let Some(k) = line.strip_prefix("unset ") {
-                cmd.env_remove(k);
-            }
+        for op in env_ops(&env_lines_with(&cfg, !args.no_mitm, pin.as_deref(), pool.as_deref(), KeyMode::from_flag(args.api_key))) {
+            match op {
+                EnvOp::Set(k, v) => cmd.env(k, v),
+                EnvOp::Unset(k) => cmd.env_remove(k),
+            };
         }
     }
     let status = cmd.status().context("could not launch `claude`; is it on PATH?")?;
     std::process::exit(status.code().unwrap_or(1));
+}
+
+pub async fn setup(cmd: SetupCmd) -> Result<()> {
+    match cmd {
+        SetupCmd::Claude(a) => setup_claude(a).await,
+    }
+}
+
+async fn setup_claude(args: SetupClaudeArgs) -> Result<()> {
+    use crate::claude_setup::{self, SettingsFile};
+    let cfg = Config::load()?.ok_or_else(|| anyhow!("no config yet; run `corrall login` first"))?;
+    let path = match args.settings {
+        Some(p) => p,
+        None => claude_setup::default_path()?,
+    };
+    let mut file = SettingsFile::read(&path)?;
+    let shown = file.path.display().to_string();
+    let (now, was) = if args.dry_run { ("would be", "would be") } else { ("is now", "was") };
+    // Key names only, never values: what is replaced here is often a credential.
+    let list = |label: &str, keys: &[String]| {
+        if !keys.is_empty() {
+            eprintln!("  {label:<9}{}", keys.join(", "));
+        }
+    };
+
+    if args.remove {
+        let report = claude_setup::strip(&mut file.value, &cfg)?;
+        if !report.changed() {
+            eprintln!("[Corrall] {shown} does not point Claude Code at the proxy; nothing to remove");
+            return Ok(());
+        }
+        let backup = if args.dry_run { None } else { file.write(false)? };
+        eprintln!("[Corrall] {shown}: the proxy {was} taken out of Claude Code's settings");
+        list("removed:", &report.removed);
+        list("backup:", &backup.iter().map(|b| b.display().to_string()).collect::<Vec<_>>());
+        return Ok(());
+    }
+
+    // No launch-context matching: the file serves every directory, so the pool
+    // is the one named here or the default.
+    let pool = args.pool.as_deref().map(|p| pool_name(&cfg, Some(p))).transpose()?;
+    let ops = env_ops(&env_lines_with(&cfg, false, None, pool.as_deref(), KeyMode::from_flag(args.api_key)));
+    let report = claude_setup::apply(&mut file.value, &ops)?;
+    if !report.changed() {
+        eprintln!("[Corrall] {shown} already points Claude Code at the proxy; nothing to change");
+    } else {
+        let holds_key = ops.iter().any(|op| matches!(op, EnvOp::Set(k, _) if k == "ANTHROPIC_CUSTOM_HEADERS" || k == "ANTHROPIC_API_KEY"));
+        let backup = if args.dry_run { None } else { file.write(holds_key)? };
+        let url = ops.iter().find_map(|op| match op {
+            EnvOp::Set(k, v) if k == "ANTHROPIC_BASE_URL" => Some(v.as_str()),
+            _ => None,
+        });
+        eprintln!("[Corrall] {shown}: Claude Code {now} pointed at the proxy ({})", url.unwrap_or_default());
+        list("set:", &report.set);
+        list("removed:", &report.removed);
+        list("backup:", &backup.iter().map(|b| b.display().to_string()).collect::<Vec<_>>());
+        if !report.models.is_empty() {
+            eprintln!("  note: {} still name models for the provider that was removed; check Anthropic serves them", report.models.join(", "));
+        }
+        if !args.dry_run {
+            eprintln!("  Restart running Claude Code sessions so they pick this up.");
+        }
+    }
+
+    let exported = claude_setup::shell_conflicts(&ops);
+    if !exported.is_empty() {
+        eprintln!(
+            "  warning: {} exported in this shell. Settings cannot unset a shell export, so Claude Code started from it may still go elsewhere; remove it from your shell profile",
+            exported.join(", ")
+        );
+    }
+    if !args.dry_run {
+        crate::upstream::init(&cfg)?;
+        if control_get(&cfg, "/corrall/health").await.is_err() {
+            eprintln!(
+                "  warning: the proxy is not running on port {}; Claude Code cannot connect until it is (`corrall server`, or `corrall service install`)",
+                cfg.proxy.port
+            );
+        }
+    }
+    Ok(())
 }
 
 pub fn ca_path() -> Result<()> {

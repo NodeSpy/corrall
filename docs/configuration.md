@@ -216,6 +216,64 @@ key come from the config; `--url http://host:port` and `--key` override them
 for a server elsewhere. Quitting leaves the server running. If the server
 stops answering, the header says so and the table keeps the last state it saw.
 
+## Setting Claude Code up
+
+`corrall setup claude` writes the proxy into Claude Code's user settings
+(`$CLAUDE_CONFIG_DIR/settings.json`, else `~/.claude/settings.json`), so every
+session goes through it without a wrapper or a shell export. It writes the
+`env` entries `corrall env --no-mitm` prints, and the rest of the file is left
+as it was:
+
+```json
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:3456",
+    "ENABLE_TOOL_SEARCH": "auto",
+    "_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL": "1"
+  }
+}
+```
+
+The proxy key is added (as `ANTHROPIC_CUSTOM_HEADERS`) only when the server
+will ask for one, `API_TIMEOUT_MS` only when the pool has `holdSeconds`, and
+`--api-key` selects [the other mode](#choosing-a-mode). A file that ends up
+holding the key is written at mode 0600.
+
+So that nothing else routes or signs Claude Code in, setup also removes from
+that file:
+
+| Removed | Why |
+| --- | --- |
+| `ANTHROPIC_BASE_URL` (replaced), `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY`, `ANTHROPIC_CUSTOM_HEADERS`, top-level `apiKeyHelper` | Another gateway and its credential. The token, key and helper also take Claude Code off its claude.ai login |
+| `HTTPS_PROXY`, `HTTP_PROXY` and their lower-case forms | A forward proxy; the base URL is dialled directly |
+| `CLAUDE_CODE_USE_BEDROCK`, `_VERTEX`, `_FOUNDRY`, `_MANTLE`, `_ANTHROPIC_AWS` and the `ANTHROPIC_*_BASE_URL` of each | A cloud provider. With one selected, `ANTHROPIC_BASE_URL` is not read |
+
+The file as it was is copied to `settings.json.corrall-backup-<time>` (mode
+0600) first, and the command reports the names of the keys it set and removed,
+never their values. `--dry-run` reports without writing. Running it again
+changes nothing.
+
+`corrall setup claude --remove` takes out the entries setup wrote, and only
+those: an `API_TIMEOUT_MS` of your own stays. It does not put back what setup
+removed; that is in the backup.
+
+What a settings file cannot do, compared with `corrall run` and `corrall env`:
+
+- **One pool.** The file serves every directory, so [pool
+  matching](#auto-selecting-a-pool) does not apply. `--pool <name>` picks the
+  pool; the default pool otherwise.
+- **Base-URL mode only.** No MITM, so only what `ANTHROPIC_BASE_URL` covers
+  goes through the proxy.
+- **No fallback.** With the proxy down Claude Code cannot connect. Setup warns
+  when the server is not answering; `corrall service install` keeps it running.
+
+Three things can still override the file. A settings `env` value wins over the
+same variable exported in a shell, but a variable the file does not set still
+arrives from the shell, so setup warns when one of the variables above is
+exported where it runs. A project's `.claude/settings.json` or
+`.claude/settings.local.json`, and an organization's managed settings, rank
+above user settings in Claude Code.
+
 ## Passthrough paths
 
 `/v1/oauth/token`, `/api/oauth/*`, `/v1/code/*` (Remote Control, including
@@ -254,7 +312,8 @@ Three things make connectors work through Corrall:
    ```
 
    `corrall env` and `corrall run` emit exactly this (and never
-   `ANTHROPIC_API_KEY`); the last two variables are explained
+   `ANTHROPIC_API_KEY`), and [`corrall setup claude`](#setting-claude-code-up)
+   writes it into the settings file; the last two variables are explained
    [below](#request-size-behind-a-custom-base-url).
 2. **The connector list is relayed with the client's own login.**
    `/v1/mcp_servers` and `/api/organizations/*/mcp/*` are passthrough paths:
