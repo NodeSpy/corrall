@@ -190,6 +190,7 @@ async fn server(args: ServerArgs, interactive: bool) -> Result<()> {
         tls: RwLock::new(None),
         titles: titles.clone(),
         oauth_flows: Default::default(),
+        history: Default::default(),
     }));
     *ctx_cell.lock() = Some(ctx.clone());
 
@@ -326,7 +327,7 @@ async fn server(args: ServerArgs, interactive: bool) -> Result<()> {
                             let tools = tools.map(|n| format!(", {n} tools in full")).unwrap_or_default();
                             format!("→ {id} {who} {method} {path}{model} [{}{tools}]", proxy::server::body_size(bytes))
                         }
-                        proxy::server::Activity::Account { .. } => continue,
+                        proxy::server::Activity::Account { .. } | proxy::server::Activity::Past { .. } => continue,
                         proxy::server::Activity::End { id, account, status, elapsed_ms, ok, tokens } => {
                             let what = open.remove(&id).filter(|w| !w.is_empty()).map(|w| format!(" {w}")).unwrap_or_default();
                             let used = tokens.map(|t| format!(" {}", t.note())).unwrap_or_default();

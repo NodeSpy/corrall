@@ -1273,7 +1273,20 @@ impl Manager {
     pub fn record_session(&self, session: Option<&str>, id: &str, model: Option<&str>) {
         let Some(s) = session else { return };
         let now = now_ms();
-        self.with(|f| f.sessions.touch(s, Some(id), Some(weekly_bucket_for(model)), model, now));
+        let bucket = weekly_bucket_for(model);
+        // Where sessions are placed one by one, a session changing account is
+        // news of its own; otherwise the "Switched" line already covers it.
+        let moved = self.with(|f| {
+            let from = f.sessions.pinned_account(s, bucket).filter(|p| *p != id && f.distribute_sessions).and_then(|p| f.account(p)).cloned();
+            f.sessions.touch(s, Some(id), Some(bucket), model, now);
+            let to = f.account(id)?.name.clone();
+            let from = from?;
+            let why = f.unavailable_reason(&from, model, None, now).map(|w| format!(": \"{}\" is out ({w})", from.name)).unwrap_or_default();
+            Some(format!("Session {} moved from \"{}\" to \"{to}\"{why}", s.chars().take(8).collect::<String>(), from.name))
+        });
+        if let Some(line) = moved {
+            self.log(line);
+        }
     }
 
     /// Note the account a session's open request was just sent to.
@@ -1693,7 +1706,25 @@ impl Fleet {
         }
     }
 
-    fn clear_expired_all(&mut self, now: i64) {
+    /// Clear every window and rate limit that has run out, and say which
+    /// accounts that puts back in service: the other half of the line that
+    /// said traffic was leaving them.
+    fn clear_expired_all(&mut self, now: i64, mgr: &Manager) {
+        let held = |f: &Fleet| -> Vec<Option<String>> {
+            f.accounts.iter().map(|a| f.unavailable_reason(a, None, None, now).filter(|r| r.starts_with("quota") || r.starts_with("rate-limited"))).collect()
+        };
+        let before = held(self);
+        self.expire(now);
+        for ((a, was), is) in self.accounts.iter().zip(before).zip(held(self)) {
+            if let (Some(was), None) = (was, is) {
+                if self.unavailable_reason(a, None, None, now).is_none() {
+                    mgr.log(format!("Account \"{}\" can serve again (was: {was})", a.name));
+                }
+            }
+        }
+    }
+
+    fn expire(&mut self, now: i64) {
         let th = self.threshold.clone();
         for a in &mut self.accounts {
             let _ = a.quota.clear_expired(now, |b| th.for_bucket(b));
@@ -1827,8 +1858,28 @@ impl Fleet {
         }
     }
 
-    fn set_current(&mut self, id: &str, now: i64, mgr: &Manager, scoped: bool) {
+    /// Why traffic is leaving `from` for `to`, in a clause that follows the
+    /// account names in a log line: the reason `from` cannot serve this
+    /// request, or what puts `to` ahead of it.
+    fn why_leaving(&self, from: &Account, to: &Account, req: &SelectRequest, now: i64) -> String {
+        if req.exclude.contains(&from.id) {
+            return format!("\"{}\" failed this request", from.name);
+        }
+        match self.unavailable_reason_for(from, req.model, req.advisor_model, req.provider, now) {
+            Some(why) => format!("\"{}\" is out ({why})", from.name),
+            None if to.priority < from.priority => format!("it has a better priority than \"{}\"", from.name),
+            None if self.rolled_over(from, req.model) => format!("the weekly window of \"{}\" rolled over", from.name),
+            None => format!("it now ranks ahead of \"{}\"", from.name),
+        }
+    }
+
+    fn set_current(&mut self, id: &str, now: i64, mgr: &Manager, scoped: bool, req: &SelectRequest) {
         let switched = self.current.as_deref() != Some(id);
+        // Said while the account being left is still the current one.
+        let why = match (self.current.as_deref().filter(|_| switched).and_then(|c| self.account(c)), self.account(id)) {
+            (Some(from), Some(to)) => format!(": {}", self.why_leaving(from, to, req, now)),
+            _ => String::new(),
+        };
         if !scoped {
             self.current = Some(id.to_string());
         }
@@ -1837,13 +1888,17 @@ impl Fleet {
             if let Some(a) = self.account_mut(id) {
                 a.probing = a.quota.unified7d.reset_at.is_none();
                 let name = a.name.clone();
-                mgr.log(if scoped { format!("Diverting request to \"{name}\"") } else { format!("Switched to account \"{name}\"") });
+                mgr.log(match (scoped, req.model) {
+                    (true, Some(model)) => format!("Diverting a {} request to \"{name}\"{why}", crate::security::safe_text(model, 40)),
+                    (true, None) => format!("Diverting request to \"{name}\"{why}"),
+                    (false, _) => format!("Switched to account \"{name}\"{why}"),
+                });
             }
         }
     }
 
     fn select(&mut self, req: &SelectRequest, now: i64, mgr: &Manager) -> Selection {
-        self.clear_expired_all(now);
+        self.clear_expired_all(now, mgr);
 
         // 1. Explicit pin (TC_ACCT / Proxy-Authorization / /tc-acct/): never fails over.
         if let Some(pin) = req.pin {
@@ -1923,7 +1978,7 @@ impl Fleet {
                         .map(|c| self.unavailable_reason_for(c, None, None, req.provider, now).is_none())
                         .unwrap_or(false);
                     if !cur_ok {
-                        self.set_current(&id, now, mgr, false);
+                        self.set_current(&id, now, mgr, false, req);
                     } else {
                         self.ramp_if_cold(&id, now);
                     }
@@ -1943,7 +1998,7 @@ impl Fleet {
                     }
                     if let Some(best) = self.ranked_available(req, now).first().cloned() {
                         let id = best.id.clone();
-                        self.set_current(&id, now, mgr, false);
+                        self.set_current(&id, now, mgr, false, req);
                         self.note_baseline(&id, req.model);
                         if let Some(s) = self.snapshot(self.account(&id).unwrap()) {
                             return Selection::Account(s);
@@ -1972,7 +2027,7 @@ impl Fleet {
                     if let Some(best) = self.ranked_available(req, now).first().cloned() {
                         let id = best.id.clone();
                         if id != cur {
-                            self.set_current(&id, now, mgr, false);
+                            self.set_current(&id, now, mgr, false, req);
                         }
                         self.note_baseline(&id, req.model);
                         if let Some(s) = self.snapshot(self.account(&id).unwrap()) {
@@ -1984,7 +2039,7 @@ impl Fleet {
                     let scoped = self.unavailable_reason_for(&a, None, None, req.provider, now).is_none() && !req.exclude.contains(&cur);
                     if let Some(best) = self.ranked_available(req, now).first().cloned() {
                         let id = best.id.clone();
-                        self.set_current(&id, now, mgr, scoped);
+                        self.set_current(&id, now, mgr, scoped, req);
                         if let Some(s) = self.snapshot(self.account(&id).unwrap()) {
                             return Selection::Account(s);
                         }
@@ -1996,7 +2051,7 @@ impl Fleet {
         // 5. Best available.
         if let Some(best) = self.ranked_available(req, now).first().cloned() {
             let id = best.id.clone();
-            self.set_current(&id, now, mgr, false);
+            self.set_current(&id, now, mgr, false, req);
             self.note_baseline(&id, req.model);
             if let Some(s) = self.snapshot(self.account(&id).unwrap()) {
                 return Selection::Account(s);
@@ -3052,6 +3107,89 @@ mod tests {
         // a's 5h spent → everything moves to b
         m.with(|f| f.account_mut(&ids[0].0).unwrap().quota.unified5h.utilization = Some(0.99));
         assert_eq!(select_name(&m, Some("claude-opus-5")).as_deref(), Some("b"));
+    }
+
+    /// The log says why traffic moved, not only that it did, and says when
+    /// the account it left is back.
+    #[test]
+    fn routing_changes_are_logged_with_their_reason() {
+        let mut cfg = cfg_with(vec![acct("a", 0), acct("b", 0), acct("first", -1)]);
+        pool_of(&mut cfg).accounts[2].disabled = true;
+        let m = mgr(&cfg);
+        let mut log = m.events.subscribe();
+        let mut said = || {
+            let mut lines = Vec::new();
+            while let Ok(l) = log.try_recv() {
+                lines.push(l);
+            }
+            lines
+        };
+        let id = |n: &str| m.account_ids().into_iter().find(|(_, x)| x == n).unwrap().0;
+        // Resolved before the fleet is locked: `id` locks it too.
+        let (a, first) = (id("a"), id("first"));
+        let now = now_ms();
+
+        assert_eq!(select_name(&m, Some("claude-opus-5")).as_deref(), Some("a"));
+        assert_eq!(said(), ["Switched to account \"a\""], "nothing was left behind, so there is no reason to give");
+
+        // One family's window spent: that family is diverted, and says so.
+        m.with(|f| f.account_mut(&a).unwrap().quota.unified7d_fable = window(1.0, 3 * 24 * HOUR, now));
+        assert_eq!(select_name(&m, Some("claude-fable-5-1")).as_deref(), Some("b"));
+        let lines = said();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].starts_with("Diverting a claude-fable-5-1 request to \"b\": \"a\" is out (quota: unified7dFable at 100%"), "{lines:?}");
+
+        // The 5h window at the threshold: everything moves.
+        m.with(|f| f.account_mut(&a).unwrap().quota.unified5h = window(0.99, 60_000, now));
+        assert_eq!(select_name(&m, Some("claude-opus-5")).as_deref(), Some("b"));
+        assert_eq!(said(), ["Switched to account \"b\": \"a\" is out (quota: 5h at 99%)"]);
+
+        // The window runs out: the account is announced as back, once.
+        m.with(|f| f.account_mut(&a).unwrap().quota.unified5h.reset_at = Some(now_ms() - 1));
+        assert_eq!(select_name(&m, Some("claude-opus-5")).as_deref(), Some("b"), "sticky: being back is not a reason to move");
+        assert_eq!(said(), ["Account \"a\" can serve again (was: quota: 5h at 99%)"]);
+        select_name(&m, Some("claude-opus-5"));
+        assert!(said().is_empty());
+
+        // A better priority coming into service takes over, and that is the reason.
+        m.with(|f| f.account_mut(&first).unwrap().disabled = false);
+        assert_eq!(select_name(&m, Some("claude-opus-5")).as_deref(), Some("first"));
+        assert_eq!(said(), ["Switched to account \"first\": it has a better priority than \"b\""]);
+
+        // An account that failed the request it was given.
+        let exclude = std::collections::HashSet::from([first.clone()]);
+        match m.select(&SelectRequest { model: Some("claude-opus-5"), exclude, allow_probe: true, ..Default::default() }) {
+            Selection::Account(s) => assert_ne!(s.name, "first"),
+            other => panic!("{other:?}"),
+        }
+        let lines = said();
+        assert!(lines.len() == 1 && lines[0].ends_with(": \"first\" failed this request"), "{lines:?}");
+    }
+
+    /// With sessions placed one by one, a session that changes account says
+    /// so; a sticky fleet leaves that to its "Switched" line.
+    #[test]
+    fn a_distributed_session_moving_account_is_logged() {
+        let mut cfg = cfg_with(vec![acct("a", 0), acct("b", 0)]);
+        pool_of(&mut cfg).distribute_sessions = true;
+        let m = mgr(&cfg);
+        let mut log = m.events.subscribe();
+        let id = |n: &str| m.account_ids().into_iter().find(|(_, x)| x == n).unwrap().0;
+        let sid = "11111111-2222-3333-4444-555555555555";
+        let a = id("a");
+        m.record_session(Some(sid), &a, None);
+        m.record_session(Some(sid), &a, None);
+        assert!(log.try_recv().is_err(), "staying put is not news");
+        m.with(|f| f.account_mut(&a).unwrap().quota.unified5h = window(0.99, HOUR, now_ms()));
+        m.record_session(Some(sid), &id("b"), None);
+        assert_eq!(log.try_recv().unwrap(), "Session 11111111 moved from \"a\" to \"b\": \"a\" is out (quota: 5h at 99%)");
+
+        let m = mgr(&cfg_with(vec![acct("a", 0), acct("b", 0)]));
+        let mut log = m.events.subscribe();
+        let id = |n: &str| m.account_ids().into_iter().find(|(_, x)| x == n).unwrap().0;
+        m.record_session(Some(sid), &id("a"), None);
+        m.record_session(Some(sid), &id("b"), None);
+        assert!(log.try_recv().is_err());
     }
 
     #[test]

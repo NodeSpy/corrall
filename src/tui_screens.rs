@@ -141,6 +141,7 @@ pub enum Setting {
     Names,
     Telemetry,
     Warmup,
+    WeeklyFirst,
     PointClaude,
     UnpointClaude,
     Service,
@@ -158,9 +159,9 @@ pub enum Kind {
 }
 
 impl Setting {
-    pub const ALL: [Setting; 13] = {
+    pub const ALL: [Setting; 14] = {
         use Setting::*;
-        [Pool, Threshold, Distribute, Probe, Hold, SoonestReset, Expiry, Names, Telemetry, Warmup, PointClaude, UnpointClaude, Service]
+        [Pool, Threshold, Distribute, Probe, Hold, SoonestReset, Expiry, Names, Telemetry, Warmup, WeeklyFirst, PointClaude, UnpointClaude, Service]
     };
 
     pub fn label(self) -> &'static str {
@@ -176,6 +177,7 @@ impl Setting {
             Names => "Name sessions from Claude Code's files",
             Telemetry => "Telemetry requests",
             Warmup => "Keep-warm interval",
+            WeeklyFirst => "Weekly window shown first",
             PointClaude => "Point Claude Code at the proxy",
             UnpointClaude => "Take the proxy out of Claude Code's settings",
             Service => "Run as a service that starts at login",
@@ -196,6 +198,7 @@ impl Setting {
             Names => "Read session names, titles and directories from ~/.claude on this machine, for the sessions table and the log.",
             Telemetry => "What happens to Claude Code's /api/event_logging requests: forwarded quietly, forwarded and logged, or answered here without leaving the machine.",
             Warmup => "Send a tiny request through each idle account this often so its 5h window is already running. Seconds, 60 or more; off for never.",
+            WeeklyFirst => "Which weekly quota column comes first in the accounts table: the shared 7d window or the Fable one. On a narrow terminal only the first is shown.",
             PointClaude => "Write the proxy into ~/.claude/settings.json so every Claude Code session uses it. What `corrall setup claude` does.",
             UnpointClaude => "Remove what that wrote. What `corrall setup claude --remove` does.",
             Service => "Start the proxy at every login and keep it running: a systemd --user unit on Linux, a launchd agent on macOS.",
@@ -205,7 +208,7 @@ impl Setting {
     pub fn kind(self) -> Kind {
         use Setting::*;
         match self {
-            Pool | Distribute | SoonestReset | Expiry | Names | Telemetry => Kind::Cycle,
+            Pool | Distribute | SoonestReset | Expiry | Names | Telemetry | WeeklyFirst => Kind::Cycle,
             Threshold | Probe | Hold | Warmup => Kind::Edit,
             PointClaude | UnpointClaude | Service => Kind::Run,
         }
@@ -234,6 +237,7 @@ impl Setting {
             }
             .to_string(),
             Warmup => secs(cfg.warmup_seconds),
+            WeeklyFirst => if cfg.fable_column_first { "7d fable" } else { "7d" }.to_string(),
             PointClaude | UnpointClaude | Service => String::new(),
         }
     }
@@ -276,6 +280,7 @@ impl Setting {
                 p.expiry_routing.enabled = !p.expiry_routing.enabled;
             }
             Setting::Names => cfg.session_titles.enabled = !cfg.session_titles.enabled,
+            Setting::WeeklyFirst => cfg.fable_column_first = !cfg.fable_column_first,
             Setting::Telemetry => {
                 cfg.event_logging = match cfg.event_logging {
                     EventLogging::Hide => EventLogging::Show,
@@ -383,8 +388,13 @@ fn dim() -> Style {
     Style::default().fg(Color::DarkGray)
 }
 
-fn selected() -> Style {
-    Style::default().bg(Color::Blue).fg(Color::White)
+/// A row of a list, with the cursor's mark in its margin when it is the one
+/// selected. `text` starts with the space the mark takes.
+fn list_row(text: String, selected: bool) -> Line<'static> {
+    match selected {
+        true => Line::from(format!("›{}", text.chars().skip(1).collect::<String>())).style(Style::default().fg(Color::Cyan).bold()),
+        false => Line::from(text),
+    }
 }
 
 /// A bordered pane titled `title` filling `area`; returns the space inside.
@@ -415,7 +425,7 @@ pub fn draw_settings(f: &mut Frame, area: Rect, s: &Settings) {
             (r, _) => r.value(cfg, &s.pool),
         };
         let text = format!(" {:<label_w$}{}", row.label(), safe_text(&value, 120));
-        lines.push(if i == s.cursor { Line::from(text).style(selected()) } else { Line::from(text) });
+        lines.push(list_row(text, i == s.cursor));
     }
     lines.push(Line::default());
     lines.push(match &s.error {
@@ -484,7 +494,7 @@ pub fn draw_import(f: &mut Frame, area: Rect, i: &Import) {
         lines.push(Line::from(" Which login?").style(dim()));
         for (n, file) in i.files.iter().enumerate() {
             let text = format!("   {}", safe_text(file, 200));
-            lines.push(if n == i.cursor { Line::from(text).style(selected()) } else { Line::from(text) });
+            lines.push(list_row(text, n == i.cursor));
         }
         lines.push(Line::default());
         lines.push(Line::from(if i.link {

@@ -50,6 +50,7 @@ fn dashboard() -> (Tui, Ctx) {
         tls: parking_lot::RwLock::new(None),
         titles: corrall::titles::Titles::new(&cfg.session_titles),
         oauth_flows: Default::default(),
+        history: Default::default(),
     }));
     (Tui::new(Backend::Local { ctx: ctx.clone(), prober: Prober::new(pools) }, None), ctx)
 }
@@ -154,7 +155,12 @@ async fn the_dashboard_manages_accounts_and_settings() {
     assert!(Config::load().unwrap().unwrap().session_titles.enabled);
 
     // A row that runs something asks first, and `n` does nothing.
+    // The weekly column order is a choice too, kept in the config.
     keys(&mut tui, &[KeyCode::Down, KeyCode::Down, KeyCode::Down, KeyCode::Enter]).await;
+    assert!(Config::load().unwrap().unwrap().fable_column_first);
+    assert!(line(&tui.screen_text(W, 30), "Weekly window shown first").contains("7d fable"));
+
+    keys(&mut tui, &[KeyCode::Down, KeyCode::Enter]).await;
     let screen = tui.screen_text(W, 30);
     assert!(screen.contains("Point Claude Code at http://127.0.0.1:") && screen.contains("y yes"), "{screen}");
     keys(&mut tui, &[KeyCode::Esc]).await;

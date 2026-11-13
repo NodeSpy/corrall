@@ -34,9 +34,18 @@ use crate::tui_screens::{self as screens, Action, Confirm, Import, Input, Kind, 
 /// How loudly a log line is drawn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Severity {
+    /// A request that went through: traffic, not news.
+    Routine,
     Info,
     Warn,
     Error,
+}
+
+impl Severity {
+    /// A warning, an error or a request that failed.
+    fn is_problem(self) -> bool {
+        matches!(self, Severity::Warn | Severity::Error)
+    }
 }
 
 /// Classify a log line. Lines forwarded from `tracing` (see
@@ -251,6 +260,14 @@ impl Backend {
         }
     }
 
+    /// Whether the accounts table leads with the Fable weekly window.
+    fn fable_first(&self, st: &Value) -> bool {
+        match self {
+            Backend::Local { ctx, .. } => ctx.config().fable_column_first,
+            Backend::Remote(_) => st.get("fableColumnFirst").and_then(Value::as_bool).unwrap_or(false),
+        }
+    }
+
     /// Whether the config file on this machine is the server's own, so that
     /// editing it and asking for a reload is how to change the server. Not so
     /// for a dashboard attached to a server elsewhere (`attach --url`).
@@ -357,6 +374,11 @@ pub struct Tui {
     /// A question waiting for y or n, over whatever screen asked it.
     confirm: Option<Confirm>,
     message: Option<String>,
+    /// Whether the activity pane lists every request, or only what is news:
+    /// switches, quota events, warnings and requests that failed.
+    every_request: bool,
+    /// When the event being handled happened, if not now (a replayed one).
+    past: Option<i64>,
     activity_file: Option<std::fs::File>,
     done_tx: tokio::sync::mpsc::UnboundedSender<Done>,
     done_rx: tokio::sync::mpsc::UnboundedReceiver<Done>,
@@ -366,9 +388,15 @@ fn ts() -> String {
     chrono::Local::now().format("%H:%M:%S").to_string()
 }
 
+/// The clock time of `ms` since the epoch, as log lines carry it.
+fn ts_at(ms: i64) -> String {
+    use chrono::TimeZone;
+    chrono::Local.timestamp_millis_opt(ms).single().map(|t| t.format("%H:%M:%S").to_string()).unwrap_or_else(ts)
+}
+
 fn severity_style(severity: Severity) -> Style {
     match severity {
-        Severity::Info => Style::default(),
+        Severity::Routine | Severity::Info => Style::default(),
         Severity::Warn => Style::default().fg(Color::Yellow),
         Severity::Error => Style::default().fg(Color::Red).bold(),
     }
@@ -385,6 +413,8 @@ impl Tui {
             screen: Screen::Dashboard,
             confirm: None,
             message: None,
+            every_request: false,
+            past: None,
             activity_file,
             done_tx,
             done_rx,
@@ -407,7 +437,8 @@ impl Tui {
 
     fn push_log(&mut self, line: String, severity: Severity) {
         let line = safe_text(&line, 300);
-        if let Some(f) = &mut self.activity_file {
+        // A replayed line was written when it happened, by whoever saw it.
+        if let (Some(f), None) = (&mut self.activity_file, self.past) {
             let _ = writeln!(f, "{line}");
         }
         self.log.push_front((line, severity));
@@ -416,14 +447,24 @@ impl Tui {
         }
         // A reader scrolled back keeps looking at the same lines.
         if let Screen::Log(view) = &mut self.screen {
-            if view.offset > 0 && (!view.problems_only || severity != Severity::Info) {
+            if view.offset > 0 && (!view.problems_only || severity.is_problem()) {
                 view.offset = (view.offset + 1).min(LOG_MAX);
             }
         }
     }
 
+    /// When the event being handled happened, as a log line shows it.
+    fn stamp(&self) -> String {
+        self.past.map(ts_at).unwrap_or_else(ts)
+    }
+
     fn on_activity(&mut self, st: &Value, a: Activity) {
         match a {
+            Activity::Past { at, event } => {
+                self.past = Some(at);
+                self.on_activity(st, *event);
+                self.past = None;
+            }
             Activity::Start { id, method, path, model, session, client, label, bytes, .. } => {
                 let (mut sess, width) = self.backend.session_label(st, session.as_deref(), label);
                 if sess.chars().count() > width {
@@ -438,13 +479,10 @@ impl Tui {
                     None => String::new(),
                 };
                 let line = format!("{who}{sess} {method} {path}{model}");
-                self.inflight.push(InFlight {
-                    id,
-                    started: std::time::Instant::now(),
-                    line: safe_text(&line, 200),
-                    account: String::new(),
-                    in_table: session.is_some(),
-                });
+                // A replayed request has been running since it began.
+                let age = self.past.map(|at| Duration::from_millis((crate::quota::now_ms() - at).max(0) as u64)).unwrap_or_default();
+                let started = std::time::Instant::now().checked_sub(age).unwrap_or_else(std::time::Instant::now);
+                self.inflight.push(InFlight { id, started, line: safe_text(&line, 200), account: String::new(), in_table: session.is_some() });
             }
             Activity::Account { id, account } => {
                 if let Some(f) = self.inflight.iter_mut().find(|f| f.id == id) {
@@ -455,17 +493,17 @@ impl Tui {
                 if let Some(pos) = self.inflight.iter().position(|f| f.id == id) {
                     let f = self.inflight.remove(pos);
                     let mark = if ok { "✓" } else { "✗" };
-                    let severity = if ok { Severity::Info } else { Severity::Warn };
+                    let severity = if ok { Severity::Routine } else { Severity::Warn };
                     let used = tokens.map(|t| format!("  {}", t.note())).unwrap_or_default();
                     self.push_log(
-                        format!("{mark} {}  {} → {} {} ({:.1}s){used}", ts(), f.line, safe_text(&account, 40), status, elapsed_ms as f64 / 1000.0),
+                        format!("{mark} {}  {} → {} {} ({:.1}s){used}", self.stamp(), f.line, safe_text(&account, 40), status, elapsed_ms as f64 / 1000.0),
                         severity,
                     );
                 }
             }
             Activity::Log(s) => {
                 let severity = severity_of(&s);
-                self.push_log(format!("  {}  {s}", ts()), severity);
+                self.push_log(format!("  {}  {s}", self.stamp()), severity);
             }
         }
     }
@@ -678,6 +716,10 @@ impl Tui {
                 Screen::Dashboard
             }
             KeyCode::Char('l') => Screen::Log(LogView::default()),
+            KeyCode::Char('t') => {
+                self.every_request = !self.every_request;
+                Screen::Dashboard
+            }
             KeyCode::Char('g') if self.may_configure() => Screen::Settings(Box::new(Settings::open())),
             KeyCode::Char('a') if self.may_configure() => self.start_login(None),
             KeyCode::Char('i') if self.may_configure() => {
@@ -718,7 +760,7 @@ impl Tui {
     }
 
     fn key_log(&mut self, code: KeyCode, mut view: LogView) -> Screen {
-        let shown = self.log.iter().filter(|(_, s)| !view.problems_only || *s != Severity::Info).count();
+        let shown = self.log.iter().filter(|(_, s)| !view.problems_only || s.is_problem()).count();
         match code {
             KeyCode::Esc | KeyCode::Char('q' | 'l') => return Screen::Dashboard,
             // Newest is at the top, so down is back in time.
@@ -981,7 +1023,7 @@ impl Tui {
             Screen::Detail => self.draw_detail(f, chunks[1], st, sessions),
             Screen::Log(view) => {
                 let rows = chunks[1].height.saturating_sub(2) as usize;
-                let wanted = |severity: &Severity| !view.problems_only || *severity != Severity::Info;
+                let wanted = |severity: &Severity| !view.problems_only || severity.is_problem();
                 let total = self.log.iter().filter(|(_, s)| wanted(s)).count();
                 let lines: Vec<(String, Style)> =
                     self.log.iter().filter(|(_, s)| wanted(s)).skip(view.offset).take(rows).map(|(l, s)| (l.clone(), severity_style(*s))).collect();
@@ -993,7 +1035,9 @@ impl Tui {
         }
         // The most-wanted keys first: a narrow terminal cuts the line short.
         let keys = match &self.screen {
-            Screen::Dashboard => "↑↓ account  Enter detail  a add  i import  l log  g settings  q quit  s switch  d disable  +/- priority  p probe  R reload",
+            Screen::Dashboard => {
+                "↑↓ account  Enter detail  a add  i import  l log  t all requests  g settings  q quit  s switch  d disable  +/- priority  p probe  R reload"
+            }
             Screen::Detail => "Esc back  ↑↓ other accounts  s switch  d disable/enable  +/- priority  p probe  L log in again  x remove",
             Screen::Log(_) => "Esc back  ↓↑ older/newer  PgDn/PgUp a page  Home newest  End oldest  w warnings only",
             Screen::Settings(s) if s.editing.is_some() => "Enter save  Esc cancel",
@@ -1083,6 +1127,12 @@ impl Tui {
 
         let now = crate::quota::now_ms();
         let shape = AccountsShape::fitting(area.width);
+        // The two weekly windows, in the order the config asks for. When
+        // there is room for one, it is the first.
+        let weekly = match self.backend.fable_first(st) {
+            true => [("7d fable", "unified7dFable"), ("7d", "unified7d")],
+            false => [("7d", "unified7d"), ("7d fable", "unified7dFable")],
+        };
         let mut rows: Vec<Row> = Vec::with_capacity(flat.len() + 2);
         let mut shown_pool: Option<&str> = None;
         for (i, (pool, a)) in flat.iter().enumerate() {
@@ -1113,9 +1163,10 @@ impl Tui {
             } else {
                 "ready".into()
             };
-            let style = if i == self.cursor {
-                Style::default().bg(Color::Blue).fg(Color::White)
-            } else if current {
+            // The cursor is a mark in the margin and a bolder row, not a
+            // block of colour: the row keeps what its colour says about it.
+            let on_cursor = i == self.cursor;
+            let style = if current {
                 Style::default().fg(Color::Green).bold()
             } else if blocked.is_some() {
                 Style::default().fg(Color::DarkGray)
@@ -1125,25 +1176,25 @@ impl Tui {
                 Style::default()
             };
             let mut cells = vec![
-                Cell::from(if current { "►" } else { " " }),
+                Cell::from(format!("{}{}", if on_cursor { "›" } else { " " }, if current { "►" } else { " " })),
                 Cell::from(name),
                 Cell::from(a.get("priority").and_then(Value::as_i64).unwrap_or(0).to_string()),
                 Cell::from(q("unified5h")),
-                Cell::from(q("unified7d")),
+                Cell::from(q(weekly[0].1)),
             ];
             if shape.fable {
-                cells.push(Cell::from(q("unified7dFable")));
+                cells.push(Cell::from(q(weekly[1].1)));
             }
             if shape.probe {
                 cells.push(Cell::from(probe_cell(a, now)));
             }
             cells.push(Cell::from(status));
-            rows.push(Row::new(cells).style(style));
+            rows.push(Row::new(cells).style(if on_cursor { style.bold() } else { style }));
         }
         let (mut head, mut widths) = (
-            vec!["", "account", "pri", "5h", "7d"],
+            vec!["", "account", "pri", "5h", weekly[0].0],
             vec![
-                Constraint::Length(1),
+                Constraint::Length(2),
                 Constraint::Length(shape.name),
                 Constraint::Length(3),
                 Constraint::Length(shape.quota),
@@ -1151,7 +1202,7 @@ impl Tui {
             ],
         );
         if shape.fable {
-            head.push("7d fable");
+            head.push(weekly[1].0);
             widths.push(Constraint::Length(shape.quota));
         }
         if shape.probe {
@@ -1177,10 +1228,23 @@ impl Tui {
                 Line::from(format!("⠋ {}  {}{} ({:.1}s…)", ts(), r.line, acct, r.started.elapsed().as_secs_f64())).style(Style::default().fg(Color::Cyan)),
             );
         }
-        for (l, severity) in self.log.iter().take(chunks[2].height as usize) {
+        // Routine requests are the sessions table's business; here they
+        // would bury the lines worth reading. `t` brings them back, and the
+        // log screen always has them.
+        let news = self.log.iter().filter(|(_, severity)| self.every_request || *severity != Severity::Routine);
+        for (l, severity) in news.take(chunks[2].height as usize) {
             lines.push(Line::from(l.clone()).style(severity_style(*severity)));
         }
-        f.render_widget(Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" activity ")), chunks[2]);
+        if lines.is_empty() {
+            let hidden = self.log.len();
+            let quiet = match hidden {
+                0 => " Nothing yet. Account switches, quota events, warnings and failed requests show here.".to_string(),
+                n => format!(" Nothing to report: {n} requests went through. t lists them here, l opens the whole log."),
+            };
+            lines.push(Line::from(quiet).style(Style::default().fg(Color::DarkGray)));
+        }
+        let title = if self.every_request { " activity: every request " } else { " activity: switches, quota, warnings and failures " };
+        f.render_widget(Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title)), chunks[2]);
     }
 }
 
@@ -1201,7 +1265,7 @@ struct AccountsShape {
 impl AccountsShape {
     fn fitting(width: u16) -> AccountsShape {
         // Borders, mark, priority, state and the gaps between columns.
-        let fixed = |columns: u16| 2 + 1 + 3 + 10 + (columns - 1);
+        let fixed = |columns: u16| 2 + 2 + 3 + 10 + (columns - 1);
         let full = AccountsShape { name: 28, bar: 10, quota: 24, fable: true, probe: true };
         if width >= fixed(8) + 28 + 24 * 3 + 12 {
             full
@@ -1445,7 +1509,7 @@ mod tests {
         assert!(!idle.contains("20260101"), "the model's date suffix is dropped: {idle}");
         let unnamed = line("c14711e0");
         assert!(unnamed.contains("[ci] c14711e0…") && unnamed.contains("16m ago"), "{unnamed}");
-        assert!(screen.contains(" activity "), "the log keeps its pane:\n{screen}");
+        assert!(screen.contains(" activity: "), "the log keeps its pane:\n{screen}");
     }
 
     #[test]
@@ -1470,16 +1534,113 @@ mod tests {
     fn accounts_table_keeps_names_readable_as_it_narrows() {
         let wide = AccountsShape::fitting(170);
         assert_eq!(wide, AccountsShape { name: 28, bar: 10, quota: 24, fable: true, probe: true });
-        assert_eq!(AccountsShape::fitting(135), wide);
-        assert_eq!(AccountsShape::fitting(134), AccountsShape { fable: false, ..wide }, "the Fable window goes first");
-        assert_eq!(AccountsShape::fitting(109), AccountsShape { fable: false, probe: false, ..wide });
-        assert_eq!(AccountsShape::fitting(80), AccountsShape { name: 21, bar: 5, quota: 19, fable: false, probe: false });
+        assert_eq!(AccountsShape::fitting(136), wide);
+        assert_eq!(AccountsShape::fitting(135), AccountsShape { fable: false, ..wide }, "the Fable window goes first");
+        assert_eq!(AccountsShape::fitting(110), AccountsShape { fable: false, probe: false, ..wide });
+        assert_eq!(AccountsShape::fitting(80), AccountsShape { name: 20, bar: 5, quota: 19, fable: false, probe: false });
         assert_eq!(AccountsShape::fitting(40).name, 12, "never less than this");
 
         let rows = render(80, 20, &sample_status(), &sample_sessions());
         let account = rows.iter().find(|r| r.contains("►")).expect("the current account's row");
-        assert!(account.contains("erik.claude.3@ednitio "), "an 80-column terminal still names the account: {account}");
+        assert!(account.contains("›► erik.claude.3@edniti "), "an 80-column terminal still names the account: {account}");
         assert!(account.contains("ready"), "{account}");
+    }
+
+    #[tokio::test]
+    async fn activity_pane_shows_news_and_keeps_traffic_for_the_log() {
+        use crate::proxy::server::TokenUse;
+        let st = sample_status();
+        let mut tui = tui_on(Screen::Dashboard);
+        let request = |tui: &mut Tui, id: &str, ok: bool| {
+            let start = Activity::Start {
+                id: id.into(),
+                method: "POST".into(),
+                path: "/v1/messages".into(),
+                model: Some("claude-fable-5-2".into()),
+                session: None,
+                client: None,
+                label: None,
+                bytes: 2_000,
+                tools: None,
+            };
+            tui.on_activity(&sample_status(), start);
+            let tokens = Some(TokenUse { input: 12, cache_read: 9_000, cache_creation: 400, output: 250 });
+            tui.on_activity(
+                &sample_status(),
+                Activity::End { id: id.into(), account: "a@x.com".into(), status: if ok { 200 } else { 529 }, elapsed_ms: 1_200, ok, tokens },
+            );
+        };
+        let screen = drawn(&tui, 150, 24, &st, &Value::Null);
+        assert!(screen.contains("activity: switches, quota, warnings and failures") && screen.contains("Nothing yet."), "{screen}");
+
+        request(&mut tui, "r1", true);
+        request(&mut tui, "r2", true);
+        let screen = drawn(&tui, 150, 24, &st, &Value::Null);
+        assert!(screen.contains("Nothing to report: 2 requests went through") && !screen.contains("POST /v1/messages"), "{screen}");
+
+        tui.on_activity(&st, Activity::Log("Switched to account \"b\": \"a\" is out (quota: 5h at 99%)".into()));
+        request(&mut tui, "r3", false);
+        let screen = drawn(&tui, 150, 24, &st, &Value::Null);
+        assert!(screen.contains("Switched to account \"b\": \"a\" is out (quota: 5h at 99%)"), "{screen}");
+        assert_eq!(screen.matches("POST /v1/messages").count(), 1, "only the request that failed:\n{screen}");
+        assert!(screen.contains("→ a@x.com 529 (1.2s)"), "{screen}");
+
+        // `t` lists every request, with what each cost; the log screen always does.
+        assert!(!tui.on_key(KeyCode::Char('t'), KeyModifiers::NONE, &st).await);
+        let screen = drawn(&tui, 150, 24, &st, &Value::Null);
+        assert!(screen.contains("activity: every request") && screen.matches("POST /v1/messages").count() == 3, "{screen}");
+        assert!(screen.contains("→ a@x.com 200 (1.2s)  9.4k in (96% cached), 250 out"), "{screen}");
+        tui.every_request = false;
+        tui.screen = Screen::Log(LogView::default());
+        assert_eq!(drawn(&tui, 150, 24, &st, &Value::Null).matches("POST /v1/messages").count(), 3);
+        tui.screen = Screen::Log(LogView { offset: 0, problems_only: true });
+        let screen = drawn(&tui, 150, 24, &st, &Value::Null);
+        assert!(screen.matches("POST /v1/messages").count() == 1 && !screen.contains("Switched to account"), "{screen}");
+    }
+
+    #[test]
+    fn replayed_events_keep_the_time_they_happened() {
+        let st = sample_status();
+        let mut tui = tui_on(Screen::Dashboard);
+        let then = crate::quota::now_ms() - 3 * 3600 * 1000;
+        tui.on_activity(&st, Activity::Past { at: then, event: Box::new(Activity::Log("Account \"a\" can serve again (was: quota: 5h at 99%)".into())) });
+        tui.on_activity(&st, Activity::Log("now".into()));
+        assert!(tui.past.is_none());
+        let lines: Vec<&str> = tui.log.iter().map(|(l, _)| l.as_str()).collect();
+        assert!(lines[0].contains(&ts()[..5]) && lines[0].ends_with("now"), "{lines:?}");
+        assert!(lines[1].contains(&ts_at(then)) && lines[1].contains("can serve again"), "{lines:?}");
+        assert_ne!(ts_at(then)[..2], ts()[..2], "three hours earlier reads as another hour");
+
+        // A request that was already running when the dashboard attached has
+        // been running since it began, not since now.
+        let start = Activity::Start {
+            id: "r".into(),
+            method: "POST".into(),
+            path: "/v1/messages".into(),
+            model: None,
+            session: None,
+            client: None,
+            label: None,
+            bytes: 0,
+            tools: None,
+        };
+        tui.on_activity(&st, Activity::Past { at: crate::quota::now_ms() - 90_000, event: Box::new(start) });
+        assert!(tui.inflight[0].started.elapsed() >= Duration::from_secs(89), "{:?}", tui.inflight[0].started.elapsed());
+    }
+
+    #[test]
+    fn weekly_columns_swap_when_the_server_says_fable_first() {
+        let mut st = sample_status();
+        let header = |st: &Value, width| render(width, 20, st, &sample_sessions()).into_iter().find(|r| r.contains("account") && r.contains("pri")).unwrap();
+        let wide = header(&st, 170);
+        assert!(wide.find(" 7d ").unwrap() < wide.find("7d fable").unwrap(), "{wide}");
+        assert!(!header(&st, 100).contains("7d fable"), "narrow: only the first weekly window");
+
+        st["fableColumnFirst"] = json!(true);
+        let wide = header(&st, 170);
+        assert!(wide.find("7d fable").unwrap() < wide.rfind("7d ").unwrap() && wide.matches("7d").count() == 2, "{wide}");
+        let narrow = header(&st, 100);
+        assert!(narrow.contains("7d fable") && narrow.matches("7d").count() == 1, "narrow keeps the one asked for first: {narrow}");
     }
 
     #[test]

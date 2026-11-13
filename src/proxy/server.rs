@@ -93,6 +93,43 @@ pub enum Activity {
         tokens: Option<TokenUse>,
     },
     Log(String),
+    /// Something that happened at `at` (ms since the epoch), before this
+    /// listener was there to see it: what [`History`] replays to a dashboard
+    /// that attaches to a server already running. Only ever sent to one feed,
+    /// never on the shared channel.
+    Past {
+        at: i64,
+        event: Box<Activity>,
+    },
+}
+
+/// The last [`HISTORY_MAX`] activity events, so a dashboard opened on a
+/// running server starts with what led up to now instead of an empty pane.
+#[derive(Default)]
+pub struct History {
+    events: Mutex<std::collections::VecDeque<(i64, Activity)>>,
+}
+
+/// A few hundred requests' worth: each is a start, an account and an end.
+const HISTORY_MAX: usize = 900;
+
+impl History {
+    pub fn record(&self, event: Activity) {
+        let mut events = self.events.lock();
+        events.push_back((crate::quota::now_ms(), event));
+        while events.len() > HISTORY_MAX {
+            events.pop_front();
+        }
+    }
+
+    /// Everything kept, oldest first, together with a receiver for what
+    /// comes after it. Taken under one lock, so an event is in the past or
+    /// on the receiver, not both.
+    fn then_follow(&self, live: &tokio::sync::broadcast::Sender<Activity>) -> (Vec<Activity>, tokio::sync::broadcast::Receiver<Activity>) {
+        let events = self.events.lock();
+        let rx = live.subscribe();
+        (events.iter().map(|(at, e)| Activity::Past { at: *at, event: Box::new(e.clone()) }).collect(), rx)
+    }
 }
 
 /// One response's token usage.
@@ -166,12 +203,23 @@ impl Activity {
                 json!({ "type": "end", "id": id, "account": account, "status": status, "elapsedMs": u64::try_from(*elapsed_ms).unwrap_or(u64::MAX), "ok": ok, "tokens": tokens.map(TokenUse::to_json) })
             }
             Activity::Log(line) => json!({ "type": "log", "line": line }),
+            // The event as it was, with when: `at` is what marks it as past.
+            Activity::Past { at, event } => {
+                let mut v = event.to_json(titles, now);
+                v["at"] = json!(at);
+                v
+            }
         }
     }
 
     /// Inverse of [`Activity::to_json`]. `None` for anything that is not an
     /// activity event (a future event kind, a stray object).
     pub fn from_json(v: &Value) -> Option<Activity> {
+        if let Some(at) = v.get("at").and_then(Value::as_i64) {
+            let mut inner = v.clone();
+            inner.as_object_mut()?.remove("at");
+            return Some(Activity::Past { at, event: Box::new(Activity::from_json(&inner)?) });
+        }
         let s = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
         match v.get("type").and_then(Value::as_str)? {
             "start" => Some(Activity::Start {
@@ -205,6 +253,8 @@ pub struct CtxInner {
     pub config: RwLock<Arc<Config>>,
     pub logger: Option<RequestLogger>,
     pub activity: tokio::sync::broadcast::Sender<Activity>,
+    /// Recent activity, for a dashboard that attaches later.
+    pub history: History,
     pub reload: Option<Box<dyn Fn() -> Result<usize> + Send + Sync>>,
     /// The quota prober, so `POST /corrall/probe` can start a run. `None`
     /// where nothing probes (tests).
@@ -338,6 +388,20 @@ pub async fn bind(addr: SocketAddr) -> Result<TcpListener> {
 pub async fn serve(ctx: Ctx, listener: TcpListener, mut shutdown: tokio::sync::watch::Receiver<bool>) -> Result<()> {
     let bind = listener.local_addr().context("listener address")?;
     tracing::info!("listening on http://{bind}");
+    // Keep what happens for whoever looks later.
+    {
+        use tokio::sync::broadcast::error::RecvError;
+        let (ctx, mut rx) = (ctx.clone(), ctx.activity.subscribe());
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(event) => ctx.history.record(event),
+                    Err(RecvError::Lagged(_)) => {}
+                    Err(RecvError::Closed) => break,
+                }
+            }
+        });
+    }
     loop {
         tokio::select! {
             r = listener.accept() => {
@@ -643,6 +707,7 @@ async fn control(ctx: &Ctx, req: Request<Incoming>, auth: &Auth, asked_pool: Opt
             st["mitm"] = json!({ "caPath": mitm::ca_cert_path(), "http1Only": cfg.mitm.http1_only, "allowTunnel": cfg.mitm.allow_tunnel });
             st["client"] = json!(auth.client_name());
             st["sessionTitles"] = json!(cfg.session_titles);
+            st["fableColumnFirst"] = json!(cfg.fable_column_first);
             st["warmupSeconds"] = json!(cfg.warmup_seconds);
             json_response(StatusCode::OK, st)
         }
@@ -774,12 +839,19 @@ const ACTIVITY_PING: Duration = Duration::from_secs(15);
 /// `corrall attach` tails.
 fn activity_stream(ctx: &Ctx) -> Response<BoxBody> {
     use tokio::sync::broadcast::error::RecvError;
-    let mut rx = ctx.activity.subscribe();
+    let (past, mut rx) = ctx.history.then_follow(&ctx.activity);
     let titles = ctx.titles.clone();
     let (tx, body_rx) = tokio::sync::mpsc::channel::<std::result::Result<Frame<Bytes>, std::io::Error>>(64);
     tokio::spawn(async move {
         if tx.send(Ok(Frame::data(Bytes::from_static(b": corrall activity\n\n")))).await.is_err() {
             return;
+        }
+        // What led up to now first, then what happens from here on.
+        for event in past {
+            let frame = format!("data: {}\n\n", event.to_json(&titles, crate::quota::now_ms()));
+            if tx.send(Ok(Frame::data(Bytes::from(frame)))).await.is_err() {
+                return;
+            }
         }
         let mut ping = tokio::time::interval(ACTIVITY_PING);
         ping.tick().await;

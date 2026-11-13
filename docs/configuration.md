@@ -134,6 +134,7 @@ directory, for a wrapper resolving a project it has not entered yet.
 | `expiryRouting` | off | `{ "enabled", "tolerance": 1.5, "preempt": true }`: rank the top priority tier by headroom ÷ seconds-to-reset of the governing weekly bucket, keep accounts within `tolerance` of the best, and with `preempt` re-rank the sticky/pinned account when its window rolls over |
 | `soonestReset` | `false` | Within a priority tier, spend first the quota that is lost first. Accounts are ranked by governing weekly reset, soonest first, with weeks ending within 24 hours of the soonest one counted as equal. Within that band they are ranked by 5h reset, soonest first, with resets within 15 minutes of the soonest counted as equal; an account with no running 5h window counts as starting one now, so it goes after every running window. `distributeSessions` then spreads new sessions by load only across accounts that tie on both bands. Bands are measured from the accounts still available, and accounts at the switch threshold are skipped as usual. A sticky account, or a session pinned to one, moves only to an account in an earlier weekly or 5h band |
 | `warmupSeconds` | `0` | Keep-warm interval (min 60). Spawns `claude -p --bare --model haiku` per idle account through this proxy; spends a little quota |
+| `fableColumnFirst` | `false` | In the dashboard's accounts table, show the Fable weekly window before the shared 7d one. On a terminal with room for one weekly column, it is the first that stays. Also a row in the dashboard's settings |
 | `sessionTitles` | off | `{ "enabled", "width": 18, "projectsDir"? }`: name sessions in [the sessions table](#the-sessions-table) and the activity log from Claude Code's own files on this machine. The name Claude Code shows for a running session and its directory come from `~/.claude/sessions/<pid>.json`; a `/rename`d or generated title, and the directory of a session that has exited, from the transcript under `~/.claude/projects`. Only `.json` files are opened in `sessions/`, and only for UUID-shaped session ids. `width` is the label's width in the log; `projectsDir` moves both directories (`sessions/` is taken to sit beside it). Off, a session is its id |
 | `mitm.http1Only` | `true` | Offer only HTTP/1.1 inside the intercepted tunnel (needed for WebSocket / Remote Control). With `false` the tunnel also offers `h2` and serves whichever the client negotiates |
 | `mitm.allowTunnel` | `false` | Allow blind CONNECT tunnels to non-intercepted hosts (port 443, public addresses only: the name is resolved first and refused if any answer is loopback, private, link-local or the metadata address). `platform.claude.com`, `mcp-proxy.anthropic.com` and `*.mcp.claude.com` are tunnelled regardless, see [claude.ai connectors](#claudeai-connectors) |
@@ -200,7 +201,7 @@ refused.
 | `GET quota` | Tier-weighted fleet quota for status lines, for the addressed pool |
 | `GET metrics` | Prometheus text format. Per-account series carry a `pool="…"` label |
 | `GET sessions` | Who is being served: `{ active, known, names, shown, sessions: [...] }`, one entry per session heard from in the last hour across every pool (at most 100; `active` and `known` count them all), those with a request open first, then the most recent. Each has `id`, `pool`, `client`, `name`, `title`, `project`, `account`, `model` (the one most of its requests named), `active`, `inFlight`, `busyMs` (how long its oldest open request has run, else null), `idleMs`, `ageMs`, `firstSeen`, `lastSeen`, `requests`, `tokens` (`input`, `output`, `cacheRead`, `cacheCreation`) and `cacheHit` (cache reads as a share of prompt tokens). `names` is whether `sessionTitles` is on |
-| `GET activity` | The activity feed as server-sent events: one JSON object per `data:` line (`type` is `start`, `account`, `end` or `log`), a `: ping` comment every 15 s. Stays open until the client leaves. What `corrall attach` tails. A `start` carries the request's `bytes` and `tools` (how many tool definitions it sends in full rather than deferred); an `end` carries `tokens` (`input`, `cacheRead`, `cacheCreation`, `output`) when the response reported usage |
+| `GET activity` | The activity feed as server-sent events: one JSON object per `data:` line (`type` is `start`, `account`, `end` or `log`), a `: ping` comment every 15 s. Stays open until the client leaves. What `corrall attach` tails. A `start` carries the request's `bytes` and `tools` (how many tool definitions it sends in full rather than deferred); an `end` carries `tokens` (`input`, `cacheRead`, `cacheCreation`, `output`) when the response reported usage. The feed opens with the last 900 events the server saw, oldest first, each with `at` (ms since the epoch) to mark it as past; events without `at` are live |
 | `POST reload` | Re-read the config |
 | `POST probe` | Start a quota probe of every OAuth account now. `{ ok: true, result: "started" }`, or `ok: false` with `result` `already-running` / `too-soon` (and `waitSeconds`) |
 | `POST switch` `{ "account": "…", "pool"? }` | Prefer one account. Without a pool, every pool is searched |
@@ -235,6 +236,7 @@ activity log. A cursor sits on one account:
 | `p` | Probe every account's quota now; in the account's own screen, probe just that one |
 | `a` | Add an account: a browser opens on Claude's sign-in page and the screen closes when it comes back. With the browser on another machine, paste the address it ends on. Signing in as an account that is already here renews its login |
 | `i` | Import a Claude Code login from `~/.claude*/.credentials.json`, linked (Claude Code keeps refreshing it) or copied |
+| `t` | List every request in the activity pane, or go back to news only |
 | `l` | The whole log, 2000 lines back: `↓` `↑` and `PgDn` `PgUp` scroll, `w` keeps only warnings, errors and failed requests |
 | `g` | Settings |
 | `R` | Reload the config |
@@ -245,8 +247,9 @@ In an account's screen, `L` logs it in again and `x` removes it, after a `y`.
 **Settings** lists, for one pool at a time: the switch threshold, how new
 sessions are spread (`off`, by sessions, by usage), the quota probe interval,
 the hold, soonest-reset and expiry-pressure routing. Below those, for the
-whole server: session names, what happens to telemetry requests, and the
-keep-warm interval. `Enter` steps a choice or opens a number for typing; the
+whole server: session names, what happens to telemetry requests, the
+keep-warm interval, and which weekly quota column the accounts table shows
+first (7d or 7d fable). `Enter` steps a choice or opens a number for typing; the
 line under the list says what the row under the cursor means. Each change is
 written to the config file and the server reloads it, exactly as the matching
 command (`corrall threshold`, `distribute`, `probe`, …) would. Three more rows
@@ -260,6 +263,15 @@ removing accounts and the settings screen edit the config file on this
 machine, as the CLI does, so they are offered only when that file is the
 server's: always under `corrall server`, and under `attach` unless `--url`
 points somewhere else.
+
+The activity pane shows what is worth reading: an account switch and why
+(`Switched to account "b": "a" is out (quota: 5h at 99%)`), a request for one
+model family being diverted, a session moving account when sessions are
+distributed, an account coming back (`Account "a" can serve again`), probes,
+warnings, and requests that failed. Requests that went through are left to the
+sessions table; `t` lists them in the pane too, and the log screen always has
+them. An attached dashboard starts with the server's recent history rather
+than an empty pane, each line at the time it happened.
 
 A finished request's line in the log ends with what it cost, `184.2k in (96%
 cached), 250 out`, and carries the size of the request body beside the model.

@@ -296,6 +296,7 @@ impl Remote {
     async fn tail_activity(&self) {
         let mut delay = RECONNECT_MIN;
         let mut was_up = false;
+        let mut was_replayed = false;
         loop {
             match self.client.get(format!("{}/corrall/activity", self.base)).header("x-api-key", &self.key).send().await {
                 Ok(r) if r.status().is_success() => {
@@ -304,7 +305,10 @@ impl Remote {
                     }
                     was_up = true;
                     delay = RECONNECT_MIN;
-                    let why = self.pump(r).await;
+                    // History comes with the first connection only: after a
+                    // reconnect it would repeat lines already on screen.
+                    let why = self.pump(r, !was_replayed).await;
+                    was_replayed = true;
                     self.say(&format!("WARN attach: activity feed dropped ({why}); reconnecting"));
                 }
                 Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => {
@@ -330,7 +334,7 @@ impl Remote {
     }
 
     /// Read one feed connection until it ends; returns why.
-    async fn pump(&self, r: reqwest::Response) -> String {
+    async fn pump(&self, r: reqwest::Response, with_history: bool) -> String {
         let mut stream = r.bytes_stream();
         let mut parser = SseParser::default();
         while let Some(chunk) = stream.next().await {
@@ -339,8 +343,12 @@ impl Remote {
                 Err(e) => return safe_text(&e.to_string(), 80),
             };
             for ev in parser.feed(&chunk) {
-                if let Some(a) = Activity::from_json(&ev) {
-                    let _ = self.activity.send(a);
+                match Activity::from_json(&ev) {
+                    Some(Activity::Past { .. }) if !with_history => {}
+                    Some(a) => {
+                        let _ = self.activity.send(a);
+                    }
+                    None => {}
                 }
             }
         }
