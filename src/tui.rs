@@ -260,6 +260,14 @@ impl Backend {
         }
     }
 
+    /// Whether the accounts table leads with the Fable weekly window.
+    fn fable_first(&self, st: &Value) -> bool {
+        match self {
+            Backend::Local { ctx, .. } => ctx.config().fable_column_first,
+            Backend::Remote(_) => st.get("fableColumnFirst").and_then(Value::as_bool).unwrap_or(false),
+        }
+    }
+
     /// Whether the config file on this machine is the server's own, so that
     /// editing it and asking for a reload is how to change the server. Not so
     /// for a dashboard attached to a server elsewhere (`attach --url`).
@@ -1119,6 +1127,12 @@ impl Tui {
 
         let now = crate::quota::now_ms();
         let shape = AccountsShape::fitting(area.width);
+        // The two weekly windows, in the order the config asks for. When
+        // there is room for one, it is the first.
+        let weekly = match self.backend.fable_first(st) {
+            true => [("7d fable", "unified7dFable"), ("7d", "unified7d")],
+            false => [("7d", "unified7d"), ("7d fable", "unified7dFable")],
+        };
         let mut rows: Vec<Row> = Vec::with_capacity(flat.len() + 2);
         let mut shown_pool: Option<&str> = None;
         for (i, (pool, a)) in flat.iter().enumerate() {
@@ -1166,10 +1180,10 @@ impl Tui {
                 Cell::from(name),
                 Cell::from(a.get("priority").and_then(Value::as_i64).unwrap_or(0).to_string()),
                 Cell::from(q("unified5h")),
-                Cell::from(q("unified7d")),
+                Cell::from(q(weekly[0].1)),
             ];
             if shape.fable {
-                cells.push(Cell::from(q("unified7dFable")));
+                cells.push(Cell::from(q(weekly[1].1)));
             }
             if shape.probe {
                 cells.push(Cell::from(probe_cell(a, now)));
@@ -1178,7 +1192,7 @@ impl Tui {
             rows.push(Row::new(cells).style(if on_cursor { style.bold() } else { style }));
         }
         let (mut head, mut widths) = (
-            vec!["", "account", "pri", "5h", "7d"],
+            vec!["", "account", "pri", "5h", weekly[0].0],
             vec![
                 Constraint::Length(2),
                 Constraint::Length(shape.name),
@@ -1188,7 +1202,7 @@ impl Tui {
             ],
         );
         if shape.fable {
-            head.push("7d fable");
+            head.push(weekly[1].0);
             widths.push(Constraint::Length(shape.quota));
         }
         if shape.probe {
@@ -1612,6 +1626,21 @@ mod tests {
         };
         tui.on_activity(&st, Activity::Past { at: crate::quota::now_ms() - 90_000, event: Box::new(start) });
         assert!(tui.inflight[0].started.elapsed() >= Duration::from_secs(89), "{:?}", tui.inflight[0].started.elapsed());
+    }
+
+    #[test]
+    fn weekly_columns_swap_when_the_server_says_fable_first() {
+        let mut st = sample_status();
+        let header = |st: &Value, width| render(width, 20, st, &sample_sessions()).into_iter().find(|r| r.contains("account") && r.contains("pri")).unwrap();
+        let wide = header(&st, 170);
+        assert!(wide.find(" 7d ").unwrap() < wide.find("7d fable").unwrap(), "{wide}");
+        assert!(!header(&st, 100).contains("7d fable"), "narrow: only the first weekly window");
+
+        st["fableColumnFirst"] = json!(true);
+        let wide = header(&st, 170);
+        assert!(wide.find("7d fable").unwrap() < wide.rfind("7d ").unwrap() && wide.matches("7d").count() == 2, "{wide}");
+        let narrow = header(&st, 100);
+        assert!(narrow.contains("7d fable") && narrow.matches("7d").count() == 1, "narrow keeps the one asked for first: {narrow}");
     }
 
     #[test]

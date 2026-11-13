@@ -134,6 +134,7 @@ directory, for a wrapper resolving a project it has not entered yet.
 | `expiryRouting` | off | `{ "enabled", "tolerance": 1.5, "preempt": true }`: rank the top priority tier by headroom ÷ seconds-to-reset of the governing weekly bucket, keep accounts within `tolerance` of the best, and with `preempt` re-rank the sticky/pinned account when its window rolls over |
 | `soonestReset` | `false` | Within a priority tier, spend first the quota that is lost first. Accounts are ranked by governing weekly reset, soonest first, with weeks ending within 24 hours of the soonest one counted as equal. Within that band they are ranked by 5h reset, soonest first, with resets within 15 minutes of the soonest counted as equal; an account with no running 5h window counts as starting one now, so it goes after every running window. `distributeSessions` then spreads new sessions by load only across accounts that tie on both bands. Bands are measured from the accounts still available, and accounts at the switch threshold are skipped as usual. A sticky account, or a session pinned to one, moves only to an account in an earlier weekly or 5h band |
 | `warmupSeconds` | `0` | Keep-warm interval (min 60). Spawns `claude -p --bare --model haiku` per idle account through this proxy; spends a little quota |
+| `fableColumnFirst` | `false` | In the dashboard's accounts table, show the Fable weekly window before the shared 7d one. On a terminal with room for one weekly column, it is the first that stays. Also a row in the dashboard's settings |
 | `sessionTitles` | off | `{ "enabled", "width": 18, "projectsDir"? }`: name sessions in [the sessions table](#the-sessions-table) and the activity log from Claude Code's own files on this machine. The name Claude Code shows for a running session and its directory come from `~/.claude/sessions/<pid>.json`; a `/rename`d or generated title, and the directory of a session that has exited, from the transcript under `~/.claude/projects`. Only `.json` files are opened in `sessions/`, and only for UUID-shaped session ids. `width` is the label's width in the log; `projectsDir` moves both directories (`sessions/` is taken to sit beside it). Off, a session is its id |
 | `mitm.http1Only` | `true` | Offer only HTTP/1.1 inside the intercepted tunnel (needed for WebSocket / Remote Control). With `false` the tunnel also offers `h2` and serves whichever the client negotiates |
 | `mitm.allowTunnel` | `false` | Allow blind CONNECT tunnels to non-intercepted hosts (port 443, public addresses only: the name is resolved first and refused if any answer is loopback, private, link-local or the metadata address). `platform.claude.com`, `mcp-proxy.anthropic.com` and `*.mcp.claude.com` are tunnelled regardless, see [claude.ai connectors](#claudeai-connectors) |
@@ -246,8 +247,9 @@ In an account's screen, `L` logs it in again and `x` removes it, after a `y`.
 **Settings** lists, for one pool at a time: the switch threshold, how new
 sessions are spread (`off`, by sessions, by usage), the quota probe interval,
 the hold, soonest-reset and expiry-pressure routing. Below those, for the
-whole server: session names, what happens to telemetry requests, and the
-keep-warm interval. `Enter` steps a choice or opens a number for typing; the
+whole server: session names, what happens to telemetry requests, the
+keep-warm interval, and which weekly quota column the accounts table shows
+first (7d or 7d fable). `Enter` steps a choice or opens a number for typing; the
 line under the list says what the row under the cursor means. Each change is
 written to the config file and the server reloads it, exactly as the matching
 command (`corrall threshold`, `distribute`, `probe`, …) would. Three more rows

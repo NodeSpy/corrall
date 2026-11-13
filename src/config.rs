@@ -539,6 +539,10 @@ pub struct Config {
     pub pools: BTreeMap<String, PoolConfig>,
     pub event_logging: EventLogging,
     pub session_titles: SessionTitles,
+    /// In the dashboard's accounts table, show the Fable weekly window before
+    /// the shared one (and keep it when a narrow terminal has room for one).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub fable_column_first: bool,
     /// Keep-warm interval in seconds (0 = off). Spends a little quota.
     pub warmup_seconds: u64,
     /// Check GitHub for a newer release and say so in status and the TUI: the
@@ -572,6 +576,7 @@ impl Default for Config {
             pools: BTreeMap::from([(DEFAULT_POOL.to_string(), PoolConfig::default())]),
             event_logging: EventLogging::Hide,
             session_titles: SessionTitles::default(),
+            fable_column_first: false,
             warmup_seconds: 0,
             update_check: true,
             mitm: MitmConfig::default(),

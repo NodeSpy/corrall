@@ -707,6 +707,7 @@ async fn control(ctx: &Ctx, req: Request<Incoming>, auth: &Auth, asked_pool: Opt
             st["mitm"] = json!({ "caPath": mitm::ca_cert_path(), "http1Only": cfg.mitm.http1_only, "allowTunnel": cfg.mitm.allow_tunnel });
             st["client"] = json!(auth.client_name());
             st["sessionTitles"] = json!(cfg.session_titles);
+            st["fableColumnFirst"] = json!(cfg.fable_column_first);
             st["warmupSeconds"] = json!(cfg.warmup_seconds);
             json_response(StatusCode::OK, st)
         }
