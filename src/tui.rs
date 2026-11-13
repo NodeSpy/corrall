@@ -1113,9 +1113,10 @@ impl Tui {
             } else {
                 "ready".into()
             };
-            let style = if i == self.cursor {
-                Style::default().bg(Color::Blue).fg(Color::White)
-            } else if current {
+            // The cursor is a mark in the margin and a bolder row, not a
+            // block of colour: the row keeps what its colour says about it.
+            let on_cursor = i == self.cursor;
+            let style = if current {
                 Style::default().fg(Color::Green).bold()
             } else if blocked.is_some() {
                 Style::default().fg(Color::DarkGray)
@@ -1125,7 +1126,7 @@ impl Tui {
                 Style::default()
             };
             let mut cells = vec![
-                Cell::from(if current { "►" } else { " " }),
+                Cell::from(format!("{}{}", if on_cursor { "›" } else { " " }, if current { "►" } else { " " })),
                 Cell::from(name),
                 Cell::from(a.get("priority").and_then(Value::as_i64).unwrap_or(0).to_string()),
                 Cell::from(q("unified5h")),
@@ -1138,12 +1139,12 @@ impl Tui {
                 cells.push(Cell::from(probe_cell(a, now)));
             }
             cells.push(Cell::from(status));
-            rows.push(Row::new(cells).style(style));
+            rows.push(Row::new(cells).style(if on_cursor { style.bold() } else { style }));
         }
         let (mut head, mut widths) = (
             vec!["", "account", "pri", "5h", "7d"],
             vec![
-                Constraint::Length(1),
+                Constraint::Length(2),
                 Constraint::Length(shape.name),
                 Constraint::Length(3),
                 Constraint::Length(shape.quota),
@@ -1201,7 +1202,7 @@ struct AccountsShape {
 impl AccountsShape {
     fn fitting(width: u16) -> AccountsShape {
         // Borders, mark, priority, state and the gaps between columns.
-        let fixed = |columns: u16| 2 + 1 + 3 + 10 + (columns - 1);
+        let fixed = |columns: u16| 2 + 2 + 3 + 10 + (columns - 1);
         let full = AccountsShape { name: 28, bar: 10, quota: 24, fable: true, probe: true };
         if width >= fixed(8) + 28 + 24 * 3 + 12 {
             full
@@ -1470,15 +1471,15 @@ mod tests {
     fn accounts_table_keeps_names_readable_as_it_narrows() {
         let wide = AccountsShape::fitting(170);
         assert_eq!(wide, AccountsShape { name: 28, bar: 10, quota: 24, fable: true, probe: true });
-        assert_eq!(AccountsShape::fitting(135), wide);
-        assert_eq!(AccountsShape::fitting(134), AccountsShape { fable: false, ..wide }, "the Fable window goes first");
-        assert_eq!(AccountsShape::fitting(109), AccountsShape { fable: false, probe: false, ..wide });
-        assert_eq!(AccountsShape::fitting(80), AccountsShape { name: 21, bar: 5, quota: 19, fable: false, probe: false });
+        assert_eq!(AccountsShape::fitting(136), wide);
+        assert_eq!(AccountsShape::fitting(135), AccountsShape { fable: false, ..wide }, "the Fable window goes first");
+        assert_eq!(AccountsShape::fitting(110), AccountsShape { fable: false, probe: false, ..wide });
+        assert_eq!(AccountsShape::fitting(80), AccountsShape { name: 20, bar: 5, quota: 19, fable: false, probe: false });
         assert_eq!(AccountsShape::fitting(40).name, 12, "never less than this");
 
         let rows = render(80, 20, &sample_status(), &sample_sessions());
         let account = rows.iter().find(|r| r.contains("►")).expect("the current account's row");
-        assert!(account.contains("erik.claude.3@ednitio "), "an 80-column terminal still names the account: {account}");
+        assert!(account.contains("›► erik.claude.3@edniti "), "an 80-column terminal still names the account: {account}");
         assert!(account.contains("ready"), "{account}");
     }
 

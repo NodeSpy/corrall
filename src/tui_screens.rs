@@ -383,8 +383,13 @@ fn dim() -> Style {
     Style::default().fg(Color::DarkGray)
 }
 
-fn selected() -> Style {
-    Style::default().bg(Color::Blue).fg(Color::White)
+/// A row of a list, with the cursor's mark in its margin when it is the one
+/// selected. `text` starts with the space the mark takes.
+fn list_row(text: String, selected: bool) -> Line<'static> {
+    match selected {
+        true => Line::from(format!("›{}", text.chars().skip(1).collect::<String>())).style(Style::default().fg(Color::Cyan).bold()),
+        false => Line::from(text),
+    }
 }
 
 /// A bordered pane titled `title` filling `area`; returns the space inside.
@@ -415,7 +420,7 @@ pub fn draw_settings(f: &mut Frame, area: Rect, s: &Settings) {
             (r, _) => r.value(cfg, &s.pool),
         };
         let text = format!(" {:<label_w$}{}", row.label(), safe_text(&value, 120));
-        lines.push(if i == s.cursor { Line::from(text).style(selected()) } else { Line::from(text) });
+        lines.push(list_row(text, i == s.cursor));
     }
     lines.push(Line::default());
     lines.push(match &s.error {
@@ -484,7 +489,7 @@ pub fn draw_import(f: &mut Frame, area: Rect, i: &Import) {
         lines.push(Line::from(" Which login?").style(dim()));
         for (n, file) in i.files.iter().enumerate() {
             let text = format!("   {}", safe_text(file, 200));
-            lines.push(if n == i.cursor { Line::from(text).style(selected()) } else { Line::from(text) });
+            lines.push(list_row(text, n == i.cursor));
         }
         lines.push(Line::default());
         lines.push(Line::from(if i.link {
