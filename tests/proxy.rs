@@ -308,6 +308,7 @@ async fn spawn_proxy(mut cfg: Config) -> Proxy {
         tls: parking_lot::RwLock::new(None),
         titles: corrall::titles::Titles::new(&cfg.session_titles),
         oauth_flows: Default::default(),
+        history: Default::default(),
     }));
     let (_stx, srx) = tokio::sync::watch::channel(false);
     let bind: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
@@ -1373,6 +1374,50 @@ async fn sessions_route_lists_named_sessions_with_usage() {
     assert_eq!((s["requests"].as_u64(), s["inFlight"].as_u64(), s["active"].as_bool()), (Some(2), Some(0), Some(true)));
     assert_eq!((s["tokens"]["input"].as_i64(), s["tokens"]["output"].as_i64()), (Some(22), Some(18)));
     assert!(s["busyMs"].is_null() && s["idleMs"].as_i64().is_some_and(|ms| ms < 10_000), "{s}");
+}
+
+/// A dashboard opened on a running server is first told what happened before
+/// it looked, each event with its time, then what happens next.
+#[tokio::test]
+async fn activity_feed_replays_recent_history_to_a_late_listener() {
+    use corrall::attach::SseParser;
+    use corrall::proxy::server::Activity;
+    use futures_util::StreamExt;
+    let mock = spawn_mock().await;
+    let p = spawn_proxy(cfg_with(vec![account("a", "tok-a", 0, &mock.url())])).await;
+    let before = chrono::Utc::now().timestamp_millis();
+    assert_eq!(post(&p, "/v1/messages", msg("claude-opus-5")).await.0, StatusCode::OK);
+    // A pool's log line, as `corrall server` forwards them onto the feed.
+    let _ = p.ctx.activity.send(Activity::Log("Switched to account \"a\"".into()));
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // Nobody was listening while that happened.
+    let feed = http().get(p.url("/corrall/activity")).header("x-api-key", KEY).send().await.unwrap();
+    let mut stream = feed.bytes_stream();
+    let mut parser = SseParser::default();
+    let mut seen: Vec<Activity> = Vec::new();
+    let mut live = false;
+    while !live {
+        let chunk = tokio::time::timeout(Duration::from_secs(3), stream.next()).await.expect("feed kept flowing").unwrap().unwrap();
+        for ev in parser.feed(&chunk) {
+            let a = Activity::from_json(&ev).expect("an activity event");
+            live |= matches!(&a, Activity::Log(l) if l == "after");
+            seen.push(a);
+        }
+        // Once the past has arrived, say something new.
+        if seen.iter().any(|a| matches!(a, Activity::Past { event, .. } if matches!(**event, Activity::End { .. }))) && !live {
+            let _ = p.ctx.activity.send(Activity::Log("after".into()));
+        }
+    }
+    let past: Vec<(&i64, &Activity)> = seen.iter().filter_map(|a| if let Activity::Past { at, event } = a { Some((at, &**event)) } else { None }).collect();
+    assert!(past.iter().all(|(at, _)| **at >= before && **at <= chrono::Utc::now().timestamp_millis()), "each with when it happened");
+    assert!(matches!(past[0].1, Activity::Start { .. }), "oldest first: {past:?}");
+    assert!(past.iter().any(|(_, e)| matches!(e, Activity::End { status: 200, ok: true, .. })), "{past:?}");
+    assert!(past.iter().any(|(_, e)| matches!(e, Activity::Log(l) if l.starts_with("Switched to account"))), "{past:?}");
+    // What happens after is not wrapped, and nothing arrives twice.
+    assert!(matches!(seen.last(), Some(Activity::Log(l)) if l == "after"));
+    assert_eq!(seen.iter().filter(|a| matches!(a, Activity::Log(l) if l == "after")).count(), 1);
+    assert!(!past.iter().any(|(_, e)| matches!(e, Activity::Log(l) if l == "after")));
 }
 
 /// Bare `corrall` shows the dashboard of a server that is already there

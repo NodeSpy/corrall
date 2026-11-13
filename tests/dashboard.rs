@@ -50,6 +50,7 @@ fn dashboard() -> (Tui, Ctx) {
         tls: parking_lot::RwLock::new(None),
         titles: corrall::titles::Titles::new(&cfg.session_titles),
         oauth_flows: Default::default(),
+        history: Default::default(),
     }));
     (Tui::new(Backend::Local { ctx: ctx.clone(), prober: Prober::new(pools) }, None), ctx)
 }
