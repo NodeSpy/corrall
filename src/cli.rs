@@ -515,7 +515,11 @@ fn pool_note(pool: Option<&str>) -> String {
 
 /// `" in pool \"x\""` for where an account ended up, or nothing for the default pool.
 fn landed_note(cfg: &Config, pool: &str) -> String {
-    if pool == cfg.default_pool { String::new() } else { format!(" in pool \"{pool}\"") }
+    if pool == cfg.default_pool {
+        String::new()
+    } else {
+        format!(" in pool \"{pool}\"")
+    }
 }
 
 fn pool_of<'a>(cfg: &'a Config, pool: Option<&str>) -> Result<&'a PoolConfig> {
@@ -725,11 +729,7 @@ pub async fn login(args: LoginArgs) -> Result<()> {
             entry.plan_type = c.plan_type.clone().or(entry.plan_type.take());
             Ok(())
         })?;
-        eprintln!(
-            "Added Codex account \"{name}\"{}{}",
-            c.plan_type.as_ref().map(|p| format!(" (plan {p})")).unwrap_or_default(),
-            landed_note(&cfg, &landed)
-        );
+        eprintln!("Added Codex account \"{name}\"{}{}", c.plan_type.as_ref().map(|p| format!(" (plan {p})")).unwrap_or_default(), landed_note(&cfg, &landed));
         notify_reload(&cfg).await;
         return Ok(());
     }
@@ -2137,7 +2137,11 @@ mod tests {
         assert_eq!(target_pool(&mut cfg, None, found.as_ref()).unwrap(), crate::config::DEFAULT_POOL, "a new account goes to the default pool");
 
         let found = locate_oauth(&cfg, "alice@example.com", Some(&alice));
-        assert_eq!(target_pool(&mut cfg, Some(crate::config::DEFAULT_POOL), found.as_ref()).unwrap(), crate::config::DEFAULT_POOL, "an explicit --pool still moves it");
+        assert_eq!(
+            target_pool(&mut cfg, Some(crate::config::DEFAULT_POOL), found.as_ref()).unwrap(),
+            crate::config::DEFAULT_POOL,
+            "an explicit --pool still moves it"
+        );
     }
 
     /// The CLI's own credentials file is linked unless `--copy` says otherwise:
