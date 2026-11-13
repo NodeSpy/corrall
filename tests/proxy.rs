@@ -1115,6 +1115,23 @@ async fn control_routes_manage_accounts_and_pools() {
     let (st, _, _) = post(&p, "/corrall/pools/default/accounts/a/priority", json!({})).await;
     assert_eq!(st, StatusCode::BAD_REQUEST, "priority needs a value");
 
+    // The attached dashboard's account keys send the same requests, naming the
+    // account by the id the status document gives it.
+    {
+        use corrall::proxy::server::AccountChange;
+        let remote = corrall::attach::Remote::new(&p.url(""), KEY).unwrap();
+        let id = acct(&p.ctx.config(), "b").id.unwrap();
+        assert_eq!(remote.edit_account(DEFAULT_POOL, &id, AccountChange::Disable).await.unwrap(), "b");
+        assert!(acct(&p.ctx.config(), "b").disabled);
+        assert_eq!(remote.status()["accounts"][1]["disabled"], true, "the table is re-fetched with the change");
+        remote.edit_account(DEFAULT_POOL, &id, AccountChange::Enable).await.unwrap();
+        remote.edit_account(DEFAULT_POOL, &id, AccountChange::Priority(-2)).await.unwrap();
+        let b = acct(&p.ctx.config(), "b");
+        assert_eq!((b.disabled, b.priority), (false, -2));
+        let err = remote.edit_account("ghost", &id, AccountChange::Disable).await.unwrap_err().to_string();
+        assert!(err.contains("no pool named"), "{err}");
+    }
+
     // Unknown account / pool 404s rather than mutating.
     let (st, _, _) = post(&p, "/corrall/pools/default/accounts/nope/disable", json!({})).await;
     assert_eq!(st, StatusCode::NOT_FOUND);
@@ -1308,6 +1325,117 @@ async fn activity_feed_labels_sessions() {
     assert_eq!(label.as_deref(), Some("0f2a6c"), "titles are off, so the label is the short id");
 }
 
+/// `/corrall/sessions` lists who is being served: the session Claude Code
+/// names, the account and model it runs on, and what it has used.
+#[tokio::test]
+async fn sessions_route_lists_named_sessions_with_usage() {
+    let mock = spawn_mock().await;
+    let home = tempfile::tempdir().unwrap();
+    let sid = "0f2a6c1e-1111-4222-8333-444455556666";
+    std::fs::create_dir_all(home.path().join("projects")).unwrap();
+    std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+    std::fs::write(home.path().join("sessions/4242.json"), format!(r#"{{"pid":4242,"sessionId":"{sid}","cwd":"/work/roster","name":"roster-e0"}}"#)).unwrap();
+    let mut cfg = cfg_with(vec![account("a", "tok-a", 0, &mock.url())]);
+    cfg.session_titles = corrall::config::SessionTitles { enabled: true, width: 18, projects_dir: Some(home.path().join("projects").display().to_string()) };
+    let p = spawn_proxy(cfg).await;
+
+    let empty: Value = http().get(p.url("/corrall/sessions")).header("x-api-key", KEY).send().await.unwrap().json().await.unwrap();
+    assert_eq!((empty["known"].as_u64(), empty["sessions"].as_array().map(Vec::len)), (Some(0), Some(0)));
+    assert_eq!(empty["names"], true);
+
+    let mut body = msg("claude-sonnet-4-6");
+    body["stream"] = json!(true);
+    for _ in 0..2 {
+        let r = http().post(p.url("/v1/messages")).header("x-claude-code-session-id", sid).json(&body).send().await.unwrap();
+        assert_eq!(r.status(), 200);
+        r.text().await.unwrap();
+    }
+    // A request with no session id is served but is nobody's row.
+    assert_eq!(post(&p, "/v1/messages", msg("claude-opus-5")).await.0, StatusCode::OK);
+
+    // The name is read off the request path, so it arrives a poll later.
+    let mut doc = Value::Null;
+    for _ in 0..100 {
+        doc = http().get(p.url("/corrall/sessions")).header("x-api-key", KEY).send().await.unwrap().json().await.unwrap();
+        if doc["sessions"][0]["name"] == "roster-e0" && doc["sessions"][0]["tokens"]["output"] == 18 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!((doc["active"].as_u64(), doc["known"].as_u64(), doc["shown"].as_u64()), (Some(1), Some(1), Some(1)), "{doc}");
+    let s = &doc["sessions"][0];
+    assert_eq!(s["id"], sid);
+    assert_eq!(s["name"], "roster-e0");
+    assert_eq!(s["project"], "/work/roster");
+    assert_eq!(s["account"], "a", "the account by name, not by id");
+    assert_eq!(s["model"], "claude-sonnet-4-6");
+    assert_eq!(s["pool"], DEFAULT_POOL);
+    assert_eq!((s["requests"].as_u64(), s["inFlight"].as_u64(), s["active"].as_bool()), (Some(2), Some(0), Some(true)));
+    assert_eq!((s["tokens"]["input"].as_i64(), s["tokens"]["output"].as_i64()), (Some(22), Some(18)));
+    assert!(s["busyMs"].is_null() && s["idleMs"].as_i64().is_some_and(|ms| ms < 10_000), "{s}");
+}
+
+/// Bare `corrall` shows the dashboard of a server that is already there
+/// rather than starting a second one; that takes knowing it is corrall.
+#[tokio::test]
+async fn a_running_server_is_recognised_at_its_address() {
+    let mock = spawn_mock().await;
+    let p = spawn_proxy(cfg_with(vec![account("a", "tok-a", 0, &mock.url())])).await;
+    assert!(corrall::attach::server_running(&p.ctx.config()).await);
+
+    // Something else on the port (the mock upstream answers, but not as
+    // corrall), and nothing at all.
+    let mut other = (*p.ctx.config()).clone();
+    other.proxy.port = mock.url().rsplit(':').next().unwrap().parse().unwrap();
+    assert!(!corrall::attach::server_running(&other).await);
+    let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    other.proxy.port = free;
+    assert!(!corrall::attach::server_running(&other).await);
+}
+
+/// A finished request says on the feed what it sent and what it cost, which
+/// is what the log shows beside it.
+#[tokio::test]
+async fn activity_feed_carries_request_size_and_token_use() {
+    use corrall::attach::SseParser;
+    use corrall::proxy::server::{Activity, TokenUse};
+    use futures_util::StreamExt;
+    let mock = spawn_mock().await;
+    let p = spawn_proxy(cfg_with(vec![account("a", "tok-a", 0, &mock.url())])).await;
+    let feed = http().get(p.url("/corrall/activity")).header("x-api-key", KEY).send().await.unwrap();
+    let mut stream = feed.bytes_stream();
+    let mut body = msg("claude-sonnet-4-6");
+    body["stream"] = json!(true);
+    body["tools"] = json!([
+        { "name": "full", "input_schema": { "type": "object" } },
+        { "name": "deferred", "input_schema": { "type": "object" }, "defer_loading": true },
+        { "type": "tool_search_tool_regex_20251119", "name": "tool_search" },
+    ]);
+    let sent = serde_json::to_vec(&body).unwrap().len() as u64;
+    let r = http().post(p.url("/v1/messages")).json(&body).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    r.text().await.unwrap();
+    let mut parser = SseParser::default();
+    let (mut start, mut end) = (None, None);
+    while end.is_none() {
+        let chunk = tokio::time::timeout(Duration::from_secs(3), stream.next()).await.expect("feed kept flowing").unwrap().unwrap();
+        for ev in parser.feed(&chunk) {
+            match Activity::from_json(&ev) {
+                Some(Activity::Start { bytes, tools, .. }) => start = Some((bytes, tools)),
+                Some(Activity::End { tokens, ok, .. }) => end = Some((tokens, ok)),
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(start, Some((sent, Some(1))), "one tool is defined in full; the deferred one and the search tool are not");
+    let (tokens, ok) = end.unwrap();
+    assert!(ok);
+    let tokens = tokens.expect("the stream reported its usage");
+    assert_eq!(tokens, TokenUse { input: 11, cache_read: 0, cache_creation: 0, output: 9 });
+    assert_eq!(tokens.note(), "11 in (0% cached), 9 out");
+    assert_eq!(TokenUse { input: 12, cache_read: 9_000, cache_creation: 400, output: 250 }.note(), "9.4k in (96% cached), 250 out");
+}
+
 /// Without a prober (tests, or a build that does not probe) the route says so
 /// instead of pretending.
 #[tokio::test]
@@ -1318,4 +1446,7 @@ async fn probe_route_without_a_prober_is_not_implemented() {
     assert_eq!(r.status(), 501);
     let v: Value = r.json().await.unwrap();
     assert_eq!(v["ok"], false);
+    // The same for one account's probe.
+    let (st, v, _) = post(&p, "/corrall/pools/default/accounts/a/probe", json!({})).await;
+    assert_eq!((st, v["ok"].as_bool()), (StatusCode::NOT_IMPLEMENTED, Some(false)));
 }

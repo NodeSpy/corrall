@@ -162,7 +162,7 @@ pub async fn forward(ctx: &Ctx, primary: &Manager, info: &ReqInfo, mut headers: 
     // its ✗ line and leaves the in-flight list.
     let fail = |r: Response<BoxBody>, account: &str| {
         let account = if account.is_empty() { "-" } else { account };
-        ctx.notify_end(info, account, r.status().as_u16(), started.elapsed(), false);
+        ctx.notify_end(info, account, r.status().as_u16(), started.elapsed(), false, None);
         r
     };
 
@@ -240,6 +240,7 @@ pub async fn forward(ctx: &Ctx, primary: &Manager, info: &ReqInfo, mut headers: 
 
         last_account = account.name.clone();
         ctx.notify_account(info, &account.name);
+        mgr.session_serving(session, &account.id);
         match attempt(ctx, &mgr, info, &account, &headers, &body).await {
             Attempt::Done(r) => {
                 mgr.record_session(session, &account.id, model);
@@ -668,10 +669,11 @@ async fn attempt(ctx: &Ctx, mgr: &Manager, info: &ReqInfo, account: &Selected, h
                 }
             }
             usage_acc.flush(&buf);
-            if let Some(u) = usage_acc.merged() {
-                manager.record_token_usage_dims(&account_id, session.as_deref(), client_name.as_deref(), &dims, model_owned.as_deref(), &u);
+            let usage = usage_acc.merged();
+            if let Some(u) = &usage {
+                manager.record_token_usage_dims(&account_id, session.as_deref(), client_name.as_deref(), &dims, model_owned.as_deref(), u);
             }
-            elapsed_notify.notify_end(&info_c, &acct_name, status.as_u16(), started.elapsed(), ok);
+            elapsed_notify.notify_end(&info_c, &acct_name, status.as_u16(), started.elapsed(), ok, usage.as_ref());
             if let Some(l) = logger {
                 let (id, acct, method, url, oh, sb, st, rh) = log_req;
                 let body = Bytes::from(logged_body);
@@ -697,12 +699,11 @@ async fn attempt(ctx: &Ctx, mgr: &Manager, info: &ReqInfo, account: &Selected, h
             }
         }
     };
-    if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
-        if let Some(u) = v.get("usage") {
-            mgr.record_token_usage_dims(&account.id, info.session_id.as_deref(), info.client.as_deref(), &info.dimensions, info.model.as_deref(), u);
-        }
+    let usage = serde_json::from_slice::<Value>(&bytes).ok().and_then(|mut v| v.get_mut("usage").map(Value::take));
+    if let Some(u) = &usage {
+        mgr.record_token_usage_dims(&account.id, info.session_id.as_deref(), info.client.as_deref(), &info.dimensions, info.model.as_deref(), u);
     }
-    ctx.notify_end(info, &account.name, status.as_u16(), started.elapsed(), status.is_success());
+    ctx.notify_end(info, &account.name, status.as_u16(), started.elapsed(), status.is_success(), usage.as_ref());
     if let Some(l) = ctx.logger.clone() {
         let (id, acct, method, url, oh, sb, st, rh) = log_req;
         let b = bytes.clone();

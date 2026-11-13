@@ -3,7 +3,7 @@
 //! The TUI in `tui.rs` draws whatever its [`Backend`](crate::tui::Backend)
 //! hands it. Inside the server that is the process's own pools and activity
 //! channel; here it is a daemon reached over its control API: `/corrall/status`
-//! polled every couple of seconds, `/corrall/activity` tailed as server-sent
+//! and `/corrall/sessions` polled every couple of seconds, `/corrall/activity` tailed as server-sent
 //! events, and `switch`/`reload`/`probe` posted on request. The daemon keeps
 //! doing everything; this process holds no accounts and probes nothing.
 
@@ -18,7 +18,7 @@ use tokio::sync::broadcast;
 
 use crate::cli::AttachArgs;
 use crate::config::Config;
-use crate::proxy::server::Activity;
+use crate::proxy::server::{AccountChange, Activity};
 use crate::security::safe_text;
 
 /// How often the status document is re-fetched.
@@ -40,7 +40,9 @@ pub async fn run(args: AttachArgs) -> Result<()> {
     let cfg = Config::load()?.ok_or_else(|| anyhow!("no config yet; run `corrall login` first"))?;
     let base = args.url.clone().unwrap_or_else(|| crate::cli::proxy_base(&cfg));
     let key = args.key.clone().unwrap_or_else(|| cfg.proxy.api_key.clone());
-    let remote = Remote::new(&base, &key)?;
+    // With no --url this is the server whose config file is on this machine,
+    // so the dashboard may change that file as the CLI does.
+    let remote = Remote::new(&base, &key)?.owning_config(args.url.is_none());
     // Fail here, plainly, rather than draw an empty dashboard around a
     // daemon that is not there.
     remote
@@ -64,9 +66,20 @@ pub async fn run(args: AttachArgs) -> Result<()> {
     tui.run(tx).await
 }
 
+/// Whether a corrall server already answers at the address this config
+/// names. Bare `corrall` asks before starting one: a second server could only
+/// fail to bind, and what the user wants there is the dashboard.
+pub async fn server_running(cfg: &Config) -> bool {
+    let Ok(remote) = Remote::new(&crate::cli::proxy_base(cfg), &cfg.proxy.api_key) else { return false };
+    // Another program on the port answers something else, or nothing.
+    remote.get("/corrall/health").await.is_ok_and(|v| v.get("ok").and_then(Value::as_bool) == Some(true) && v.get("version").is_some())
+}
+
 /// What the poller last learned about the daemon.
 struct Snapshot {
     status: Value,
+    /// The sessions document, or `Null` from a daemon without the route.
+    sessions: Value,
     fetched: Option<Instant>,
     error: Option<String>,
 }
@@ -90,6 +103,8 @@ pub struct Remote {
     client: reqwest::Client,
     snap: Arc<Mutex<Snapshot>>,
     activity: broadcast::Sender<Activity>,
+    /// Whether this machine's config file is the server's own.
+    owns_config: bool,
 }
 
 impl Remote {
@@ -105,7 +120,24 @@ impl Remote {
         let client =
             reqwest::Client::builder().use_rustls_tls().no_proxy().redirect(reqwest::redirect::Policy::none()).connect_timeout(CALL_TIMEOUT).build()?;
         let (activity, _) = broadcast::channel(512);
-        Ok(Remote { base, key: key.to_string(), client, snap: Arc::new(Mutex::new(Snapshot { status: Value::Null, fetched: None, error: None })), activity })
+        Ok(Remote {
+            base,
+            key: key.to_string(),
+            client,
+            snap: Arc::new(Mutex::new(Snapshot { status: Value::Null, sessions: Value::Null, fetched: None, error: None })),
+            activity,
+            owns_config: false,
+        })
+    }
+
+    pub fn owning_config(mut self, owns: bool) -> Remote {
+        self.owns_config = owns;
+        self
+    }
+
+    /// Whether the config file here is the one the server reads.
+    pub fn owns_config(&self) -> bool {
+        self.owns_config
     }
 
     /// Where this is attached, for the footer.
@@ -121,7 +153,12 @@ impl Remote {
             let mut tick = tokio::time::interval(STATUS_EVERY);
             loop {
                 tick.tick().await;
-                let _ = me.fetch_status().await;
+                if me.fetch_status().await.is_ok() {
+                    // A daemon from before the route answers 404; the table
+                    // then says so instead of showing nothing.
+                    let sessions = me.get("/corrall/sessions").await.ok().filter(|v| v.get("sessions").is_some());
+                    me.snap.lock().sessions = sessions.unwrap_or(Value::Null);
+                }
             }
         });
         let me = self.clone();
@@ -131,6 +168,11 @@ impl Remote {
     /// The last status document (or `Null` before the first fetch).
     pub fn status(&self) -> Value {
         self.snap.lock().status.clone()
+    }
+
+    /// The last sessions document (`Null` when the daemon has none to give).
+    pub fn sessions(&self) -> Value {
+        self.snap.lock().sessions.clone()
     }
 
     pub fn link(&self) -> Link {
@@ -177,6 +219,24 @@ impl Remote {
         Ok((name, blocked))
     }
 
+    /// `POST /corrall/pools/{pool}/accounts/{id}/{enable|disable|priority}`.
+    /// Returns the account's name, with the table already re-fetched.
+    pub async fn edit_account(&self, pool: &str, id: &str, change: AccountChange) -> Result<String> {
+        use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
+        let seg = |s: &str| utf8_percent_encode(s, NON_ALPHANUMERIC).to_string();
+        let (action, body) = match change {
+            AccountChange::Enable => ("enable", json!({})),
+            AccountChange::Disable => ("disable", json!({})),
+            AccountChange::Priority(p) => ("priority", json!({ "priority": p })),
+        };
+        let r = self.post(&format!("/corrall/pools/{}/accounts/{}/{action}", seg(pool), seg(id)), body).await?;
+        if !r.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+            bail!("{}", r.get("error").and_then(Value::as_str).unwrap_or("the server refused"));
+        }
+        let _ = self.fetch_status().await;
+        Ok(r.get("account").and_then(Value::as_str).unwrap_or(id).to_string())
+    }
+
     /// `POST /corrall/reload`; the number of accounts the reload added.
     pub async fn reload(&self) -> Result<usize> {
         let r = self.post("/corrall/reload", json!({})).await?;
@@ -192,6 +252,18 @@ impl Remote {
         let r = self.post("/corrall/probe", json!({})).await?;
         if r.get("ok").and_then(Value::as_bool).unwrap_or(false) {
             return Ok("probing all OAuth accounts…".into());
+        }
+        Ok(r.get("error").and_then(Value::as_str).unwrap_or("probe refused").to_string())
+    }
+
+    /// `POST /corrall/pools/{pool}/accounts/{id}/probe`. The server's one-line
+    /// answer either way, like [`Self::probe`].
+    pub async fn probe_account(&self, pool: &str, id: &str) -> Result<String> {
+        use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
+        let seg = |s: &str| utf8_percent_encode(s, NON_ALPHANUMERIC).to_string();
+        let r = self.post(&format!("/corrall/pools/{}/accounts/{}/probe", seg(pool), seg(id)), json!({})).await?;
+        if r.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+            return Ok("probing…".into());
         }
         Ok(r.get("error").and_then(Value::as_str).unwrap_or("probe refused").to_string())
     }

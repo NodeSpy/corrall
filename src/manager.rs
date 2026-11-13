@@ -438,6 +438,7 @@ pub struct Fleet {
     pub blocked_models: Vec<String>,
     pub storm: StormRamp,
     pub distribute_sessions: bool,
+    pub distribute_by: crate::config::DistributeBy,
     pub hold_seconds: u64,
     pub default_upstream: String,
     pub route_pins: HashMap<String, String>,
@@ -512,6 +513,7 @@ impl Manager {
             blocked_models: p.blocked_models.clone(),
             storm: p.storm_ramp.clone(),
             distribute_sessions: p.distribute_sessions,
+            distribute_by: p.distribute_by,
             hold_seconds: p.hold_seconds,
             default_upstream: cfg.upstream.clone(),
             route_pins: HashMap::new(),
@@ -577,6 +579,7 @@ impl Manager {
             f.blocked_models = p.blocked_models.clone();
             f.storm = p.storm_ramp.clone();
             f.distribute_sessions = p.distribute_sessions;
+            f.distribute_by = p.distribute_by;
             f.hold_seconds = p.hold_seconds;
             f.default_upstream = cfg.upstream.clone();
             if !p.expiry_routing.enabled || !p.expiry_routing.preempt {
@@ -1270,7 +1273,14 @@ impl Manager {
     pub fn record_session(&self, session: Option<&str>, id: &str, model: Option<&str>) {
         let Some(s) = session else { return };
         let now = now_ms();
-        self.with(|f| f.sessions.touch(s, Some(id), Some(weekly_bucket_for(model)), now));
+        self.with(|f| f.sessions.touch(s, Some(id), Some(weekly_bucket_for(model)), model, now));
+    }
+
+    /// Note the account a session's open request was just sent to.
+    pub fn session_serving(&self, session: Option<&str>, id: &str) {
+        if let Some(s) = session {
+            self.with(|f| f.sessions.serving(s, id));
+        }
     }
 
     pub fn begin_session_request(&self, session: Option<&str>, client: Option<&str>) {
@@ -1731,10 +1741,7 @@ impl Fleet {
         if self.soonest_reset {
             let bands = soonest_reset_bands(&v, req.model, now);
             let stats = if self.distribute_sessions { Some(self.sessions.stats(now)) } else { None };
-            let load = |a: &Account| match &stats {
-                Some(st) => (st.per_account_active.get(&a.id).copied().unwrap_or(0), st.per_account_in_flight.get(&a.id).copied().unwrap_or(0) + a.in_flight),
-                None => (0, 0),
-            };
+            let load = |a: &Account| stats.as_ref().map(|st| self.load_key(a, st, req.model)).unwrap_or_default();
             v.sort_by(|a, b| {
                 bands[&a.id]
                     .cmp(&bands[&b.id])
@@ -1768,26 +1775,36 @@ impl Fleet {
             return self.band(v, req.model, now);
         }
         let mut v = v;
+        let load = |a: &Account| stats.as_ref().map(|st| self.load_key(a, st, req.model)).unwrap_or_default();
         v.sort_by(|a, b| {
-            a.priority.cmp(&b.priority).then_with(|| {
-                if let Some(st) = &stats {
-                    let la = st.per_account_active.get(&a.id).copied().unwrap_or(0);
-                    let lb = st.per_account_active.get(&b.id).copied().unwrap_or(0);
-                    if la != lb {
-                        return la.cmp(&lb);
-                    }
-                    let ia = st.per_account_in_flight.get(&a.id).copied().unwrap_or(0) + a.in_flight;
-                    let ib = st.per_account_in_flight.get(&b.id).copied().unwrap_or(0) + b.in_flight;
-                    if ia != ib {
-                        return ia.cmp(&ib);
-                    }
-                }
+            a.priority.cmp(&b.priority).then_with(|| load(a).cmp(&load(b))).then_with(|| {
                 let ra = a.weekly_reset_for(req.model).unwrap_or(i64::MAX);
                 let rb = b.weekly_reset_for(req.model).unwrap_or(i64::MAX);
                 ra.cmp(&rb)
             })
         });
         v
+    }
+
+    /// How loaded an account is when a new session is being placed: the
+    /// lowest key gets it. Distributing by sessions that is the sessions it
+    /// serves, then its open requests. By usage, its 5h utilization and then
+    /// its governing weekly one come first, each in whole percent: a reading
+    /// only moves once a response reports it, so several sessions starting
+    /// together would otherwise all land on whichever account was a hair
+    /// lower, and within a percent they spread by session count instead. An
+    /// account with no reading counts as unused.
+    fn load_key(&self, a: &Account, stats: &crate::session::SessionStats, model: Option<&str>) -> (u32, u32, usize, u32) {
+        let sessions = stats.per_account_active.get(&a.id).copied().unwrap_or(0);
+        let open = stats.per_account_in_flight.get(&a.id).copied().unwrap_or(0) + a.in_flight;
+        match self.distribute_by {
+            crate::config::DistributeBy::Sessions => (0, 0, sessions, open),
+            crate::config::DistributeBy::Usage => {
+                let percent = |u: Option<f64>| (u.filter(|u| u.is_finite()).unwrap_or(0.0).clamp(0.0, 10.0) * 100.0).round() as u32;
+                let weekly = a.quota.bucket(self.weekly_key_for(model)).and_then(|b| b.utilization);
+                (percent(a.quota.unified5h.utilization), percent(weekly), sessions, open)
+            }
+        }
     }
 
     fn begin_ramp(&mut self, id: &str, now: i64) {
@@ -2150,6 +2167,41 @@ impl Fleet {
         })
     }
 
+    /// One row per known session, those with a request open first and then
+    /// the most recent, capped at `limit`: what `/corrall/sessions` and the
+    /// TUI's sessions table show, before names are added.
+    pub fn session_rows(&self, now: i64, limit: usize) -> Vec<Value> {
+        self.sessions
+            .items(now)
+            .into_iter()
+            .take(limit)
+            .map(|s| {
+                json!({
+                    "id": s.id,
+                    "pool": self.pool,
+                    "client": s.client,
+                    "account": s.account.as_deref().and_then(|id| self.account(id)).map(|a| a.name.clone()),
+                    "model": s.model,
+                    "active": s.active,
+                    "inFlight": s.in_flight,
+                    "busyMs": s.busy_since.map(|t| (now - t).max(0)),
+                    "idleMs": (now - s.last_seen).max(0),
+                    "ageMs": (now - s.first_seen).max(0),
+                    "firstSeen": iso(s.first_seen),
+                    "lastSeen": iso(s.last_seen),
+                    "requests": s.requests,
+                    "tokens": {
+                        "input": s.totals.input,
+                        "output": s.totals.output,
+                        "cacheRead": s.totals.cache_read,
+                        "cacheCreation": s.totals.cache_creation,
+                    },
+                    "cacheHit": s.totals.cache_hit(),
+                })
+            })
+            .collect()
+    }
+
     pub fn status_json(&self, now: i64, session_detail: bool) -> Value {
         let stats = self.sessions.stats(now);
         let current_name = self.current.as_ref().and_then(|c| self.account(c)).map(|a| a.name.clone());
@@ -2219,6 +2271,7 @@ impl Fleet {
             "updateCheckedAt": self.update_checked_at,
             "switchThreshold": self.threshold,
             "distributeSessions": self.distribute_sessions,
+            "distributeBy": self.distribute_by,
             "holdSeconds": self.hold_seconds,
             "quotaProbeSeconds": self.probe.interval_secs,
             "stormRamp": self.storm,
@@ -2233,6 +2286,7 @@ impl Fleet {
                 "known": stats.known,
                 "inFlight": stats.in_flight,
                 "distribute": self.distribute_sessions,
+                "distributeBy": self.distribute_by,
                 "perAccount": self.accounts.iter().map(|a| json!({
                     "name": a.name,
                     "active": stats.per_account_active.get(&a.id).copied().unwrap_or(0),
@@ -2533,6 +2587,80 @@ mod tests {
             f.account_mut(&week_ends).unwrap().quota.unified7d = window(0.4, 3 * 24 * HOUR, now);
         });
         assert_eq!(select_name(&m, None).as_deref(), Some("week-ends"));
+    }
+
+    /// `distributeBy: usage` puts a new session on the account with the most
+    /// quota left rather than the one with the fewest sessions; sessions
+    /// already placed stay where they are.
+    #[test]
+    fn distribute_by_usage_places_new_sessions_on_the_emptiest_account() {
+        let mut cfg = cfg_with(vec![acct("busy", 0), acct("idle", 0), acct("spare", 1)]);
+        pool_of(&mut cfg).distribute_sessions = true;
+        pool_of(&mut cfg).distribute_by = crate::config::DistributeBy::Usage;
+        let m = mgr(&cfg);
+        let id = |n: &str| m.account_ids().into_iter().find(|(_, x)| x == n).unwrap().0;
+        let (busy, idle, spare) = (id("busy"), id("idle"), id("spare"));
+        let now = now_ms();
+        let set = |acct: &str, five: f64, week: f64| {
+            m.with(|f| {
+                let x = f.account_mut(acct).unwrap();
+                x.quota.unified5h = window(five, 2 * HOUR, now);
+                x.quota.unified7d = window(week, 3 * 24 * HOUR, now);
+            })
+        };
+        set(&busy, 0.60, 0.20);
+        set(&idle, 0.10, 0.50);
+        set(&spare, 0.0, 0.0);
+        let sel = |sid: &str| match m.select(&SelectRequest { session_id: Some(sid), allow_probe: true, ..Default::default() }) {
+            Selection::Account(s) => s.name,
+            other => panic!("{other:?}"),
+        };
+        let (s1, s2, s3, s4) = (
+            "11111111-1111-1111-1111-111111111111",
+            "22222222-2222-2222-2222-222222222222",
+            "33333333-3333-3333-3333-333333333333",
+            "44444444-4444-4444-4444-444444444444",
+        );
+        // The lower 5h window wins although that account already has the
+        // sessions; by session count the next two would have gone to `busy`.
+        assert_eq!(sel(s1), "idle");
+        m.record_session(Some(s1), &idle, None);
+        assert_eq!(sel(s2), "idle", "still the emptier account, whatever it is serving");
+        m.record_session(Some(s2), &idle, None);
+        assert_eq!(sel("55555555-5555-5555-5555-555555555555"), "idle", "priority comes first: `spare` is unused but ranked later");
+
+        // Within a percent of each other, the weekly window decides…
+        set(&busy, 0.104, 0.20);
+        assert_eq!(sel(s3), "busy", "equal 5h (in whole percent), lower week");
+        // …and with both equal, the session count, so a burst of new sessions
+        // spreads before any response has moved a reading.
+        set(&busy, 0.104, 0.501);
+        assert_eq!(sel(s3), "busy", "equal readings: `idle` already serves two sessions");
+        m.record_session(Some(s3), &busy, None);
+        m.record_session(Some(s4), &busy, None);
+        m.record_session(Some("66666666-6666-6666-6666-666666666666"), &busy, None);
+        assert_eq!(sel("77777777-7777-7777-7777-777777777777"), "idle", "now `busy` serves more");
+
+        // A placed session does not move when the readings change.
+        set(&idle, 0.90, 0.90);
+        assert_eq!(sel(s1), "idle");
+        let _ = spare;
+
+        // By sessions (the default) the same fleet ignores the readings.
+        pool_of(&mut cfg).distribute_by = crate::config::DistributeBy::Sessions;
+        let m = mgr(&cfg);
+        let idle = m.account_ids().into_iter().find(|(_, x)| x == "idle").unwrap().0;
+        let busy = m.account_ids().into_iter().find(|(_, x)| x == "busy").unwrap().0;
+        m.with(|f| {
+            f.account_mut(&busy).unwrap().quota.unified5h = window(0.60, 2 * HOUR, now);
+            f.account_mut(&idle).unwrap().quota.unified5h = window(0.10, 2 * HOUR, now);
+        });
+        m.record_session(Some(s1), &idle, None);
+        let name = match m.select(&SelectRequest { session_id: Some(s2), allow_probe: true, ..Default::default() }) {
+            Selection::Account(s) => s.name,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(name, "busy", "fewest sessions, although its window is fuller");
     }
 
     /// With `distributeSessions`, new sessions spread by load only across

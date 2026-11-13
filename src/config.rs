@@ -367,12 +367,40 @@ pub enum LogLevel {
 /// exactly one implicit fleet. A pre-pools file is lifted into `pools.default`
 /// on load (see [`migrate_pools`]), so the on-disk shape below is what every
 /// install converges to.
+/// What `distributeSessions` weighs when it places a new session.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum DistributeBy {
+    /// The account serving the fewest sessions.
+    #[default]
+    Sessions,
+    /// The account with the most quota left: lowest 5h utilization, then
+    /// lowest weekly, then fewest sessions.
+    Usage,
+}
+
+impl DistributeBy {
+    pub fn is_default(&self) -> bool {
+        *self == DistributeBy::default()
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DistributeBy::Sessions => "sessions",
+            DistributeBy::Usage => "usage",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "camelCase", default)]
 pub struct PoolConfig {
     pub switch_threshold: Threshold,
     pub hold_seconds: u64,
     pub distribute_sessions: bool,
+    /// Only read while `distribute_sessions` is on.
+    #[serde(skip_serializing_if = "DistributeBy::is_default")]
+    pub distribute_by: DistributeBy,
     pub quota_probe_seconds: u64,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub blocked_models: Vec<String>,

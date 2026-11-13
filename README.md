@@ -140,9 +140,19 @@ rather than create an empty config beside your accounts.
   with per-account model mapping and request-field stripping.
 - Repairs orphaned `tool_use`/`tool_result` pairs so a compacted transcript
   cannot wedge a session with a non-retryable 400.
-- TUI with quota bars, reset countdowns, live activity log, account switching,
-  config reload and a one-shot quota probe. `corrall attach` shows the same
-  dashboard for a server that is already running, over its control API.
+- A terminal dashboard: accounts with quota bars and reset countdowns, a table
+  of the sessions being served (which session, on which account and model,
+  busy or idle, requests, tokens and cache hit rate), and the activity log
+  with what each request cost. From it: switch to an account, disable it, move
+  its priority, probe its quota, open it in detail, add an account by signing
+  in, import a Claude Code login, remove one, scroll the whole log, and change
+  the settings. `corrall attach` shows the same dashboard for a server that is
+  already running, and bare `corrall` attaches when there is one.
+- A GNOME Shell panel indicator with the fleet's 5h utilization, the accounts'
+  windows and the sessions with a request open (`corrall gnome install`, see
+  [docs/gnome-extension.md](docs/gnome-extension.md)).
+- Runs as a per-user service that starts at login: a `systemd --user` unit on
+  Linux, a launchd agent on macOS (`service install`).
 - OpenAI Codex subscriptions pooled alongside Claude accounts (`login --codex`,
   `import --codex`), rotating independently on the same port.
 - Expiry-pressure routing (`expiry on`): prefer the account whose ample weekly
@@ -150,13 +160,15 @@ rather than create an empty config beside your accounts.
 - Soonest-reset routing (`soonest-reset on`): spend first the week that ends
   first, then within weeks ending about the same time the 5h window that
   resets first, spreading sessions only across accounts that tie on both.
-- Keep-warm (`warmup N`), quota probe (`probe N`), session titles from Claude
-  Code's own files (`titles on`), usage dimensions for per-project attribution.
+- Keep-warm (`warmup N`), quota probe (`probe N`), session names and titles
+  from Claude Code's own files (`titles on`), usage dimensions for per-project
+  attribution.
 - Client-side OAuth token refresh and Remote Control (`/v1/code/*`, including
   its WebSocket) pass through untouched with the client's own credentials.
 - Browser dashboard at `/corrall/dashboard`, plus `/corrall/status`,
-  `/corrall/quota`, `/corrall/metrics` (Prometheus), `/corrall/health` and
-  `/corrall/activity` (the request/log feed as server-sent events).
+  `/corrall/quota`, `/corrall/sessions` (who is being served),
+  `/corrall/metrics` (Prometheus), `/corrall/health` and `/corrall/activity`
+  (the request/log feed as server-sent events).
 
 ## Everyday commands
 
@@ -164,17 +176,20 @@ rather than create an empty config beside your accounts.
 corrall accounts -v          # accounts with tier and token status
 corrall status               # live proxy status (needs a running server)
 corrall status --json
+corrall status --sessions    # ...and the sessions of the last hour: account, model, tokens, cache hit rate
 corrall attach               # live TUI for the running server (q to leave it running)
+corrall                      # the same when a server is running; starts one with its TUI when none is
 corrall switch <name>        # make the server prefer one account
 corrall disable <name>       # pause an account without removing it
 corrall priority <name> 1    # rotation order, lower = preferred
 corrall threshold 90         # switch at 90% (or: threshold unified7d=90)
 corrall distribute on        # spread sessions across equal-priority accounts
+corrall distribute usage     # ...putting each new session on the account with the most quota left
 corrall probe 300            # probe each account's quota every 300s, staggered (zero-spend)
 corrall warmup 600           # keep idle accounts' 5h windows running (spends a little)
 corrall expiry on            # expiry-pressure routing (--tolerance 1.5 --preempt on)
 corrall soonest-reset on     # spend the soonest-ending week first, then the soonest 5h window
-corrall titles on            # name activity rows after the Claude Code session
+corrall titles on            # name sessions the way Claude Code does, in the sessions table and the log
 corrall login --codex        # add an OpenAI Codex subscription
 corrall import --codex       # or import the Codex CLI's login
 corrall import-claudeacrobat --dry-run   # accounts from a claudeacrobat install
@@ -190,7 +205,8 @@ corrall login --pool work    # add an account to that pool
 corrall env --pool work      # export lines pointing at that pool
 corrall env                  # export lines for eval "$(corrall env)"; keeps Claude Code in first-party mode (deferred tool loading on)
 corrall env --api-key        # the pre-connectors form: ANTHROPIC_API_KEY, connectors off
-corrall setup claude         # point ~/.claude/settings.json at the proxy, replacing any other proxy set there
+corrall env --fish | source  # the same variables in fish syntax
+corrall setup claude         # point ~/.claude/settings.json at the proxy, replacing any other proxy set there (macOS: also sees that the service is running)
 corrall setup claude --pool work   # ...at one pool
 corrall setup claude --remove      # take it back out
 corrall ca-path              # where the MITM CA certificate lives
@@ -198,7 +214,9 @@ corrall config check         # validate and print a redacted config
 corrall server --listen 127.0.0.1:3457   # bind elsewhere for one run
 corrall update --check       # is there a newer release?
 corrall update               # install it and restart the service
-corrall service install      # systemd --user unit (Linux)
+corrall service install      # run at login: systemd --user unit (Linux), launchd agent (macOS)
+corrall service status       # what the service manager says; uninstall takes it out
+corrall gnome install        # GNOME Shell panel indicator (uninstall removes it)
 corrall --help
 ```
 
@@ -378,7 +396,7 @@ security changes above.
 
 Not ported (by choice): the unattended daily self-update (`update` is manual
 and verifying), the sx.org residential egress
-integration, the egress-IP guard, shell alias installation, the launchd service file, warm-up wall-clock schedules (interval
+integration, the egress-IP guard, shell alias installation, warm-up wall-clock schedules (interval
 mode only), and the Nix packaging.
 
 ## Paseo plugin
@@ -512,8 +530,8 @@ corrall update             # verify, swap, restart, health-check (rolls back on 
 
 `update` fetches the release through the GitHub CLI, verifies the archive
 against `SHA256SUMS` and its Sigstore signature, replaces the binary with an
-atomic rename (keeping the old one as `corrall.prev`), restarts the
-`systemd --user` unit if it was running, and waits for the health endpoint on
+atomic rename (keeping the old one as `corrall.prev`), restarts the service
+(the `systemd --user` unit or the launchd agent) if it was running, and waits for the health endpoint on
 the configured listener address (no `curl` needed). It
 never downgrades or crosses a major version unless told to (`--version`,
 `--allow-major`), refuses to overwrite a `cargo build` in a checkout, and never

@@ -44,6 +44,9 @@ pub enum Command {
         /// ANSI colors: auto, always or never
         #[arg(long, default_value = "auto")]
         color: String,
+        /// Also list the sessions served in the last hour: which, on what account and model, how busy and how well cached
+        #[arg(long)]
+        sessions: bool,
     },
     /// Show the TUI for a server that is already running (its status and
     /// activity over the control API)
@@ -89,7 +92,9 @@ pub enum Command {
         #[arg(long)]
         pool: Option<String>,
     },
-    /// Spread new sessions across equal-priority accounts (on|off)
+    /// Spread new sessions across equal-priority accounts (on|off), or name
+    /// what to balance on, which also turns it on: `sessions` (fewest sessions,
+    /// the default) or `usage` (most quota left)
     Distribute {
         value: Option<String>,
         #[arg(long)]
@@ -119,7 +124,7 @@ pub enum Command {
         #[arg(long)]
         pool: Option<String>,
     },
-    /// Session titles in the activity log (on|off)
+    /// Name sessions from Claude Code's own files, in the sessions table and the activity log (on|off)
     Titles { value: Option<String> },
     /// Per-model routing rules
     Route {
@@ -149,10 +154,15 @@ pub enum Command {
         #[command(subcommand)]
         cmd: Option<ConfigCmd>,
     },
-    /// Manage the user service (systemd --user on Linux)
+    /// Manage the user service (systemd --user on Linux, a launchd agent on macOS)
     Service {
         #[command(subcommand)]
         cmd: ServiceCmd,
+    },
+    /// The GNOME Shell panel indicator: quota and sessions in the top bar
+    Gnome {
+        #[command(subcommand)]
+        cmd: GnomeCmd,
     },
     /// Replace this binary with the latest release (verified; never runs unattended)
     Update(crate::update::UpdateArgs),
@@ -275,6 +285,9 @@ pub struct EnvArgs {
     /// Match pool rules against this directory instead of the current one
     #[arg(long, value_name = "DIR")]
     pub cwd: Option<String>,
+    /// Print fish syntax (`set -gx`), for `corrall env --fish | source`
+    #[arg(long)]
+    pub fish: bool,
 }
 
 #[derive(Args, Debug)]
@@ -322,7 +335,8 @@ pub struct PoolSetArgs {
     /// Switch threshold: a percent, or bucket=percent (bucket=default to clear)
     #[arg(long)]
     pub threshold: Option<String>,
-    /// Spread new sessions across equal-priority accounts (on|off)
+    /// Spread new sessions across equal-priority accounts (on|off), or name
+    /// what to balance on, which also turns it on: sessions|usage
     #[arg(long)]
     pub distribute: Option<String>,
     /// Background quota probe interval in seconds (off|N)
@@ -405,6 +419,10 @@ pub struct SetupClaudeArgs {
     /// Show what would change without writing anything
     #[arg(long)]
     pub dry_run: bool,
+    /// macOS: leave the launchd service alone. Without this, setup installs
+    /// and starts it when the proxy is not already running
+    #[arg(long, conflicts_with = "remove")]
+    pub no_service: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -414,10 +432,22 @@ pub enum ConfigCmd {
 }
 
 #[derive(Subcommand, Debug)]
-pub enum ServiceCmd {
-    Print,
+pub enum GnomeCmd {
+    /// Write the extension into ~/.local/share/gnome-shell/extensions and enable it
     Install,
+    /// Disable it and remove its directory
     Uninstall,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ServiceCmd {
+    /// Print the unit or plist that `install` would write
+    Print,
+    /// Write it for this binary and config, then start the service (and at every login)
+    Install,
+    /// Stop the service and remove its file
+    Uninstall,
+    /// Ask the service manager how it is doing
     Status,
 }
 
@@ -710,7 +740,7 @@ pub(crate) fn display_name(profile: &oauth::Profile, cfg: &Config) -> String {
 // ── commands ──────────────────────────────────────────────────
 
 pub async fn login(args: LoginArgs) -> Result<()> {
-    let mut cfg = Config::load_or_create()?;
+    let cfg = Config::load_or_create()?;
     crate::upstream::init(&cfg)?;
     let want_pool = args.pool.clone();
     if args.api {
@@ -764,36 +794,48 @@ pub async fn login(args: LoginArgs) -> Result<()> {
         return Ok(());
     }
     let tokens = if args.token { oauth::login_paste().await? } else { oauth::login_browser(!args.no_browser).await? };
+    let (cfg, lines) = save_login(&tokens, args.name.as_deref(), want_pool.as_deref()).await?;
+    for l in lines {
+        eprintln!("{l}");
+    }
+    notify_reload(&cfg).await;
+    Ok(())
+}
+
+/// Save a finished OAuth login as an account: a new one, or the account it
+/// already is, logged in again. Returns the config as written and what to
+/// tell the user; prints nothing, so the dashboard can call it too.
+pub async fn save_login(tokens: &oauth::Tokens, name: Option<&str>, pool: Option<&str>) -> Result<(Config, Vec<String>)> {
+    let mut lines = Vec::new();
     let profile = match oauth::fetch_profile(&tokens.access_token).await {
         Ok(p) => Some(p),
-        Err(e) if args.name.is_some() => {
-            eprintln!("Profile lookup failed ({e}); continuing with --name");
+        Err(e) if name.is_some() => {
+            lines.push(format!("Profile lookup failed ({e}); continuing with --name"));
             None
         }
         Err(e) => bail!("profile lookup failed: {e}. Retry, or pass --name to add the account without profile detection"),
     };
-    let name = args.name.clone().unwrap_or_else(|| display_name(profile.as_ref().unwrap(), &cfg));
+    let cfg = Config::load_or_create()?;
+    let name = name.map(str::to_string).unwrap_or_else(|| display_name(profile.as_ref().unwrap(), &cfg));
     let mut landed = String::new();
-    cfg = Config::update(|c| {
+    let cfg = Config::update(|c| {
         let found = locate_oauth(c, &name, profile.as_ref());
-        let pool = target_pool(c, want_pool.as_deref(), found.as_ref())?;
-        upsert_oauth(c, &pool, &name, &tokens, profile.as_ref());
+        let pool = target_pool(c, pool, found.as_ref())?;
+        upsert_oauth(c, &pool, &name, tokens, profile.as_ref());
         landed = pool;
         Ok(())
     })?;
-    if let Some(p) = &profile {
-        eprintln!(
+    lines.push(match &profile {
+        Some(p) => format!(
             "Logged in as {} ({}){}{}",
             name,
             p.org_name.clone().unwrap_or_else(|| "personal".into()),
             p.rate_limit_tier.as_ref().map(|t| format!(", tier {t}")).unwrap_or_default(),
             landed_note(&cfg, &landed)
-        );
-    } else {
-        eprintln!("Added account \"{name}\"{}", landed_note(&cfg, &landed));
-    }
-    notify_reload(&cfg).await;
-    Ok(())
+        ),
+        None => format!("Added account \"{name}\"{}", landed_note(&cfg, &landed)),
+    });
+    Ok((cfg, lines))
 }
 
 fn read_secret() -> Result<String> {
@@ -812,17 +854,17 @@ fn import_links(args: &ImportArgs, from: &str, own_file: &str) -> bool {
 }
 
 /// What a linked or copied import means for the login it came from.
-fn import_note(link: bool, from: &str, owner: &str) {
+fn import_note(link: bool, from: &str, owner: &str) -> String {
     if link {
-        eprintln!(
+        format!(
             "Linked to {from}: {owner} keeps refreshing this login and Corrall reads the file. \
              It goes stale while {owner} is not used here; `corrall login` adds a login Corrall refreshes itself."
-        );
+        )
     } else {
-        eprintln!(
+        format!(
             "Copied from {from}: Corrall now refreshes this login. Stop using {from} with {owner}, \
              or each refresh logs the other one out; `--link` shares it instead."
-        );
+        )
     }
 }
 
@@ -864,22 +906,37 @@ pub async fn import(args: ImportArgs) -> Result<()> {
             Ok(())
         })?;
         eprintln!("Imported Codex account \"{name}\"{}", landed_note(&cfg, &landed));
-        import_note(link, &from, "the Codex CLI");
+        eprintln!("{}", import_note(link, &from, "the Codex CLI"));
         notify_reload(&cfg).await;
         return Ok(());
     }
     let link = import_links(&args, &args.from, oauth::DEFAULT_CREDENTIALS_PATH);
-    let creds = oauth::import_credentials(&args.from)?;
-    let access = creds.access_token.clone().filter(|t| !t.is_empty()).ok_or_else(|| anyhow!("{} carries no access token", args.from))?;
+    let (cfg, lines) = import_login(&args.from, link, args.name.as_deref(), args.pool.as_deref()).await?;
+    for l in lines {
+        eprintln!("{l}");
+    }
+    notify_reload(&cfg).await;
+    Ok(())
+}
+
+/// Import the Claude Code login in the credentials file `from`: linked (the
+/// file stays the source and Claude Code keeps refreshing it) or copied.
+/// Returns the config as written and what to tell the user; prints nothing,
+/// so the dashboard can call it too.
+pub async fn import_login(from: &str, link: bool, name: Option<&str>, pool: Option<&str>) -> Result<(Config, Vec<String>)> {
+    let mut lines = Vec::new();
+    let cfg = Config::load_or_create()?;
+    let creds = oauth::import_credentials(from)?;
+    let access = creds.access_token.clone().filter(|t| !t.is_empty()).ok_or_else(|| anyhow!("{from} carries no access token"))?;
     let profile = match oauth::fetch_profile(&access).await {
         Ok(p) => Some(p),
-        Err(e) if args.name.is_some() => {
-            eprintln!("Profile lookup failed ({e}); continuing with --name");
+        Err(e) if name.is_some() => {
+            lines.push(format!("Profile lookup failed ({e}); continuing with --name"));
             None
         }
         Err(e) => bail!("profile lookup failed: {e}. Pass --name to import without profile detection"),
     };
-    let name = args.name.clone().unwrap_or_else(|| display_name(profile.as_ref().unwrap(), &cfg));
+    let name = name.map(str::to_string).unwrap_or_else(|| display_name(profile.as_ref().unwrap(), &cfg));
     let tokens = oauth::Tokens {
         access_token: access,
         refresh_token: creds.refresh_token.clone(),
@@ -889,15 +946,27 @@ pub async fn import(args: ImportArgs) -> Result<()> {
     let mut landed = String::new();
     let cfg = Config::update(|c| {
         let found = locate_oauth(c, &name, profile.as_ref());
-        let pool = target_pool(c, args.pool.as_deref(), found.as_ref())?;
+        let pool = target_pool(c, pool, found.as_ref())?;
         landed = pool.clone();
-        apply_import(c, &pool, &name, &tokens, profile.as_ref(), link.then_some(args.from.as_str()), creds.subscription_type.as_deref());
+        apply_import(c, &pool, &name, &tokens, profile.as_ref(), link.then_some(from), creds.subscription_type.as_deref());
         Ok(())
     })?;
-    eprintln!("Imported \"{name}\"{}", landed_note(&cfg, &landed));
-    import_note(link, &args.from, "Claude Code");
-    notify_reload(&cfg).await;
-    Ok(())
+    lines.push(format!("Imported \"{name}\"{}", landed_note(&cfg, &landed)));
+    lines.push(import_note(link, from, "Claude Code"));
+    Ok((cfg, lines))
+}
+
+/// Take an account out of its pool. `account` is anything that names it.
+/// Returns the config as written, the account's name and its pool.
+pub fn remove_account(pool: Option<&str>, account: &str) -> Result<(Config, String, String)> {
+    let (mut name, mut owner) = (String::new(), String::new());
+    let cfg = Config::update(|c| {
+        let (p, i) = locate(c, pool, account)?;
+        name = c.pool_mut(&p).expect("locate returns a configured pool").accounts.remove(i).name;
+        owner = p;
+        Ok(())
+    })?;
+    Ok((cfg, name, owner))
 }
 
 /// One account, mapped and with its destination pool resolved.
@@ -1110,10 +1179,18 @@ pub fn accounts(verbose: bool, pool: Option<String>) -> Result<()> {
     Ok(())
 }
 
-pub async fn status(json_out: bool, color: &str) -> Result<()> {
+pub async fn status(json_out: bool, color: &str, sessions: bool) -> Result<()> {
     let cfg = Config::load()?.ok_or_else(|| anyhow!("no config yet"))?;
     crate::upstream::init(&cfg)?;
     let mut st = control_get(&cfg, "/corrall/status").await?;
+    let listed = match sessions {
+        true => Some(
+            control_get(&cfg, "/corrall/sessions")
+                .await
+                .map_err(|e| anyhow!("{e}; --sessions needs a server with /corrall/sessions (update and restart it)"))?,
+        ),
+        false => None,
+    };
     // If the daemon has not yet finished its own release check (e.g. it started
     // moments ago), do one on demand so `status` still surfaces an available
     // update. Governed by the same `updateCheck` config flag as the daemon's
@@ -1126,6 +1203,9 @@ pub async fn status(json_out: bool, color: &str) -> Result<()> {
         }
     }
     if json_out {
+        if let Some(doc) = listed {
+            st["sessions"]["list"] = doc.get("sessions").cloned().unwrap_or(Value::Null);
+        }
         println!("{}", serde_json::to_string_pretty(&st)?);
     } else {
         let use_color = match color {
@@ -1134,6 +1214,15 @@ pub async fn status(json_out: bool, color: &str) -> Result<()> {
             _ => std::io::IsTerminal::is_terminal(&std::io::stdout()) && std::env::var_os("NO_COLOR").is_none(),
         };
         println!("{}", crate::status::render(&st, use_color, crate::quota::now_ms()));
+        if let Some(doc) = listed {
+            // As wide as the terminal; wide enough for every column in a pipe.
+            let width = match std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+                true => crossterm::terminal::size().map(|(w, _)| w).unwrap_or(120),
+                false => 200,
+            };
+            let multi = st.get("pools").and_then(Value::as_array).is_some_and(|p| p.len() > 1);
+            println!("\n{}", crate::session_table::render_text(&doc, multi, width));
+        }
     }
     Ok(())
 }
@@ -1186,12 +1275,8 @@ pub async fn switch(name: Option<String>, pool: Option<String>) -> Result<()> {
 }
 
 pub async fn remove(name: String, pool: Option<String>) -> Result<()> {
-    let cfg = Config::update(|c| {
-        let (p, i) = locate(c, pool.as_deref(), &name)?;
-        let removed = c.pool_mut(&p).expect("locate returns a configured pool").accounts.remove(i);
-        eprintln!("Removed \"{}\" from pool \"{p}\"", removed.name);
-        Ok(())
-    })?;
+    let (cfg, name, pool) = remove_account(pool.as_deref(), &name)?;
+    eprintln!("Removed \"{name}\" from pool \"{pool}\"");
     notify_reload(&cfg).await;
     Ok(())
 }
@@ -1230,7 +1315,7 @@ pub async fn priority(name: String, value: Option<i32>, first: bool, last: bool,
 }
 
 /// Apply a `PCT` or `bucket=PCT` threshold spec to `t` in place.
-fn set_threshold(t: &mut Threshold, v: &str) -> Result<()> {
+pub(crate) fn set_threshold(t: &mut Threshold, v: &str) -> Result<()> {
     if let Some((bucket, pct)) = v.split_once('=') {
         let mut table = match t {
             Threshold::Single(x) => std::collections::BTreeMap::from([("default".to_string(), *x)]),
@@ -1257,7 +1342,7 @@ fn set_threshold(t: &mut Threshold, v: &str) -> Result<()> {
 }
 
 /// Seconds from an `off|N` argument.
-fn parse_secs(v: &str, min: u64, what: &str) -> Result<u64> {
+pub(crate) fn parse_secs(v: &str, min: u64, what: &str) -> Result<u64> {
     let secs: u64 = if v.eq_ignore_ascii_case("off") { 0 } else { v.parse().context("seconds must be a number or off")? };
     if secs != 0 && secs < min {
         bail!("minimum {what} is {min} seconds");
@@ -1291,18 +1376,41 @@ fn parse_on_off(v: &str) -> Result<bool> {
     }
 }
 
+/// A `distribute` value: `on`/`off`, or what to balance new sessions on
+/// (`sessions`, `usage`), which also turns distribution on.
+pub fn parse_distribute(v: &str) -> Result<(bool, Option<crate::config::DistributeBy>)> {
+    use crate::config::DistributeBy;
+    match v.to_ascii_lowercase().as_str() {
+        "sessions" => Ok((true, Some(DistributeBy::Sessions))),
+        "usage" => Ok((true, Some(DistributeBy::Usage))),
+        other => parse_on_off(other).map(|on| (on, None)).map_err(|_| anyhow!("expected on, off, sessions or usage")),
+    }
+}
+
+/// `on (by usage)`, `on (by sessions)` or `off`.
+pub fn describe_distribute(p: &crate::config::PoolConfig) -> String {
+    match p.distribute_sessions {
+        true => format!("on (by {})", p.distribute_by.as_str()),
+        false => "off".to_string(),
+    }
+}
+
 pub async fn distribute(value: Option<String>, pool: Option<String>) -> Result<()> {
     let cfg = match value {
         None => {
             let c = Config::load()?.unwrap_or_default();
-            println!("distributeSessions: {}", if pool_of(&c, pool.as_deref())?.distribute_sessions { "on" } else { "off" });
+            println!("distributeSessions: {}", describe_distribute(pool_of(&c, pool.as_deref())?));
             return Ok(());
         }
         Some(v) => {
-            let on = parse_on_off(&v)?;
+            let (on, by) = parse_distribute(&v)?;
             Config::update(|c| {
-                pool_mut_of(c, pool.as_deref())?.distribute_sessions = on;
-                eprintln!("distributeSessions: {}", if on { "on" } else { "off" });
+                let p = pool_mut_of(c, pool.as_deref())?;
+                p.distribute_sessions = on;
+                if let Some(by) = by {
+                    p.distribute_by = by;
+                }
+                eprintln!("distributeSessions: {}", describe_distribute(p));
                 Ok(())
             })?
         }
@@ -1519,7 +1627,11 @@ pub async fn pool(cmd: Option<PoolCmd>) -> Result<()> {
                     crate::security::safe_text(&format!("{name}{star}"), 18),
                     p.accounts.len(),
                     serde_json::to_string(&p.switch_threshold)?,
-                    if p.distribute_sessions { "on" } else { "off" },
+                    match (p.distribute_sessions, p.distribute_by) {
+                        (false, _) => "off",
+                        (true, crate::config::DistributeBy::Sessions) => "on",
+                        (true, crate::config::DistributeBy::Usage) => "usage",
+                    },
                     match p.quota_probe_seconds {
                         0 => "off".to_string(),
                         n => format!("{n}s"),
@@ -1623,7 +1735,7 @@ fn apply_pool_set(c: &mut Config, name: &str, set: &PoolSetArgs) -> Result<()> {
         c.pool_mut(name).expect("caller created the pool").accounts.push(a);
     }
     let probe = set.probe.as_deref().map(|v| parse_secs(v, 30, "probe interval")).transpose()?;
-    let distribute = set.distribute.as_deref().map(parse_on_off).transpose()?;
+    let distribute = set.distribute.as_deref().map(parse_distribute).transpose()?;
     let fallback = set.fallback.as_deref().map(|f| pool_name(c, Some(f))).transpose()?;
     if fallback.as_deref() == Some(name) {
         bail!("pool \"{name}\" cannot fall back to itself");
@@ -1632,8 +1744,11 @@ fn apply_pool_set(c: &mut Config, name: &str, set: &PoolSetArgs) -> Result<()> {
     if let Some(t) = &set.threshold {
         set_threshold(&mut p.switch_threshold, t)?;
     }
-    if let Some(on) = distribute {
+    if let Some((on, by)) = distribute {
         p.distribute_sessions = on;
+        if let Some(by) = by {
+            p.distribute_by = by;
+        }
     }
     if let Some(secs) = probe {
         p.quota_probe_seconds = secs;
@@ -1880,10 +1995,23 @@ pub fn env(args: EnvArgs) -> Result<()> {
     if !args.no_mitm {
         crate::proxy::mitm::ensure_certs(&["api.anthropic.com".to_string()])?;
     }
-    for l in env_lines_with(&cfg, !args.no_mitm, pin.as_deref(), pool.as_deref(), KeyMode::from_flag(args.api_key)) {
+    let lines = env_lines_with(&cfg, !args.no_mitm, pin.as_deref(), pool.as_deref(), KeyMode::from_flag(args.api_key));
+    let lines = if args.fish { fish_lines(&env_ops(&lines)) } else { lines };
+    for l in lines {
         println!("{l}");
     }
     Ok(())
+}
+
+/// The same variables for fish, which has neither `export K=V` nor `unset`.
+/// Inside fish's single quotes only `\` and `'` are special.
+pub fn fish_lines(ops: &[EnvOp]) -> Vec<String> {
+    ops.iter()
+        .map(|op| match op {
+            EnvOp::Set(k, v) => format!("set -gx {k} '{}'", v.replace('\\', "\\\\").replace('\'', "\\'")),
+            EnvOp::Unset(k) => format!("set -e {k}"),
+        })
+        .collect()
 }
 
 pub async fn run(args: RunArgs) -> Result<()> {
@@ -1985,16 +2113,101 @@ async fn setup_claude(args: SetupClaudeArgs) -> Result<()> {
             exported.join(", ")
         );
     }
-    if !args.dry_run {
+    // On macOS nothing else brings the proxy up at login, and settings that
+    // point at a proxy that is not there break every Claude Code session. So
+    // there setup also sees to the launchd service.
+    let launchd = crate::service::Kind::native() == Some(crate::service::Kind::Launchd);
+    if launchd || !args.dry_run {
         crate::upstream::init(&cfg)?;
-        if control_get(&cfg, "/corrall/health").await.is_err() {
-            eprintln!(
-                "  warning: the proxy is not running on port {}; Claude Code cannot connect until it is (`corrall server`, or `corrall service install`)",
-                cfg.proxy.port
-            );
-        }
+    }
+    if launchd {
+        ensure_service(&cfg, args.dry_run, args.no_service).await;
+    } else if !args.dry_run && control_get(&cfg, "/corrall/health").await.is_err() {
+        eprintln!(
+            "  warning: the proxy is not running on port {}; Claude Code cannot connect until it is (`corrall server`, or `corrall service install`)",
+            cfg.proxy.port
+        );
     }
     Ok(())
+}
+
+/// `setup claude` and `setup claude --remove` for the default settings file,
+/// from the dashboard: the same edit and the same backup, with what happened
+/// returned in one line instead of printed. Key names only, never values.
+pub fn point_claude_code(cfg: &Config, remove: bool) -> Result<String> {
+    use crate::claude_setup::{self, SettingsFile};
+    let mut file = SettingsFile::read(&claude_setup::default_path()?)?;
+    // The outcome first: this is read in one line of a terminal.
+    let shown = crate::tui_screens::tilde(&file.path);
+    if remove {
+        let report = claude_setup::strip(&mut file.value, cfg)?;
+        if !report.changed() {
+            return Ok(format!("nothing to remove: {shown} does not point Claude Code at the proxy"));
+        }
+        file.write(false)?;
+        return Ok(format!("the proxy was taken out of {shown}"));
+    }
+    let ops = env_ops(&env_lines_with(cfg, false, None, None, KeyMode::Header));
+    let report = claude_setup::apply(&mut file.value, &ops)?;
+    if !report.changed() {
+        return Ok(format!("Claude Code already points at the proxy ({shown})"));
+    }
+    let holds_key = ops.iter().any(|op| matches!(op, EnvOp::Set(k, _) if k == "ANTHROPIC_CUSTOM_HEADERS" || k == "ANTHROPIC_API_KEY"));
+    file.write(holds_key)?;
+    let removed = if report.removed.is_empty() { String::new() } else { format!(", replacing {}", report.removed.join(", ")) };
+    Ok(format!("Claude Code now points at the proxy{removed}; restart its sessions ({shown})"))
+}
+
+/// Ask for `/corrall/health` until it answers or `budget` runs out.
+async fn proxy_answers(cfg: &Config, budget: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        if control_get(cfg, "/corrall/health").await.is_ok() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+}
+
+/// The service half of `setup claude`: check that the proxy runs as a service,
+/// and install and start that service when nothing is serving at all. Never an
+/// error: the settings are already written, so what is wrong is reported.
+async fn ensure_service(cfg: &Config, dry_run: bool, no_service: bool) {
+    use crate::service::{self, Ensure};
+    use std::time::Duration;
+    let Some(kind) = service::Kind::native() else { return };
+    let (name, port) = (kind.name(), cfg.proxy.port);
+    let silent = |after: &str| {
+        eprintln!("  warning: the service ({name}) is {after} but the proxy does not answer on port {port}; its log says why: {}", kind.logs_hint())
+    };
+    match service::ensure_plan(service::state(), proxy_answers(cfg, Duration::ZERO).await) {
+        Ensure::Unsupported => {}
+        Ensure::Fine => eprintln!("  service: the proxy is running as a service ({name}) and starts at login"),
+        // Long enough for a start in progress, short enough not to hang on a
+        // service that is failing.
+        Ensure::Wait if proxy_answers(cfg, Duration::from_secs(12)).await => {
+            eprintln!("  service: the proxy is running as a service ({name}) and starts at login")
+        }
+        Ensure::Wait => silent("loaded"),
+        Ensure::ByHand => eprintln!(
+            "  warning: the proxy answers on port {port}, but nothing keeps it running: it was started by hand and stops with its terminal. Stop it, then run `corrall service install` so it starts at login"
+        ),
+        Ensure::Install if no_service => {
+            eprintln!("  warning: the proxy is not running on port {port} and --no-service left the service alone; Claude Code cannot connect until `corrall server` or `corrall service install`")
+        }
+        Ensure::Install if dry_run => eprintln!("  service: the proxy is not running; the service ({name}) would be installed and started"),
+        Ensure::Install => match service::install() {
+            Ok(path) if proxy_answers(cfg, Duration::from_secs(15)).await => {
+                eprintln!("  service: the proxy was not running, so it is now installed as a service ({name}) that starts at login");
+                eprintln!("           {} (`corrall service uninstall` takes it out)", path.display());
+            }
+            Ok(_) => silent("installed"),
+            Err(e) => eprintln!("  warning: the proxy is not running and installing the service failed: {e:#}"),
+        },
+    }
 }
 
 pub fn ca_path() -> Result<()> {
@@ -2030,49 +2243,6 @@ pub fn config_cmd(cmd: Option<ConfigCmd>) -> Result<()> {
             };
             eprintln!("config OK: {} account(s){pools}, bind {}:{}", cfg.all_accounts().count(), cfg.bind_host(), cfg.proxy.port);
             Ok(())
-        }
-    }
-}
-
-pub fn service(cmd: ServiceCmd) -> Result<()> {
-    if !cfg!(target_os = "linux") {
-        bail!("service management is implemented for systemd --user on Linux only");
-    }
-    let exe = std::env::current_exe()?;
-    let unit = format!(
-        "[Unit]\nDescription=Corrall multi-account Claude proxy\nAfter=network-online.target\n\n[Service]\nExecStart={} server --headless\nRestart=on-failure\nRestartSec=3\nEnvironment=CORRALL_CONFIG={}\nNoNewPrivileges=yes\nPrivateTmp=yes\nProtectSystem=strict\nReadWritePaths={}\n\n[Install]\nWantedBy=default.target\n",
-        exe.display(),
-        crate::config::config_path().display(),
-        crate::config::config_dir().display()
-    );
-    let dir: PathBuf = dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("systemd/user");
-    let path = dir.join("corrall.service");
-    match cmd {
-        ServiceCmd::Print => {
-            print!("{unit}");
-            Ok(())
-        }
-        ServiceCmd::Install => {
-            std::fs::create_dir_all(&dir)?;
-            std::fs::write(&path, unit)?;
-            let _ = std::process::Command::new("systemctl").args(["--user", "daemon-reload"]).status();
-            let st = std::process::Command::new("systemctl").args(["--user", "enable", "--now", "corrall.service"]).status()?;
-            if !st.success() {
-                bail!("systemctl enable failed");
-            }
-            eprintln!("installed {}", path.display());
-            Ok(())
-        }
-        ServiceCmd::Uninstall => {
-            let _ = std::process::Command::new("systemctl").args(["--user", "disable", "--now", "corrall.service"]).status();
-            let _ = std::fs::remove_file(&path);
-            let _ = std::process::Command::new("systemctl").args(["--user", "daemon-reload"]).status();
-            eprintln!("removed {}", path.display());
-            Ok(())
-        }
-        ServiceCmd::Status => {
-            let st = std::process::Command::new("systemctl").args(["--user", "status", "corrall.service", "--no-pager"]).status()?;
-            std::process::exit(st.code().unwrap_or(1));
         }
     }
 }
@@ -2166,6 +2336,47 @@ mod tests {
             assert!(!lines.contains("ENABLE_TOOL_SEARCH"), "{lines}");
             assert!(!lines.contains("FIRST_PARTY"), "{lines}");
         }
+    }
+
+    #[test]
+    fn fish_gets_the_same_variables_in_its_own_syntax() {
+        let mut cfg = Config::default();
+        cfg.proxy.api_key = "tc-secret-0123456789abcdef".into();
+        cfg.proxy.require_key_on_loopback = true;
+        let lines = env_lines_with(&cfg, false, None, None, KeyMode::Header);
+        let fish = fish_lines(&env_ops(&lines));
+        assert_eq!(fish.len(), lines.len(), "one line each");
+        assert!(fish.contains(&"set -gx ANTHROPIC_BASE_URL 'http://127.0.0.1:3456'".to_string()), "{fish:?}");
+        assert!(fish.contains(&"set -gx ANTHROPIC_CUSTOM_HEADERS 'x-corrall-key: tc-secret-0123456789abcdef'".to_string()), "{fish:?}");
+        assert!(fish.iter().all(|l| l.starts_with("set -gx ") || l.starts_with("set -e ")), "{fish:?}");
+        for (bash, fish) in lines.iter().zip(&fish) {
+            assert_eq!(bash.starts_with("unset "), fish.starts_with("set -e "), "{bash} / {fish}");
+        }
+        // Only a quote and a backslash need escaping inside fish's quotes.
+        let odd = fish_lines(&[EnvOp::Set("K".into(), r"it's a \ path $HOME".into()), EnvOp::Unset("GONE".into())]);
+        assert_eq!(odd, [r"set -gx K 'it\'s a \\ path $HOME'", "set -e GONE"]);
+    }
+
+    #[test]
+    fn distribute_takes_a_switch_or_what_to_balance_on() {
+        use crate::config::DistributeBy;
+        assert_eq!(parse_distribute("on").unwrap(), (true, None));
+        assert_eq!(parse_distribute("OFF").unwrap(), (false, None));
+        assert_eq!(parse_distribute("usage").unwrap(), (true, Some(DistributeBy::Usage)));
+        assert_eq!(parse_distribute("sessions").unwrap(), (true, Some(DistributeBy::Sessions)));
+        assert!(parse_distribute("random").unwrap_err().to_string().contains("on, off, sessions or usage"));
+        let mut p = crate::config::PoolConfig::default();
+        assert_eq!(describe_distribute(&p), "off");
+        (p.distribute_sessions, p.distribute_by) = (true, DistributeBy::Usage);
+        assert_eq!(describe_distribute(&p), "on (by usage)");
+        // The balance is only written to the file when it is not the default.
+        let json = serde_json::to_value(&p).unwrap();
+        assert_eq!(json["distributeBy"], "usage");
+        assert!(serde_json::to_value(crate::config::PoolConfig::default()).unwrap().get("distributeBy").is_none());
+        assert_eq!(
+            serde_json::from_value::<crate::config::PoolConfig>(serde_json::json!({ "distributeBy": "usage" })).unwrap().distribute_by,
+            DistributeBy::Usage
+        );
     }
 
     #[test]

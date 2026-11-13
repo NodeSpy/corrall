@@ -12,14 +12,15 @@
 #      Sigstore signature and build provenance.
 #   2. Backs up the config and state file: ~/.config/corrall.json, or
 #      ~/.config/teamclaude.json when only that one exists.
-#   3. Stops the systemd --user unit (corrall.service or teamclaude.service).
+#   3. Stops the service: the systemd --user unit (corrall.service or
+#      teamclaude.service), or on macOS the com.nodespy.corrall launchd agent.
 #   4. Migrates a TeamClaude install: renames teamclaude.json, its .state.json
 #      and the teamclaude-*.pem MITM certificates to corrall.*, removes the
 #      teamclaude.service unit, the ~/.local/bin/teamclaude binary and the npm
 #      global @karpeleslab/teamclaude (remembering its version).
 #   5. Installs the binary to ~/.local/bin/corrall and validates the config.
-#   6. Writes corrall.service in place of a migrated unit, restarts it if it
-#      was running, and waits for /corrall/health.
+#   6. Writes corrall.service in place of a migrated unit, restarts the service
+#      if it was running, and waits for /corrall/health.
 #   Any failure after step 3 rolls everything back automatically.
 #
 # The repository is private: downloads go through `gh` (GitHub CLI), which must
@@ -39,6 +40,10 @@ LEGACY_STATE="${LEGACY_CONFIG%.json}.state.json"
 UNIT="$NAME.service"
 LEGACY_UNIT="$LEGACY_NAME.service"
 UNIT_DIR="$CONFIG_DIR/systemd/user"
+# The launchd agent `corrall service install` sets up on macOS.
+AGENT_LABEL="com.nodespy.$NAME"
+AGENT_PLIST="$HOME/Library/LaunchAgents/$AGENT_LABEL.plist"
+AGENT_LOG="$HOME/Library/Logs/$NAME.log"
 NPM_PKG="@karpeleslab/teamclaude"
 # MITM certificate files, `<name>-<suffix>`, beside the config file.
 CERT_SUFFIXES="ca.pem leaf.pem leaf.key"
@@ -50,7 +55,7 @@ MANAGE_NPM=1
 STAMP="$(date +%Y%m%d-%H%M%S)"
 ROLLBACK_FILE="${CONFIG%.json}.rollback"
 
-usage() { sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
+usage() { sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
 log() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33mwarning:\033[0m %s\n' "$*" >&2; }
 die() { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
@@ -91,14 +96,30 @@ target_triple() {
 unit_present() { [ "$MANAGE_SERVICE" = 1 ] && command -v systemctl >/dev/null 2>&1 && systemctl --user list-unit-files "$1" 2>/dev/null | grep -q "$1"; }
 unit_active() { unit_present "$1" && systemctl --user is-active --quiet "$1"; }
 unit_enabled() { unit_present "$1" && systemctl --user is-enabled --quiet "$1" 2>/dev/null; }
+agent_target() { printf 'gui/%s/%s' "$(id -u)" "$AGENT_LABEL"; }
+agent_loaded() { [ "$MANAGE_SERVICE" = 1 ] && command -v launchctl >/dev/null 2>&1 && launchctl print "$(agent_target)" >/dev/null 2>&1; }
+# `bootout` returns before the job is gone; the binary is swapped only after.
+agent_stop() {
+  run launchctl bootout "$(agent_target)" || true
+  [ "$DRY_RUN" = 1 ] && return 0
+  for _ in $(seq 1 40); do agent_loaded || return 0; sleep 0.25; done
+  return 0
+}
 npm_version() { [ "$MANAGE_NPM" = 1 ] && command -v npm >/dev/null 2>&1 && npm ls -g --depth=0 --json 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("dependencies",{}).get("'"$NPM_PKG"'",{}).get("version",""))' 2>/dev/null || true; }
 
-# $1 = control-plane prefix (corrall or teamclaude), $2 = config file to read the port from
+# $1 = control-plane prefix (corrall or teamclaude), $2 = config file to read the port and key from
+#
+# The proxy key goes with the request: a server with proxy.requireKeyOnLoopback
+# answers a keyless poll 401, which would read as unhealthy and roll the swap
+# back. It reaches curl as a config line on stdin, never on a command line.
 wait_healthy() {
   local prefix="$1" cfgfile="$2" port
   port="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("proxy",{}).get("port",3456))' "$cfgfile" 2>/dev/null || echo 3456)"
   for _ in $(seq 1 30); do
-    if curl -fsS "http://127.0.0.1:${port}/${prefix}/health" >/dev/null 2>&1; then return 0; fi
+    if python3 -c 'import json,sys
+key = json.load(open(sys.argv[1])).get("proxy", {}).get("apiKey", "")
+if key and "\"" not in key and "\\" not in key and "\n" not in key:
+    print("header = \"x-api-key: %s\"" % key)' "$cfgfile" 2>/dev/null | curl -fsS -K - "http://127.0.0.1:${port}/${prefix}/health" >/dev/null 2>&1; then return 0; fi
     sleep 0.5
   done
   return 1
@@ -120,6 +141,9 @@ rollback() {
   log "Rolling back to the previous installation"
   unit_present "$UNIT" && { run systemctl --user stop "$UNIT" || true; }
   unit_present "$LEGACY_UNIT" && { run systemctl --user stop "$LEGACY_UNIT" || true; }
+  # Whichever binary the agent was running, it comes back on the restored one.
+  local agent_running=0
+  agent_loaded && { agent_running=1; agent_stop; }
 
   if [ -n "${PREV_BINARY_BACKUP:-}" ] && [ -f "$PREV_BINARY_BACKUP" ]; then
     run cp -f "$PREV_BINARY_BACKUP" "$INSTALL_DIR/$NAME"
@@ -168,6 +192,11 @@ rollback() {
     run systemctl --user daemon-reload
     run systemctl --user start "$unit"
     if [ "$DRY_RUN" = 0 ] && wait_healthy "$prefix" "$live_config"; then log "Previous installation is serving again"; else warn "service restarted but health check did not pass; inspect: journalctl --user -u $unit"; fi
+  fi
+  if { [ "${AGENT_WAS_LOADED:-0}" = 1 ] || [ "$agent_running" = 1 ]; } && [ -f "$AGENT_PLIST" ]; then
+    # The plist names the binary by path, which now holds the previous one.
+    run launchctl bootstrap "gui/$(id -u)" "$AGENT_PLIST" || true
+    if [ "$DRY_RUN" = 0 ] && wait_healthy "$NAME" "$live_config"; then log "Previous installation is serving again"; else warn "launchd agent reloaded but health check did not pass; inspect: $AGENT_LOG"; fi
   fi
   log "Rollback complete"
 }
@@ -224,6 +253,7 @@ log "New binary: $("$NEW_BIN" --version)"
 WAS_ACTIVE=0; ACTIVE_UNIT=""
 if unit_active "$UNIT"; then WAS_ACTIVE=1; ACTIVE_UNIT="$UNIT"
 elif unit_active "$LEGACY_UNIT"; then WAS_ACTIVE=1; ACTIVE_UNIT="$LEGACY_UNIT"; fi
+AGENT_WAS_LOADED=0; agent_loaded && AGENT_WAS_LOADED=1
 MIGRATE_UNIT=0; unit_present "$LEGACY_UNIT" && MIGRATE_UNIT=1
 LEGACY_UNIT_ENABLED=0; unit_enabled "$LEGACY_UNIT" && LEGACY_UNIT_ENABLED=1
 MIGRATE_CONFIG=0
@@ -270,6 +300,7 @@ if [ "$DRY_RUN" = 0 ]; then
   cat > "$ROLLBACK_FILE" <<REC
 WAS_ACTIVE=$WAS_ACTIVE
 ACTIVE_UNIT=$ACTIVE_UNIT
+AGENT_WAS_LOADED=$AGENT_WAS_LOADED
 MIGRATED_UNIT=$MIGRATE_UNIT
 MIGRATED_CONFIG=$MIGRATE_CONFIG
 LEGACY_UNIT_ENABLED=$LEGACY_UNIT_ENABLED
@@ -302,13 +333,17 @@ if [ "$WAS_ACTIVE" = 1 ]; then
   log "Stopping $ACTIVE_UNIT"
   run systemctl --user stop "$ACTIVE_UNIT"
 fi
-# A server that is not the unit we just stopped must not share the config.
+if [ "$AGENT_WAS_LOADED" = 1 ]; then
+  log "Stopping the launchd agent $AGENT_LABEL"
+  agent_stop
+fi
+# A server that is not the service we just stopped must not share the config.
 unit_pids="$( { unit_present "$UNIT" && systemctl --user show -p MainPID --value "$UNIT" 2>/dev/null; unit_present "$LEGACY_UNIT" && systemctl --user show -p MainPID --value "$LEGACY_UNIT" 2>/dev/null; echo 0; } | tr ' ' '\n')"
 own="$(printf '%s\n' "$$" "$BASHPID"; pgrep -P "$$" 2>/dev/null || true)"
 strays="$(pgrep -f "(^|/)($NAME|$LEGACY_NAME) server" 2>/dev/null | grep -vxF -f <(printf '%s\n' "$unit_pids") | grep -vxF -f <(printf '%s\n' "$own") || true)"
 if [ -n "$strays" ] && [ "$DRY_RUN" = 0 ]; then
   if [ "$MANAGE_SERVICE" = 1 ]; then
-    die "a $NAME/$LEGACY_NAME server is running outside systemd (pid $strays); stop it first so two instances never share the config"
+    die "a $NAME/$LEGACY_NAME server is running outside its service (pid $strays); stop it first so two instances never share the config"
   else
     warn "another $NAME/$LEGACY_NAME server is running (pid $strays); make sure it does not use $CONFIG"
   fi
@@ -367,10 +402,19 @@ if [ "$WAS_ACTIVE" = 1 ]; then
     log "Proxy is healthy"
     CORRALL_CONFIG="$CONFIG" "$INSTALL_DIR/$NAME" status || true
   fi
+elif [ "$AGENT_WAS_LOADED" = 1 ]; then
+  log "Starting the launchd agent $AGENT_LABEL"
+  # Rewrites the plist for the binary just installed, then loads it.
+  run env CORRALL_CONFIG="$CONFIG" "$INSTALL_DIR/$NAME" service install
+  if [ "$DRY_RUN" = 0 ]; then
+    wait_healthy "$NAME" "$CONFIG" || { tail -n 20 "$AGENT_LOG" >&2 || true; false; }
+    log "Proxy is healthy"
+    CORRALL_CONFIG="$CONFIG" "$INSTALL_DIR/$NAME" status || true
+  fi
 elif unit_present "$UNIT"; then
   log "Unit exists but was not running; leaving it stopped (systemctl --user start $UNIT)"
 else
-  log "No systemd unit found. Start with: $NAME server   (or: $NAME service install)"
+  log "No service found. Start with: $NAME server   (or, to run it at every login: $NAME service install)"
 fi
 
 trap - ERR

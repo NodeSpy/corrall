@@ -1,0 +1,8 @@
+{
+  "uuid": "corrall@nodespy.github.io",
+  "name": "corrall",
+  "description": "Shows the corrall proxy status: how full the Claude accounts' 5h/7d windows are, which accounts can serve, and the sessions with a request open.",
+  "shell-version": ["48", "49", "50", "51"],
+  "url": "https://github.com/NodeSpy/corrall",
+  "version-name": "0.1.0"
+}

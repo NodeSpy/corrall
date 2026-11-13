@@ -309,6 +309,32 @@ impl Pools {
         st
     }
 
+    /// The sessions document (`GET /corrall/sessions`, the TUI's sessions
+    /// table): one row per session heard from in the last hour across every
+    /// pool, those with a request open first, each with what `titles` knows
+    /// of its name. At most `limit` rows; the counts cover them all.
+    pub fn sessions(&self, titles: &crate::titles::Titles, limit: usize) -> Value {
+        let now = crate::quota::now_ms();
+        let (mut active, mut known, mut rows) = (0usize, 0usize, Vec::new());
+        for (_, m) in self.each() {
+            let (stats, mut pool_rows) = m.with(|f| (f.sessions.stats(now), f.session_rows(now, limit)));
+            active += stats.active;
+            known += stats.known;
+            rows.append(&mut pool_rows);
+        }
+        // Each pool's rows arrive ordered; merge them into one ordering.
+        let key = |r: &Value| (r["inFlight"].as_u64().unwrap_or(0) == 0, r["idleMs"].as_i64().unwrap_or(i64::MAX));
+        rows.sort_by_key(key);
+        rows.truncate(limit);
+        for r in &mut rows {
+            let info = titles.info(r["id"].as_str(), now);
+            r["name"] = json!(info.display());
+            r["title"] = json!(info.title);
+            r["project"] = json!(info.project());
+        }
+        json!({ "active": active, "known": known, "names": titles.enabled(), "shown": rows.len(), "sessions": rows })
+    }
+
     /// Snapshot every pool's runtime state into one file-shaped `State`.
     pub fn export_state(&self) -> State {
         let default = self.default_name();
