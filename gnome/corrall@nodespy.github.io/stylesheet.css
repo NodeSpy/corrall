@@ -1,0 +1,105 @@
+/* corrall GNOME Shell extension */
+
+.corrall-panel-label {
+    padding-left: 4px;
+}
+
+.corrall-menu {
+    min-width: 380px;
+}
+
+.corrall-header-row {
+    spacing: 16px;
+}
+
+.corrall-header {
+    font-weight: bold;
+}
+
+.corrall-account {
+    spacing: 3px;
+    padding-top: 4px;
+    padding-bottom: 4px;
+}
+
+.corrall-account-title {
+    spacing: 8px;
+}
+
+.corrall-account-name {
+    font-weight: bold;
+}
+
+.corrall-badge {
+    font-size: 0.85em;
+    padding: 1px 7px;
+    border-radius: 9px;
+    background-color: rgba(128, 128, 128, 0.22);
+}
+
+.corrall-badge-active {
+    background-color: rgba(51, 209, 122, 0.28);
+}
+
+.corrall-badge-cooling {
+    background-color: rgba(224, 27, 36, 0.32);
+}
+
+.corrall-badge-warn {
+    background-color: rgba(246, 211, 45, 0.32);
+}
+
+.corrall-flags {
+    font-family: monospace;
+    font-size: 0.95em;
+}
+
+.corrall-flag-ok {
+    color: #33d17a;
+}
+
+.corrall-flag-spent {
+    color: #e01b24;
+}
+
+.corrall-bar-row {
+    spacing: 8px;
+}
+
+.corrall-bar-label {
+    font-size: 0.85em;
+    min-width: 52px;
+}
+
+.corrall-bar {
+    height: 7px;
+    min-width: 120px;
+}
+
+.corrall-bar-pct {
+    font-family: monospace;
+    font-size: 0.9em;
+    min-width: 34px;
+    text-align: right;
+}
+
+.corrall-bar-reset {
+    font-size: 0.85em;
+    min-width: 118px;
+}
+
+.corrall-session {
+    spacing: 8px;
+}
+
+.corrall-session-name {
+    min-width: 150px;
+}
+
+.corrall-session-meta {
+    font-size: 0.85em;
+}
+
+.corrall-footer {
+    font-size: 0.85em;
+}

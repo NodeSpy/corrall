@@ -73,6 +73,11 @@ pub enum Activity {
         session: Option<String>,
         client: Option<String>,
         label: Option<String>,
+        /// Size of the request body, and how many tool definitions it carries
+        /// in full. A session that sends megabytes each turn, most of it tool
+        /// schemas, is one started without deferred tool loading.
+        bytes: u64,
+        tools: Option<u32>,
     },
     Account {
         id: String,
@@ -84,8 +89,66 @@ pub enum Activity {
         status: u16,
         elapsed_ms: u128,
         ok: bool,
+        /// What the response said it used, when it said.
+        tokens: Option<TokenUse>,
     },
     Log(String),
+}
+
+/// One response's token usage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TokenUse {
+    pub input: i64,
+    pub cache_read: i64,
+    pub cache_creation: i64,
+    pub output: i64,
+}
+
+impl TokenUse {
+    /// From an Anthropic `usage` object. `None` when it counts nothing.
+    pub fn from_usage(usage: &Value) -> Option<TokenUse> {
+        let g = |k: &str| usage.get(k).and_then(Value::as_i64).unwrap_or(0);
+        let t = TokenUse {
+            input: g("input_tokens"),
+            cache_read: g("cache_read_input_tokens"),
+            cache_creation: g("cache_creation_input_tokens"),
+            output: g("output_tokens"),
+        };
+        (t.prompt() + t.output > 0).then_some(t)
+    }
+
+    /// Every prompt token, cached or not.
+    pub fn prompt(&self) -> i64 {
+        self.input + self.cache_read + self.cache_creation
+    }
+
+    /// `184.2k in (96% cached), 250 out`: what a request cost, for a log line.
+    pub fn note(&self) -> String {
+        use crate::session_table::token_count;
+        let cached = match self.prompt() {
+            0 => String::new(),
+            p => format!(" ({:.0}% cached)", self.cache_read as f64 * 100.0 / p as f64),
+        };
+        format!("{} in{cached}, {} out", token_count(self.prompt()), token_count(self.output))
+    }
+
+    fn to_json(self) -> Value {
+        json!({ "input": self.input, "cacheRead": self.cache_read, "cacheCreation": self.cache_creation, "output": self.output })
+    }
+
+    fn from_json(v: &Value) -> Option<TokenUse> {
+        let g = |k: &str| v.get(k).and_then(Value::as_i64);
+        Some(TokenUse { input: g("input")?, cache_read: g("cacheRead")?, cache_creation: g("cacheCreation")?, output: g("output")? })
+    }
+}
+
+/// A request body's size in a few characters: `812B`, `41kB`, `1.3MB`.
+pub fn body_size(bytes: u64) -> String {
+    match bytes {
+        1_000_000.. => format!("{:.1}MB", bytes as f64 / 1_000_000.0),
+        1_000.. => format!("{}kB", bytes / 1_000),
+        _ => format!("{bytes}B"),
+    }
 }
 
 impl Activity {
@@ -94,13 +157,13 @@ impl Activity {
     /// attached TUI shows titles from this machine's Claude Code files.
     pub fn to_json(&self, titles: &crate::titles::Titles, now: i64) -> Value {
         match self {
-            Activity::Start { id, method, path, model, session, client, label } => {
+            Activity::Start { id, method, path, model, session, client, label, bytes, tools } => {
                 let label = label.clone().or_else(|| session.as_deref().map(|s| titles.label(Some(s), now)));
-                json!({ "type": "start", "id": id, "method": method, "path": path, "model": model, "session": session, "client": client, "label": label })
+                json!({ "type": "start", "id": id, "method": method, "path": path, "model": model, "session": session, "client": client, "label": label, "bytes": bytes, "tools": tools })
             }
             Activity::Account { id, account } => json!({ "type": "account", "id": id, "account": account }),
-            Activity::End { id, account, status, elapsed_ms, ok } => {
-                json!({ "type": "end", "id": id, "account": account, "status": status, "elapsedMs": u64::try_from(*elapsed_ms).unwrap_or(u64::MAX), "ok": ok })
+            Activity::End { id, account, status, elapsed_ms, ok, tokens } => {
+                json!({ "type": "end", "id": id, "account": account, "status": status, "elapsedMs": u64::try_from(*elapsed_ms).unwrap_or(u64::MAX), "ok": ok, "tokens": tokens.map(TokenUse::to_json) })
             }
             Activity::Log(line) => json!({ "type": "log", "line": line }),
         }
@@ -119,6 +182,8 @@ impl Activity {
                 session: s("session"),
                 client: s("client"),
                 label: s("label"),
+                bytes: v.get("bytes").and_then(Value::as_u64).unwrap_or(0),
+                tools: v.get("tools").and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok()),
             }),
             "account" => Some(Activity::Account { id: s("id")?, account: s("account").unwrap_or_default() }),
             "end" => Some(Activity::End {
@@ -127,6 +192,7 @@ impl Activity {
                 status: v.get("status").and_then(Value::as_u64).and_then(|n| u16::try_from(n).ok()).unwrap_or(0),
                 elapsed_ms: u128::from(v.get("elapsedMs").and_then(Value::as_u64).unwrap_or(0)),
                 ok: v.get("ok").and_then(Value::as_bool).unwrap_or(false),
+                tokens: v.get("tokens").and_then(TokenUse::from_json),
             }),
             "log" => Some(Activity::Log(s("line")?)),
             _ => None,
@@ -212,13 +278,16 @@ impl Ctx {
         let _ = self.activity.send(Activity::Account { id: info.id.clone(), account: account.to_string() });
     }
 
-    pub fn notify_end(&self, info: &ReqInfo, account: &str, status: u16, elapsed: Duration, ok: bool) {
+    /// Report a request's end. `usage` is the response's `usage` object when
+    /// it had one.
+    pub fn notify_end(&self, info: &ReqInfo, account: &str, status: u16, elapsed: Duration, ok: bool, usage: Option<&Value>) {
         use std::sync::atomic::Ordering;
         self.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
         if !ok {
             self.metrics.requests_failed.fetch_add(1, Ordering::Relaxed);
         }
-        let _ = self.activity.send(Activity::End { id: info.id.clone(), account: account.to_string(), status, elapsed_ms: elapsed.as_millis(), ok });
+        let tokens = usage.and_then(TokenUse::from_usage);
+        let _ = self.activity.send(Activity::End { id: info.id.clone(), account: account.to_string(), status, elapsed_ms: elapsed.as_millis(), ok, tokens });
     }
 
     pub fn intercept_hosts(&self) -> Vec<String> {
@@ -522,12 +591,23 @@ async fn handle(ctx: Ctx, req: Request<Incoming>, peer: IpAddr, tunnel: Option<&
             session: info.session_id.clone(),
             client: info.client.clone(),
             label: None,
+            bytes: body.len() as u64,
+            tools: full_tool_definitions(info.parsed.as_deref()),
         });
     }
     manager.begin_session_request(info.session_id.as_deref(), info.client.as_deref());
     let resp = super::forward::forward(&ctx, &manager, &info, parts.headers, body).await;
     manager.end_session_request(info.session_id.as_deref());
     resp
+}
+
+/// How many of a request's tool definitions carry their schema in the request
+/// itself, as opposed to being left for tool search to load (`defer_loading`).
+/// `None` for a request with no `tools` at all.
+fn full_tool_definitions(parsed: Option<&super::body::Obj>) -> Option<u32> {
+    let tools = parsed?.get("tools")?.as_array()?;
+    let full = tools.iter().filter(|t| t.get("input_schema").is_some() && t.get("defer_loading").and_then(Value::as_bool) != Some(true)).count();
+    u32::try_from(full).ok()
 }
 
 async fn read_body(body: Incoming, limit: usize) -> std::result::Result<Bytes, bool> {
@@ -574,19 +654,11 @@ async fn control(ctx: &Ctx, req: Request<Incoming>, auth: &Auth, asked_pool: Opt
             }
             json_response(StatusCode::OK, q)
         }
+        (Method::GET, "/corrall/sessions") => json_response(StatusCode::OK, ctx.pools.sessions(&ctx.titles, SESSIONS_LIMIT)),
         (Method::GET, "/corrall/activity") => activity_stream(ctx),
         (Method::POST, "/corrall/probe") => match &ctx.prober {
             None => json_response(StatusCode::NOT_IMPLEMENTED, json!({ "ok": false, "error": "probe not available" })),
-            Some(p) => match p.request_manual() {
-                crate::prober::ManualProbe::Started => json_response(StatusCode::OK, json!({ "ok": true, "result": "started" })),
-                crate::prober::ManualProbe::AlreadyRunning => {
-                    json_response(StatusCode::OK, json!({ "ok": false, "result": "already-running", "error": "probe already running" }))
-                }
-                crate::prober::ManualProbe::TooSoon { wait_secs } => json_response(
-                    StatusCode::OK,
-                    json!({ "ok": false, "result": "too-soon", "waitSeconds": wait_secs, "error": format!("probed moments ago; try again in {wait_secs}s") }),
-                ),
-            },
+            Some(p) => probe_response(p.request_manual()),
         },
         (Method::GET, "/corrall/metrics") => {
             let mut r = Response::new(Full::new(Bytes::from(render_metrics(ctx))).map_err(|e| match e {}).boxed());
@@ -688,10 +760,10 @@ async fn control(ctx: &Ctx, req: Request<Incoming>, auth: &Auth, asked_pool: Opt
     }
 }
 
-/// Read a control-route request body and parse it as JSON, defaulting to `{}`
-/// on an empty/absent body. Returns a ready error response on an oversized or
-/// unreadable body, matching the other control routes' conventions. The error
-/// is boxed so the `Ok` path does not carry a full `Response` in its size.
+/// Rows in the sessions document. A terminal shows a few dozen; the cap keeps
+/// a fleet with thousands of sessions from naming every one on each poll.
+pub const SESSIONS_LIMIT: usize = 100;
+
 /// A comment line this often keeps an idle activity stream from being cut by
 /// anything between the daemon and its watcher.
 const ACTIVITY_PING: Duration = Duration::from_secs(15);
@@ -734,6 +806,10 @@ fn activity_stream(ctx: &Ctx) -> Response<BoxBody> {
     r
 }
 
+/// Read a control-route request body and parse it as JSON, defaulting to `{}`
+/// on an empty/absent body. Returns a ready error response on an oversized or
+/// unreadable body, matching the other control routes' conventions. The error
+/// is boxed so the `Ok` path does not carry a full `Response` in its size.
 async fn control_body(req: Request<Incoming>) -> std::result::Result<Value, Box<Response<BoxBody>>> {
     match read_body(req.into_body(), CONTROL_BODY_LIMIT).await {
         Ok(b) => Ok(serde_json::from_slice(&b).unwrap_or(json!({}))),
@@ -809,36 +885,74 @@ fn pools_param(ctx: &Ctx, sub: &str, v: &Value) -> Response<BoxBody> {
     }
 }
 
+/// What a probe request came to, as the probe routes answer it. A refused
+/// probe is an outcome, not an error: 200 with `ok: false`.
+fn probe_response(outcome: crate::prober::ManualProbe) -> Response<BoxBody> {
+    use crate::prober::ManualProbe;
+    match outcome {
+        ManualProbe::Started => json_response(StatusCode::OK, json!({ "ok": true, "result": "started" })),
+        ManualProbe::AlreadyRunning => json_response(StatusCode::OK, json!({ "ok": false, "result": "already-running", "error": "probe already running" })),
+        ManualProbe::TooSoon { wait_secs } => json_response(
+            StatusCode::OK,
+            json!({ "ok": false, "result": "too-soon", "waitSeconds": wait_secs, "error": format!("probed moments ago; try again in {wait_secs}s") }),
+        ),
+        ManualProbe::NotProbeable => {
+            json_response(StatusCode::NOT_FOUND, json!({ "ok": false, "result": "not-probeable", "error": "no OAuth account by that name in that pool" }))
+        }
+    }
+}
+
+/// A change to one account's standing in its pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountChange {
+    Enable,
+    Disable,
+    Priority(i32),
+}
+
+/// Apply `change` to an account, persist it and re-sync the running fleet:
+/// what `corrall enable/disable/priority` do, from inside the server. `id` is
+/// anything those commands accept. Returns the account's name.
+pub fn edit_account(ctx: &Ctx, pool: &str, id: &str, change: AccountChange) -> Result<String> {
+    if !ctx.config().pools.contains_key(pool) {
+        anyhow::bail!("no pool named {pool:?}");
+    }
+    let mut name = String::new();
+    let cfg = Config::update(|c| {
+        let a = crate::cli::find_account_mut(c, Some(pool), id)?;
+        match change {
+            AccountChange::Enable => a.disabled = false,
+            AccountChange::Disable => a.disabled = true,
+            AccountChange::Priority(p) => a.priority = p,
+        }
+        name = a.name.clone();
+        Ok(())
+    })?;
+    reconcile(ctx, cfg);
+    Ok(name)
+}
+
 /// `POST /corrall/pools/{pool}/accounts/{id}/{enable|disable|priority}` — flip a
 /// per-account flag and persist it, mirroring `corrall enable/disable/priority`.
+/// `…/probe` reads that one account's quota now and changes nothing on disk.
 fn account_action(ctx: &Ctx, pool: &str, id: &str, action: &str, v: &Value) -> Response<BoxBody> {
-    let priority = match action {
-        "enable" | "disable" => None,
+    if action == "probe" {
+        return match &ctx.prober {
+            None => json_response(StatusCode::NOT_IMPLEMENTED, json!({ "ok": false, "error": "probe not available" })),
+            Some(p) => probe_response(p.request_account(pool, id)),
+        };
+    }
+    let change = match action {
+        "enable" => AccountChange::Enable,
+        "disable" => AccountChange::Disable,
         "priority" => match v.get("priority").and_then(Value::as_i64) {
-            Some(p) => Some(p as i32),
+            Some(p) => AccountChange::Priority(p as i32),
             None => return json_response(StatusCode::BAD_REQUEST, json!({ "ok": false, "error": "missing or invalid \"priority\"" })),
         },
         _ => return json_response(StatusCode::NOT_FOUND, json!({ "ok": false, "error": "unknown account action" })),
     };
-    if !ctx.config().pools.contains_key(pool) {
-        return json_response(StatusCode::NOT_FOUND, json!({ "ok": false, "error": format!("no pool named {pool:?}") }));
-    }
-    let mut account_name = String::new();
-    match Config::update(|c| {
-        let a = crate::cli::find_account_mut(c, Some(pool), id)?;
-        match action {
-            "enable" => a.disabled = false,
-            "disable" => a.disabled = true,
-            "priority" => a.priority = priority.expect("priority parsed above"),
-            _ => unreachable!(),
-        }
-        account_name = a.name.clone();
-        Ok(())
-    }) {
-        Ok(cfg) => {
-            reconcile(ctx, cfg);
-            json_response(StatusCode::OK, json!({ "ok": true, "pool": pool, "account": account_name }))
-        }
+    match edit_account(ctx, pool, id, change) {
+        Ok(name) => json_response(StatusCode::OK, json!({ "ok": true, "pool": pool, "account": name })),
         Err(e) => json_response(StatusCode::NOT_FOUND, json!({ "ok": false, "error": e.to_string() })),
     }
 }

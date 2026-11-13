@@ -38,7 +38,14 @@ fn main() {
 
 async fn dispatch(cli: Cli) -> Result<()> {
     let json_logs = cli.log_format == "json";
-    match cli.command.unwrap_or(Command::Server(ServerArgs::default())) {
+    // Bare `corrall` in a terminal means "show me the dashboard": the one of
+    // the server already running when there is one, a new server's otherwise.
+    let command = match cli.command {
+        Some(c) => c,
+        None if std::io::IsTerminal::is_terminal(&std::io::stdout()) && running_server().await => Command::Attach(cli::AttachArgs::default()),
+        None => Command::Server(ServerArgs::default()),
+    };
+    match command {
         Command::Server(args) => {
             let interactive = !args.headless && std::io::IsTerminal::is_terminal(&std::io::stdout());
             if !interactive {
@@ -59,7 +66,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
             cli::import_claudeacrobat(a).await
         }
         Command::Accounts { verbose, pool } => cli::accounts(verbose, pool),
-        Command::Status { json, color } => cli::status(json, &color).await,
+        Command::Status { json, color, sessions } => cli::status(json, &color, sessions).await,
         Command::Attach(a) => attach::run(a).await,
         Command::Switch { name, pool } => cli::switch(name, pool).await,
         Command::Remove { name, pool } => cli::remove(name, pool).await,
@@ -80,9 +87,19 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Command::Setup { cmd } => cli::setup(cmd).await,
         Command::CaPath => cli::ca_path(),
         Command::Config { cmd } => cli::config_cmd(cmd),
-        Command::Service { cmd } => cli::service(cmd),
+        Command::Service { cmd } => service::run(cmd),
+        Command::Gnome { cmd } => gnome::run(cmd),
         Command::Update(a) => update::run(&a).await,
         Command::Api { path, account, pool } => cli::api(path, account, pool).await,
+    }
+}
+
+/// Whether the configured address already has a corrall server on it.
+async fn running_server() -> bool {
+    match Config::load() {
+        Ok(Some(cfg)) => attach::server_running(&cfg).await,
+        // No config, or one that will not load: `server` says what is wrong.
+        _ => false,
     }
 }
 
@@ -291,16 +308,30 @@ async fn server(args: ServerArgs, interactive: bool) -> Result<()> {
         let mut rx = activity_tx.subscribe();
         let mut file = activity_file;
         let mut sd = shutdown_rx.clone();
+        // What each open request is, so the line that ends it says whose it
+        // was without a search back through the log for its id.
+        let mut open: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         loop {
             tokio::select! {
                 Ok(a) = rx.recv() => {
                     let line = match a {
-                        proxy::server::Activity::Start { id, method, path, model, session, client, .. } => {
+                        proxy::server::Activity::Start { id, method, path, model, session, client, bytes, tools, .. } => {
                             let label = ctx.titles.label(session.as_deref(), quota::now_ms());
-                            format!("→ {id} {}{label} {method} {path}{}", client.map(|c| format!("[{c}] ")).unwrap_or_default(), model.map(|m| format!(" ({m})")).unwrap_or_default())
+                            let who = format!("{}{label}", client.map(|c| format!("[{c}] ")).unwrap_or_default());
+                            let model = model.map(|m| format!(" ({m})")).unwrap_or_default();
+                            if open.len() >= 4096 {
+                                open.clear();
+                            }
+                            open.insert(id.clone(), format!("{who}{model}").trim().to_string());
+                            let tools = tools.map(|n| format!(", {n} tools in full")).unwrap_or_default();
+                            format!("→ {id} {who} {method} {path}{model} [{}{tools}]", proxy::server::body_size(bytes))
                         }
                         proxy::server::Activity::Account { .. } => continue,
-                        proxy::server::Activity::End { id, account, status, elapsed_ms, ok } => format!("{} {id} → {account} {status} ({:.1}s)", if ok { "✓" } else { "✗" }, elapsed_ms as f64 / 1000.0),
+                        proxy::server::Activity::End { id, account, status, elapsed_ms, ok, tokens } => {
+                            let what = open.remove(&id).filter(|w| !w.is_empty()).map(|w| format!(" {w}")).unwrap_or_default();
+                            let used = tokens.map(|t| format!(" {}", t.note())).unwrap_or_default();
+                            format!("{} {id}{what} → {account} {status} ({:.1}s){used}", if ok { "✓" } else { "✗" }, elapsed_ms as f64 / 1000.0)
+                        }
                         proxy::server::Activity::Log(s) => s,
                     };
                     let line = security::safe_text(&line, 400);

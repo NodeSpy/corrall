@@ -23,7 +23,6 @@ use sha2::{Digest, Sha256};
 
 use crate::security::safe_text;
 
-const UNIT: &str = "corrall.service";
 const GH_HINT: &str = "the GitHub CLI (gh) is required: the repository is private, so its releases cannot be downloaded anonymously. Install gh and run `gh auth login`, or set GH_TOKEN";
 
 #[derive(Args, Debug, Default)]
@@ -40,7 +39,7 @@ pub struct UpdateArgs {
     /// Allow a jump to a new major version (which may change behaviour)
     #[arg(long)]
     pub allow_major: bool,
-    /// Do not restart the systemd --user unit after swapping the binary
+    /// Do not restart the service (systemd --user unit or launchd agent) after swapping the binary
     #[arg(long)]
     pub no_restart: bool,
     /// Skip the post-restart health check (and its automatic rollback)
@@ -111,7 +110,7 @@ pub async fn run(args: &UpdateArgs) -> Result<()> {
     let backup = apply(&repo, &latest, &target)?;
     println!("Updated to {latest} at {}", target.display());
     if args.no_restart {
-        println!("Not restarting {UNIT} (--no-restart); the running server keeps the old binary until restarted.");
+        println!("Not restarting the service (--no-restart); the running server keeps the old binary until restarted.");
         return Ok(());
     }
     if !restart_service() {
@@ -128,9 +127,9 @@ pub async fn run(args: &UpdateArgs) -> Result<()> {
                 eprintln!("rolling back to the previous binary");
                 std::fs::rename(&b, &target).context("restoring the previous binary")?;
                 restart_service();
-                bail!("update rolled back; {UNIT} is running the previous binary again");
+                bail!("update rolled back; {} is running the previous binary again", service_name());
             }
-            bail!("no backup to roll back to; inspect: journalctl --user -u {UNIT}");
+            bail!("no backup to roll back to; inspect: {}", crate::service::Kind::native().map(|k| k.logs_hint()).unwrap_or_default());
         }
     }
     Ok(())
@@ -180,12 +179,18 @@ fn health_url(cfg: Option<&crate::config::Config>) -> String {
 /// Poll the proxy's health endpoint until it answers with a version. Done
 /// in-process: a host without `curl` must not read as an unhealthy server and
 /// roll a good update back.
+///
+/// The proxy key goes with every poll. On loopback the server usually asks
+/// for none, but with `proxy.requireKeyOnLoopback` (or a listener bound to
+/// another address) a keyless poll is answered 401, which read as "not
+/// healthy" and rolled a good update back.
 async fn wait_healthy() -> Result<String> {
     let cfg = crate::config::Config::load().ok().flatten();
-    wait_healthy_at(&health_url(cfg.as_ref()), std::time::Duration::from_secs(20)).await
+    let key = cfg.as_ref().map(|c| c.proxy.api_key.as_str()).filter(|k| !k.is_empty());
+    wait_healthy_at(&health_url(cfg.as_ref()), key, std::time::Duration::from_secs(20)).await
 }
 
-async fn wait_healthy_at(url: &str, budget: std::time::Duration) -> Result<String> {
+async fn wait_healthy_at(url: &str, key: Option<&str>, budget: std::time::Duration) -> Result<String> {
     // The listener is on this machine; an HTTP(S)_PROXY in the environment
     // must not sit between us and it.
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -198,7 +203,11 @@ async fn wait_healthy_at(url: &str, budget: std::time::Duration) -> Result<Strin
     let deadline = std::time::Instant::now() + budget;
     let mut last = String::new();
     while std::time::Instant::now() < deadline {
-        match client.get(url).send().await {
+        let mut req = client.get(url);
+        if let Some(key) = key {
+            req = req.header("x-api-key", key);
+        }
+        match req.send().await {
             Ok(r) if r.status().is_success() => {
                 let v = r
                     .json::<serde_json::Value>()
@@ -378,23 +387,26 @@ fn write_err(dir: &Path, e: std::io::Error) -> anyhow::Error {
     }
 }
 
-/// Restart the unit if it is running. Returns whether a restart happened.
+fn service_name() -> &'static str {
+    crate::service::Kind::native().map(|k| k.name()).unwrap_or("the service")
+}
+
+/// Restart the service if it is running. Returns whether a restart happened.
 fn restart_service() -> bool {
-    if !cfg!(target_os = "linux") {
-        return false;
-    }
-    let active = Command::new("systemctl").args(["--user", "is-active", "--quiet", UNIT]).status().map(|s| s.success()).unwrap_or(false);
-    if !active {
-        println!("{UNIT} is not running; nothing to restart.");
-        return false;
-    }
-    match Command::new("systemctl").args(["--user", "restart", UNIT]).status() {
-        Ok(s) if s.success() => {
-            println!("Restarted {UNIT}.");
+    use crate::service::Restart;
+    let name = service_name();
+    match crate::service::restart() {
+        Restart::NotRunning => {
+            println!("{name} is not running; nothing to restart.");
+            false
+        }
+        Restart::Restarted => {
+            println!("Restarted {name}.");
             true
         }
-        _ => {
-            eprintln!("note: could not restart {UNIT} automatically; run: systemctl --user restart {UNIT}");
+        Restart::Failed => {
+            let hint = crate::service::Kind::native().map(|k| k.restart_hint()).unwrap_or_default();
+            eprintln!("note: could not restart {name} automatically; run: {hint}");
             false
         }
     }
@@ -531,13 +543,43 @@ mod tests {
                 sock.write_all(resp.as_bytes()).await.unwrap();
             }
         });
-        let v = wait_healthy_at(&format!("http://{addr}/corrall/health"), std::time::Duration::from_secs(10)).await.unwrap();
+        let v = wait_healthy_at(&format!("http://{addr}/corrall/health"), None, std::time::Duration::from_secs(10)).await.unwrap();
         assert_eq!(v, "9.9.9");
 
         // Nothing listening: the budget runs out and says so.
         let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap();
-        let err = wait_healthy_at(&format!("http://{closed}/corrall/health"), std::time::Duration::from_millis(700)).await.unwrap_err();
+        let err = wait_healthy_at(&format!("http://{closed}/corrall/health"), None, std::time::Duration::from_millis(700)).await.unwrap_err();
         assert!(err.to_string().contains("no healthy answer"), "{err}");
+    }
+
+    /// A server that wants the key on loopback answers a keyless poll 401.
+    /// The check has to present the key, or every update on such a server
+    /// reads as unhealthy and is rolled back.
+    #[tokio::test]
+    async fn the_health_check_presents_the_proxy_key() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 2048];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
+                let (status, body) = if request.contains("x-api-key: tc-health-0123456789abcdef") {
+                    ("200 OK", r#"{"ok":true,"version":"9.9.9"}"#)
+                } else {
+                    ("401 Unauthorized", r#"{"type":"error"}"#)
+                };
+                let resp = format!("HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+        let url = format!("http://{addr}/corrall/health");
+        let v = wait_healthy_at(&url, Some("tc-health-0123456789abcdef"), std::time::Duration::from_secs(5)).await.unwrap();
+        assert_eq!(v, "9.9.9");
+        let err = wait_healthy_at(&url, None, std::time::Duration::from_millis(700)).await.unwrap_err();
+        assert!(err.to_string().contains("HTTP 401"), "{err}");
     }
 
     #[test]

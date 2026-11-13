@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <!-- two Claude-style starbursts layered: several accounts, one proxy -->
+  <defs>
+    <clipPath id="behind" clip-rule="evenodd">
+      <path clip-rule="evenodd" d="M0,0 H16 V16 H0 Z M16.60,10.5 A6.10,6.10 0 1 0 4.40,10.5 A6.10,6.10 0 1 0 16.60,10.5 Z"/>
+    </clipPath>
+  </defs>
+  <g fill="#2e3436" clip-path="url(#behind)">
+    <circle cx="5.4" cy="5.4" r="1.7"/>
+    <rect x="4.500" y="0.400" width="1.8" height="4.000" rx="0.9" transform="rotate(11.25 5.4 5.4)"/>
+    <rect x="4.500" y="0.400" width="1.8" height="4.000" rx="0.9" transform="rotate(56.25 5.4 5.4)"/>
+    <rect x="4.500" y="0.400" width="1.8" height="4.000" rx="0.9" transform="rotate(101.25 5.4 5.4)"/>
+    <rect x="4.500" y="0.400" width="1.8" height="4.000" rx="0.9" transform="rotate(146.25 5.4 5.4)"/>
+    <rect x="4.500" y="0.400" width="1.8" height="4.000" rx="0.9" transform="rotate(191.25 5.4 5.4)"/>
+    <rect x="4.500" y="0.400" width="1.8" height="4.000" rx="0.9" transform="rotate(236.25 5.4 5.4)"/>
+    <rect x="4.500" y="0.400" width="1.8" height="4.000" rx="0.9" transform="rotate(281.25 5.4 5.4)"/>
+    <rect x="4.500" y="0.400" width="1.8" height="4.000" rx="0.9" transform="rotate(326.25 5.4 5.4)"/>
+  </g>
+  <g fill="#2e3436">
+    <circle cx="10.5" cy="10.5" r="1.7"/>
+    <rect x="9.600" y="5.500" width="1.8" height="4.000" rx="0.9" transform="rotate(11.25 10.5 10.5)"/>
+    <rect x="9.600" y="5.500" width="1.8" height="4.000" rx="0.9" transform="rotate(56.25 10.5 10.5)"/>
+    <rect x="9.600" y="5.500" width="1.8" height="4.000" rx="0.9" transform="rotate(101.25 10.5 10.5)"/>
+    <rect x="9.600" y="5.500" width="1.8" height="4.000" rx="0.9" transform="rotate(146.25 10.5 10.5)"/>
+    <rect x="9.600" y="5.500" width="1.8" height="4.000" rx="0.9" transform="rotate(191.25 10.5 10.5)"/>
+    <rect x="9.600" y="5.500" width="1.8" height="4.000" rx="0.9" transform="rotate(236.25 10.5 10.5)"/>
+    <rect x="9.600" y="5.500" width="1.8" height="4.000" rx="0.9" transform="rotate(281.25 10.5 10.5)"/>
+    <rect x="9.600" y="5.500" width="1.8" height="4.000" rx="0.9" transform="rotate(326.25 10.5 10.5)"/>
+  </g>
+</svg>

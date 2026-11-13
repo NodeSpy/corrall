@@ -349,6 +349,46 @@ pub async fn login_browser(open_browser: bool) -> Result<Tokens> {
     exchange_code(&code, &p.state, &p.verifier, &redirect_uri).await
 }
 
+/// A browser login in progress, for a caller that owns the terminal: nothing
+/// is printed and nothing reads stdin. The caller shows [`BrowserLogin::url`],
+/// then finishes with whichever comes first, the browser coming back to the
+/// loopback listener ([`BrowserLogin::redirect`]) or the user pasting the
+/// address their browser ended up at, which is how it goes when the browser
+/// is on another machine.
+pub struct BrowserLogin {
+    pub url: String,
+    redirect_uri: String,
+    verifier: String,
+    state: String,
+    listener: Option<TcpListener>,
+}
+
+pub async fn start_browser_login() -> Result<BrowserLogin> {
+    let p = pkce();
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.context("binding callback listener")?;
+    let redirect_uri = format!("http://localhost:{}/callback", listener.local_addr()?.port());
+    Ok(BrowserLogin { url: authorize_url(&p, &redirect_uri), redirect_uri, verifier: p.verifier, state: p.state, listener: Some(listener) })
+}
+
+impl BrowserLogin {
+    /// The browser coming back to the loopback listener, as a future that
+    /// owns the listener and resolves to the authorization code. Take it once.
+    pub fn redirect(&mut self) -> impl std::future::Future<Output = Result<String>> + Send + 'static {
+        let (listener, state) = (self.listener.take(), self.state.clone());
+        async move {
+            let listener = listener.ok_or_else(|| anyhow!("the callback listener is already in use"))?;
+            tokio::time::timeout(Duration::from_secs(600), callback_server(listener, state)).await.map_err(|_| anyhow!("login timed out after 10 minutes"))?
+        }
+    }
+
+    /// Exchange what came back for tokens: the code from [`Self::redirect`],
+    /// or what the user pasted (the redirect URL, `code#state`, a bare code).
+    pub async fn finish(&self, code_or_pasted: &str) -> Result<Tokens> {
+        let (code, state) = parse_auth_code(code_or_pasted, &self.state)?;
+        exchange_code(&code, &state, &self.verifier, &self.redirect_uri).await
+    }
+}
+
 /// PKCE material for a manual (copy/paste) login that is carried across two
 /// separate calls — the `authorize_url` is handed out first, then the pasted
 /// code is exchanged later. Used by both `login_paste` (stdin) and the control
@@ -487,6 +527,36 @@ pub fn parse_credentials(raw: &[u8]) -> Result<ImportedCredentials> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The dashboard's login: the sign-in page names a loopback redirect,
+    /// and the browser landing on it hands over the code, with nothing
+    /// printed and nothing read from stdin.
+    #[tokio::test]
+    async fn a_browser_login_takes_its_code_from_the_loopback_redirect() {
+        let mut login = start_browser_login().await.unwrap();
+        let page = url::Url::parse(&login.url).unwrap();
+        let query: std::collections::HashMap<String, String> = page.query_pairs().into_owned().collect();
+        let redirect_uri = &query["redirect_uri"];
+        assert!(redirect_uri.starts_with("http://localhost:") && redirect_uri.ends_with("/callback"), "{redirect_uri}");
+        assert_eq!(query["client_id"], CLIENT_ID);
+        let state = query["state"].clone();
+
+        let redirect = tokio::spawn(login.redirect());
+        // A second taker has no listener to wait on.
+        assert!(login.redirect().await.is_err());
+        // The browser, sent back by the sign-in page.
+        let came_back = format!("{}?code=the-code&state={state}", redirect_uri.replace("localhost", "127.0.0.1"));
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let page = client.get(&came_back).send().await.unwrap();
+        assert!(page.status().is_success());
+        assert_eq!(redirect.await.unwrap().unwrap(), "the-code");
+
+        // A paste carrying another login's state is refused before any
+        // request leaves; that needs no network to see.
+        let err = login.finish("http://localhost:1/callback?code=x&state=someone-elses").await.unwrap_err();
+        assert!(err.to_string().contains("state mismatch"), "{err}");
+    }
 
     #[test]
     fn refresh_token_expiry_is_read_from_the_token_response() {

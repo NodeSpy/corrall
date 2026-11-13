@@ -51,6 +51,9 @@ pub enum ManualProbe {
     AlreadyRunning,
     /// The last manual run was too recent; try again after `wait_secs`.
     TooSoon { wait_secs: u64 },
+    /// The account asked for is not an OAuth account of that pool (an API-key
+    /// account has no usage endpoint to read).
+    NotProbeable,
 }
 
 #[derive(Clone)]
@@ -62,6 +65,8 @@ pub struct Prober {
     /// Held for the whole of a run, scheduled or manual, so two never overlap.
     running: Arc<tokio::sync::Mutex<()>>,
     last_manual: Arc<Mutex<Option<Instant>>>,
+    /// When each account was last probed on its own, by account id.
+    last_single: Arc<Mutex<BTreeMap<String, Instant>>>,
     /// Wakes the loop before its next tick; a reload rings it so an account
     /// just added by a login is probed right away.
     wake: Arc<tokio::sync::Notify>,
@@ -103,6 +108,7 @@ impl Prober {
             seen: Arc::new(Mutex::new(BTreeMap::new())),
             running: Arc::new(tokio::sync::Mutex::new(())),
             last_manual: Arc::new(Mutex::new(None)),
+            last_single: Arc::new(Mutex::new(BTreeMap::new())),
             wake: Arc::new(tokio::sync::Notify::new()),
         }
     }
@@ -232,6 +238,36 @@ impl Prober {
         }
         let p = self.clone();
         tokio::spawn(async move { p.probe_all().await });
+        ManualProbe::Started
+    }
+
+    /// Ask for an immediate probe of one account (the TUI's account view, or
+    /// `POST /corrall/pools/{pool}/accounts/{id}/probe`). `account` is anything
+    /// that names it: id, name, e-mail. One request to the usage endpoint, so
+    /// it is gated per account, [`MANUAL_MIN_GAP`] apart, and like any probe
+    /// it waits its turn: refused while a run holds the lock.
+    pub fn request_account(&self, pool: &str, account: &str) -> ManualProbe {
+        let Some(m) = self.pools.get(pool) else { return ManualProbe::NotProbeable };
+        let Some((id, name)) = m.resolve_pin(account).and_then(|id| m.oauth_accounts().into_iter().find(|(i, _)| *i == id)) else {
+            return ManualProbe::NotProbeable;
+        };
+        let now = Instant::now();
+        {
+            let mut last = self.last_single.lock();
+            last.retain(|_, t| now.duration_since(*t) < MANUAL_MIN_GAP);
+            if let Some(t) = last.get(&id) {
+                return ManualProbe::TooSoon { wait_secs: (MANUAL_MIN_GAP - now.duration_since(*t)).as_secs().max(1) };
+            }
+            if self.running.try_lock().is_err() {
+                return ManualProbe::AlreadyRunning;
+            }
+            last.insert(id.clone(), now);
+        }
+        let p = self.clone();
+        tokio::spawn(async move {
+            let _g = p.running.lock().await;
+            p.probe_one(&m, id, name, 0, Arc::new(AtomicBool::new(false))).await;
+        });
         ManualProbe::Started
     }
 
@@ -477,6 +513,36 @@ mod tests {
         // rule still refuses a second press.
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(matches!(p.request_manual(), ManualProbe::TooSoon { wait_secs } if (1..=30).contains(&wait_secs)));
+    }
+
+    #[tokio::test]
+    async fn one_account_is_probed_on_its_own_clock() {
+        let mut cfg = crate::config::Config::default();
+        let oauth = |name: &str| crate::config::AccountConfig { name: name.into(), access_token: Some("t".into()), ..Default::default() };
+        let key =
+            crate::config::AccountConfig { name: "key".into(), kind: crate::config::AccountType::Apikey, api_key: Some("k".into()), ..Default::default() };
+        cfg.pool_mut(crate::config::DEFAULT_POOL).unwrap().accounts = vec![oauth("a@x.com"), oauth("b@x.com"), key];
+        cfg.ensure_account_ids();
+        let p = Prober::new(Pools::new(&cfg));
+        let pool = crate::config::DEFAULT_POOL;
+
+        assert_eq!(p.request_account(pool, "nobody"), ManualProbe::NotProbeable);
+        assert_eq!(p.request_account("ghost", "a@x.com"), ManualProbe::NotProbeable);
+        assert_eq!(p.request_account(pool, "key"), ManualProbe::NotProbeable, "an API key has no usage endpoint");
+
+        // Held as a run would hold it: nothing starts, and nothing is charged
+        // to the account's clock.
+        let guard = p.running.clone().lock_owned().await;
+        assert_eq!(p.request_account(pool, "a@x.com"), ManualProbe::AlreadyRunning);
+        assert!(p.last_single.lock().is_empty());
+        // Recorded as probed a moment ago: this account waits, another does not.
+        let a = p.pools.get(pool).unwrap().resolve_pin("a@x.com").unwrap();
+        p.last_single.lock().insert(a, Instant::now());
+        assert!(matches!(p.request_account(pool, "a@x.com"), ManualProbe::TooSoon { wait_secs } if wait_secs >= 1));
+        assert_eq!(p.request_account(pool, "b@x.com"), ManualProbe::AlreadyRunning, "b is not gated by a's clock, only by the run");
+        drop(guard);
+        // The whole-fleet gate is separate too.
+        assert!(p.last_manual.lock().is_none());
     }
 
     #[tokio::test]

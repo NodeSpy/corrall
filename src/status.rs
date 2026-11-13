@@ -243,7 +243,7 @@ fn format_sessions(sessions: &Value, paint: Paint) -> String {
     let active = i(sessions, "active");
     let known = i(sessions, "known");
     let mode = if b(sessions, "distribute") {
-        paint.green("distributing")
+        paint.green(if s(sessions, "distributeBy") == Some("usage") { "distributing by usage" } else { "distributing" })
     } else if i(sessions, "draining") > 0 {
         paint.yellow(&format!("draining {}", i(sessions, "draining")))
     } else {
