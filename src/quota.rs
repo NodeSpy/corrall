@@ -195,13 +195,23 @@ impl Quota {
     /// reads lower than what is held for the same window (same reset, within
     /// [`SAME_WINDOW_SLOP_MS`]) is stale and must not pull an account back
     /// under its switch threshold; a lower reading is taken only once the
-    /// window has moved on.
+    /// window has moved on. It still shows the window is the one held, so the
+    /// held reading counts as seen now and does not go stale under a probe.
+    ///
+    /// A reading whose reset has already passed describes a window that is
+    /// over (the endpoint lagging across a rollover, or an answer that was in
+    /// flight when the window ended). Taking it would put back what
+    /// [`Quota::clear_expired`] just dropped, only to drop it again.
     pub fn apply_usage(&mut self, u: &UsagePayload, now: i64) {
         let set = |dst: &mut Bucket, src: &Option<Bucket>| {
             if let Some(b) = src {
+                if b.is_reset(now) {
+                    return;
+                }
                 let same_window = matches!((dst.reset_at, b.reset_at), (Some(d), Some(s)) if (s - d).abs() <= SAME_WINDOW_SLOP_MS);
                 let lower = matches!((dst.utilization, b.utilization), (Some(d), Some(s)) if s < d);
                 if same_window && lower {
+                    dst.seen_at = Some(now);
                     return;
                 }
                 if b.utilization.is_some() {
@@ -223,7 +233,8 @@ impl Quota {
                 Some(_) => set(&mut self.unified7d_sonnet, &u.seven_day_sonnet),
                 None => self.unified7d_sonnet.clear(),
             }
-            self.scoped_weekly = u.scoped_weekly.iter().map(|(k, b)| (k.clone(), Bucket { seen_at: Some(now), ..*b })).collect();
+            self.scoped_weekly =
+                u.scoped_weekly.iter().filter(|(_, b)| !b.is_reset(now)).map(|(k, b)| (k.clone(), Bucket { seen_at: Some(now), ..*b })).collect();
         } else {
             set(&mut self.unified7d_fable, &u.seven_day_fable);
             set(&mut self.unified7d_sonnet, &u.seven_day_sonnet);
@@ -389,6 +400,34 @@ mod tests {
         // A new window (later reset): the lower reading is the truth now.
         q.apply_usage(&probe(0.02, reset + 5 * 3_600_000), 4);
         assert_eq!(q.unified5h.utilization, Some(0.02));
+    }
+
+    #[test]
+    fn a_probe_reading_of_a_window_that_is_over_is_ignored() {
+        let (reset, now) = (1_790_838_000_000, 1_790_838_002_000);
+        let old = UsagePayload { five_hour: Some(Bucket { utilization: Some(0.95), reset_at: Some(reset), seen_at: None }), ..Default::default() };
+        // The window ended and was dropped; a late answer must not bring it back.
+        let mut q = Quota { unified5h: Bucket { utilization: Some(0.95), reset_at: Some(reset), seen_at: Some(1) }, ..Default::default() };
+        assert!(q.clear_expired(now, |_| 0.98));
+        q.apply_usage(&old, now);
+        assert_eq!(q.unified5h, Bucket::default());
+        // What the endpoint says once it has caught up (idle: no reset yet) is taken.
+        let idle = UsagePayload { five_hour: Some(Bucket { utilization: Some(0.0), reset_at: None, seen_at: None }), ..Default::default() };
+        q.apply_usage(&idle, now + 1);
+        assert_eq!(q.unified5h, Bucket { utilization: Some(0.0), reset_at: None, seen_at: Some(now + 1) });
+    }
+
+    #[test]
+    fn a_lower_probe_in_the_same_window_keeps_a_spent_family_reading_fresh() {
+        let reset = 1_790_838_000_000;
+        let stale = family_stale_ms();
+        let mut q = Quota { unified7d_fable: Bucket { utilization: Some(1.02), reset_at: Some(reset), seen_at: Some(0) }, ..Default::default() };
+        // Headers said 102%, the endpoint tops out at 100%: not taken, but seen.
+        let probe = UsagePayload { seven_day_fable: Some(Bucket { utilization: Some(1.0), reset_at: Some(reset), seen_at: None }), ..Default::default() };
+        q.apply_usage(&probe, stale);
+        assert_eq!(q.unified7d_fable, Bucket { utilization: Some(1.02), reset_at: Some(reset), seen_at: Some(stale) });
+        assert!(!q.clear_expired(stale + 1, |_| 0.98), "a reading a probe just confirmed is not stale");
+        assert!(q.clear_expired(2 * stale + 1, |_| 0.98), "left alone, it still goes stale");
     }
 
     #[test]
