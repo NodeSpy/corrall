@@ -9,7 +9,8 @@
 //! (a `corrall login` while the server runs) is probed on the next tick, which
 //! a reload wakes up early, and then joins the rotation from that moment. So
 //! is an account whose credential a reload replaced (a re-login, a rotated
-//! key): its last reading was taken on the old credential.
+//! key): its last reading was taken on the old credential. And so is one
+//! whose quota window just rolled over, which leaves it with no reading.
 //!
 //! The usage endpoint rate-limits the caller, not the account: when it says
 //! 429 it says so for every account of the fleet within the same second. A
@@ -133,6 +134,7 @@ impl Prober {
                 // Before the schedule check, so it runs with probing off too.
                 m.recheck_linked();
                 m.warn_login_expiry();
+                m.expire_quota();
                 let secs = m.probe_seconds();
                 let recheck = m.take_probe_recheck();
                 let Some(claim) = self.claim_due(&name, secs, &m.oauth_accounts(), &recheck, Instant::now()) else { continue };
@@ -160,7 +162,8 @@ impl Prober {
     /// `now + interval + i * interval / n`, and every `interval` after that.
     /// An account without a booking (added since the last tick) is due now and
     /// then keeps the phase of its arrival; so is one named in `recheck`,
-    /// whose credential a reload just replaced. A booking that has slipped
+    /// whose credential a reload just replaced or whose quota window just
+    /// rolled over. A booking that has slipped
     /// more than a whole interval (a long backoff) restarts from `now`.
     ///
     /// Sync on purpose: it keeps the lock guard out of `run`'s future, which

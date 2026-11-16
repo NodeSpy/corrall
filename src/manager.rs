@@ -476,9 +476,10 @@ pub struct ProbeState {
     pub last_run_finished_at: Option<i64>,
     pub next_run_at: Option<i64>,
     pub accounts: HashMap<String, ProbeAccount>,
-    /// Accounts whose credential a reload replaced (a re-login, a rotated
-    /// key) since the prober last asked. The prober drains this and probes
-    /// them ahead of their turn, since the old quota reading may be stale.
+    /// Accounts whose quota reading went out of date since the prober last
+    /// asked: a reload replaced the credential (a re-login, a rotated key),
+    /// or a window rolled over and its reading was dropped. The prober drains
+    /// this and probes them ahead of their turn.
     pub recheck: HashSet<String>,
 }
 
@@ -1061,7 +1062,9 @@ impl Manager {
                     a.requalify = true;
                     learned = Some(a.name.clone());
                 }
-                let _ = a.quota.clear_expired(now, |b| th.for_bucket(b));
+                if a.quota.clear_expired(now, |b| th.for_bucket(b)) {
+                    f.probe.recheck.insert(id.to_string());
+                }
             }
             let a = f.account(id)?;
             let why = f.near_quota(a, None).filter(|_| !before)?;
@@ -1363,8 +1366,16 @@ impl Manager {
         self.with(|f| f.update_available.clone())
     }
 
-    /// Accounts whose credential changed since the last call, and clear the
-    /// list. See [`ProbeState::recheck`].
+    /// Drop every quota window and rate limit that has run out. Selection
+    /// does this on each request; the prober calls it every tick as well, so
+    /// a pool with no traffic does not go on showing a window that is over.
+    pub fn expire_quota(&self) {
+        let now = now_ms();
+        self.with(|f| f.clear_expired_all(now, self));
+    }
+
+    /// Accounts whose quota reading went out of date since the last call,
+    /// and clear the list. See [`ProbeState::recheck`].
     pub fn take_probe_recheck(&self) -> Vec<String> {
         self.with(|f| f.probe.recheck.drain().collect())
     }
@@ -1727,7 +1738,9 @@ impl Fleet {
     fn expire(&mut self, now: i64) {
         let th = self.threshold.clone();
         for a in &mut self.accounts {
-            let _ = a.quota.clear_expired(now, |b| th.for_bucket(b));
+            if a.quota.clear_expired(now, |b| th.for_bucket(b)) {
+                self.probe.recheck.insert(a.id.clone());
+            }
             if let Some(until) = a.rate_limited_until {
                 if until <= now {
                     a.rate_limited_until = None;
@@ -3345,6 +3358,29 @@ mod tests {
         m.sync_config(&cfg_with(vec![base]), crate::config::DEFAULT_POOL);
         assert_eq!(m.credential_of(&id).as_deref(), Some("tok3"));
         assert!(m.take_probe_recheck().is_empty(), "a kept credential is not a change");
+    }
+
+    /// A window that rolls over leaves the account with no reading at all;
+    /// the prober is asked to fetch one rather than leave it to its turn.
+    #[test]
+    fn a_rolled_over_window_flags_the_account_for_a_probe_once() {
+        let mut base = acct("a", 0);
+        base.id = Some("acct-a".into());
+        let m = mgr(&cfg_with(vec![base, acct("b", 0)]));
+        let id = "acct-a".to_string();
+        let now = now_ms();
+        m.with(|f| {
+            f.account_mut(&id).unwrap().quota.unified5h = crate::quota::Bucket { utilization: Some(0.4), reset_at: Some(now + 60_000), seen_at: Some(now) }
+        });
+        m.expire_quota();
+        assert!(m.take_probe_recheck().is_empty(), "a running window is left alone");
+        m.with(|f| f.account_mut(&id).unwrap().quota.unified5h.reset_at = Some(now - 1));
+        m.expire_quota();
+        assert_eq!(m.with(|f| f.account(&id).unwrap().quota.unified5h), crate::quota::Bucket::default());
+        assert_eq!(m.take_probe_recheck(), vec![id.clone()]);
+        // Nothing is left to roll over, so nothing asks again.
+        m.expire_quota();
+        assert!(m.take_probe_recheck().is_empty());
     }
 
     /// A plain reload with nothing changed must not flag anyone: the prober
