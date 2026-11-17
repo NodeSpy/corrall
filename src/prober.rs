@@ -42,6 +42,26 @@ const MANUAL_MIN_GAP: Duration = Duration::from_secs(30);
 /// Per-account start offset within a probe run, so a fleet does not burst the
 /// token/usage endpoints simultaneously.
 const PROBE_STAGGER_MS: u64 = 300;
+/// How long one request to the usage endpoint may take.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Ask the usage endpoint, and ask once more if it does not answer within
+/// `limit`. The endpoint is slow now and then (about one request in two
+/// hundred), and a lone slow answer is not worth a warning in the activity
+/// log; two in a row are reported as "probe timed out". Only a timeout is
+/// retried: any answer, a 429 included, stands.
+async fn usage_with_retry<F, Fut>(limit: Duration, fetch: F) -> UsageResult
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = UsageResult>,
+{
+    for _ in 0..2 {
+        if let Ok(r) = tokio::time::timeout(limit, fetch()).await {
+            return r;
+        }
+    }
+    UsageResult::Error("probe timed out".into())
+}
 
 /// What became of an operator's request for an immediate probe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -336,10 +356,10 @@ impl Prober {
             m.probe_account_status(&id, "error", started, Some(crate::quota::now_ms()), Some(why));
             return RunOutcome::Completed;
         }
-        let mut result = tokio::time::timeout(Duration::from_secs(15), fetch_usage(&cred)).await.unwrap_or(UsageResult::Error("probe timed out".into()));
+        let mut result = usage_with_retry(PROBE_TIMEOUT, || fetch_usage(&cred)).await;
         if matches!(result, UsageResult::Unauthorized) {
             if let Some(c2) = m.ensure_token_fresh(&id, true, OnRefreshFail::Keep).await {
-                result = tokio::time::timeout(Duration::from_secs(15), fetch_usage(&c2)).await.unwrap_or(UsageResult::Error("probe timed out".into()));
+                result = usage_with_retry(PROBE_TIMEOUT, || fetch_usage(&c2)).await;
             }
         }
         let finished = crate::quota::now_ms();
@@ -506,6 +526,32 @@ mod tests {
         let t0 = Instant::now();
         assert_eq!(p.back_off("a", 5, t0), t0 + Duration::from_secs(MIN_INTERVAL * 2));
         assert_eq!(p.back_off("b", 86_400, t0), t0 + MAX_BACKOFF);
+    }
+
+    #[tokio::test]
+    async fn a_lone_timeout_is_retried_and_two_in_a_row_are_reported() {
+        use std::sync::atomic::AtomicUsize;
+        let limit = Duration::from_millis(20);
+        // `slow` of the first calls hang; the rest answer at once.
+        let run = |slow: usize| async move {
+            let calls = AtomicUsize::new(0);
+            let r = usage_with_retry(limit, || {
+                let n = calls.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if n < slow {
+                        std::future::pending::<()>().await;
+                    }
+                    UsageResult::Unauthorized
+                }
+            })
+            .await;
+            (r, calls.load(Ordering::SeqCst))
+        };
+        assert!(matches!(run(0).await, (UsageResult::Unauthorized, 1)));
+        assert!(matches!(run(1).await, (UsageResult::Unauthorized, 2)));
+        let (r, calls) = run(2).await;
+        assert!(matches!(r, UsageResult::Error(e) if e == "probe timed out"));
+        assert_eq!(calls, 2);
     }
 
     #[tokio::test]
