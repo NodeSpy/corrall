@@ -23,11 +23,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Pinned, not ubuntu-latest: the ubuntu-26.04 image built v3.12.2
+          # with AVX instructions in ring's C code, which dies with SIGILL at
+          # startup on CPUs without AVX (older hardware, plain QEMU guests).
           - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
+            os: ubuntu-24.04
             cross: false
           - target: aarch64-unknown-linux-musl
-            os: ubuntu-latest
+            os: ubuntu-24.04
             cross: true
           - target: x86_64-apple-darwin
             os: macos-15-intel
