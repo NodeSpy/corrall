@@ -1,7 +1,7 @@
 {
   "id": "corrall",
   "requirements": {
-    "paseo": ">=0.8.0"
+    "paseo": ">=0.13.0"
   },
   "build": [["npm", "ci", "--omit=dev"]]
 }

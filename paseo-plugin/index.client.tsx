@@ -24,7 +24,7 @@ export default function contribute(client: PluginClientContext) {
   // The surface is registered so it can be opened from the composer pill, the
   // command centre and the slash command; it lives under Settings rather than
   // as a permanent sidebar item.
-  cleanups.push(client.addSurface(SURFACE_ID, CorrallSurface));
+  cleanups.push(client.addScreen({ id: SURFACE_ID, title: "Corrall", Component: CorrallSurface }));
   tryRegister("settings-screen", () =>
     client.addSettingsScreen({
       id: SURFACE_ID,
@@ -34,9 +34,9 @@ export default function contribute(client: PluginClientContext) {
     }),
   );
 
-  // Composer pill on every agent's chat. The helper manages the per-agent
-  // lifecycle and the host-shape difference between Paseo 0.7 and 0.8.
-  tryRegister("composer-pill", () => registerUsagePill(client));
+  // Icon-only usage gauge on every agent's composer, with an attach-style
+  // popover of per-account meters.
+  tryRegister("composer-pill", () => registerUsagePill(client, SURFACE_ID));
 
   // Command centre: open the usage surface from anywhere.
   tryRegister("command-center:open", () =>
@@ -46,8 +46,8 @@ export default function contribute(client: PluginClientContext) {
       icon: "Gauge",
       keywords: ["corrall", "usage", "quota", "limit", "proxy", "claude"],
       context: "global",
-      onSelect({ openSurface }) {
-        openSurface(SURFACE_ID);
+      onSelect({ openScreen }) {
+        openScreen({ screenId: SURFACE_ID });
       },
     }),
   );
@@ -59,8 +59,8 @@ export default function contribute(client: PluginClientContext) {
       description: "Show corrall account usage",
       argumentHint: "",
       context: "agent",
-      onSubmit({ openSurface }) {
-        openSurface(SURFACE_ID);
+      onSubmit({ openScreen }) {
+        openScreen({ screenId: SURFACE_ID });
       },
     }),
   );

@@ -1,207 +1,394 @@
-// Composer-rail usage pill, built on paseo-plugin-helper. The helper registers
-// one pill per agent (subscribing to the agent list) and — crucially — knows
-// that on Paseo 0.8 the pill body is host-rendered from a static label+icon
-// string, so a custom pill component never mounts there. We render a compact
-// read-only summary in the tap-through popover.
+// Composer-rail usage pill. One pill per agent composer, collapsed to a live
+// mini-gauge icon; tapping it opens a popover laid out like `corrall attach`:
+// per account, a 10-cell bar for each window (5h, 7d, 7d per model) with the
+// percentage and the reset countdown, and ► on the account currently serving.
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import { Pressable, Text, View } from "react-native";
 
-import type { PluginClientContext } from "@getpaseo/plugin/client";
-import { useRpc } from "@getpaseo/plugin/client";
-import { Icon, Modal, ScrollView, useToast } from "@getpaseo/plugin/client/react-native";
-import {
-  initClientHelpers,
-  registerComposerPill,
-  usePluginTheme,
-  type ComposerPillRegistrar,
-  type RenderModalProps,
-} from "paseo-plugin-helper/client";
+import type { PluginTheme } from "@getpaseo/plugin";
+import type {
+  PluginButton,
+  PluginButtonContentProps,
+  PluginButtonIconProps,
+  PluginButtonRegistration,
+  PluginClientContext,
+} from "@getpaseo/plugin/client";
+import { Icon } from "@getpaseo/plugin/client/ui";
 
-import type { StatusEnvelope } from "../shared/contracts";
+import type { AccountStatus, StatusEnvelope, StatusResponse } from "../shared/contracts";
 import { statusRpc } from "../shared/contracts";
-import { pct } from "./theme";
-
-// Wire the host primitives the helper needs (once per module load).
-initClientHelpers({ Icon, Modal, useRpc, useToast });
+import { EXHAUSTED_RED, gradientColorAt, pct, stateLabel } from "./theme";
 
 const POLL_MS = 10000;
 
-// Compact read-only summary shown when the pill is tapped. On 0.8 this renders
-// in a narrow anchored popover, so keep it vertically stacked.
-function PillModal({ onOpenSettings, close }: RenderModalProps & { onOpenSettings: () => void }) {
-  const { colors } = usePluginTheme();
-  const callStatus = useRpc(statusRpc);
-  const [env, setEnv] = useState<StatusEnvelope | null>(null);
-  const mounted = useRef(true);
+// Paseo always prints a composer pill's label (falling back to the title) and
+// rejects a blank one. A word joiner survives its trim but renders nothing, so
+// the pill collapses to just the icon; `title` stays the accessible name.
+const ICON_ONLY_LABEL = "⁠";
 
-  useEffect(() => {
-    mounted.current = true;
-    const tick = async () => {
-      try {
-        const next = await callStatus({});
-        if (mounted.current) setEnv(next);
-      } catch {
-        /* leave last value */
+// ── Shared status poller ─────────────────────────────────────────────────────
+// Every pill icon and popover reads one poller, so N open composers cost one
+// request per interval, and it only runs while something is mounted.
+
+type Fetch = () => Promise<StatusEnvelope>;
+
+function createStatusStore(fetch: Fetch) {
+  let env: StatusEnvelope | null = null;
+  let timer: ReturnType<typeof setInterval> | null = null;
+  const listeners = new Set<() => void>();
+
+  const tick = async () => {
+    try {
+      env = await fetch();
+    } catch (err) {
+      env = { state: "error", message: err instanceof Error ? err.message : String(err) };
+    }
+    for (const l of listeners) l();
+  };
+
+  return {
+    subscribe(listener: () => void) {
+      listeners.add(listener);
+      if (!timer) {
+        void tick();
+        timer = setInterval(() => void tick(), POLL_MS);
       }
-    };
-    void tick();
-    const id = setInterval(() => void tick(), POLL_MS);
-    return () => {
-      mounted.current = false;
-      clearInterval(id);
-    };
-  }, [callStatus]);
+      return () => {
+        listeners.delete(listener);
+        if (listeners.size === 0 && timer) {
+          clearInterval(timer);
+          timer = null;
+        }
+      };
+    },
+    get: () => env,
+    stop() {
+      listeners.clear();
+      if (timer) clearInterval(timer);
+      timer = null;
+    },
+  };
+}
 
-  // Keep a fixed height whether loading or loaded: a popover that doesn't
-  // resize when data arrives won't get re-anchored below the pill by the host.
-  if (!env || env.state !== "ok" || !env.status) {
+type StatusStore = ReturnType<typeof createStatusStore>;
+
+function useStatus(store: StatusStore): StatusEnvelope | null {
+  return useSyncExternalStore(store.subscribe, store.get, store.get);
+}
+
+// The account the header of `corrall attach` calls "current": the serving
+// account of the default pool, else any serving account.
+function currentAccount(status: StatusResponse): AccountStatus | null {
+  const def = status.pools.find((p) => p.default) ?? status.pools[0];
+  return (
+    def?.accounts.find((a) => a.serving) ??
+    status.pools.flatMap((p) => p.accounts).find((a) => a.serving) ??
+    null
+  );
+}
+
+// "2h8m" / "6d18h" / "45m" / "-", the terse countdown `corrall attach` prints.
+function shortReset(iso: string | undefined, now: number): string {
+  if (!iso) return "-";
+  const t = Date.parse(iso);
+  if (Number.isNaN(t)) return "-";
+  const secs = Math.round((t - now) / 1000);
+  if (secs <= 0) return "now";
+  const d = Math.floor(secs / 86400);
+  const h = Math.floor((secs % 86400) / 3600);
+  const m = Math.floor((secs % 3600) / 60);
+  if (d > 0) return h ? `${d}d${h}h` : `${d}d`;
+  if (h > 0) return `${h}h${m}m`;
+  if (m > 0) return `${m}m`;
+  return `${secs}s`;
+}
+
+// ── Pill icon: a two-bar live gauge ─────────────────────────────────────────
+
+// Two vertical bars filling from the bottom: the current account's 5h and 7d
+// windows, coloured along the attach gradient. Falls back to a plain gauge
+// glyph until data arrives or when Corrall is unreachable.
+function GaugeIcon({ store, size, color, theme }: PluginButtonIconProps & { store: StatusStore }) {
+  const env = useStatus(store);
+  const acct = env?.state === "ok" && env.status ? currentAccount(env.status) : null;
+  if (!acct) return <Icon name="Gauge" size={size} color={color} />;
+
+  const exhausted = acct.state === "cooling";
+  const barW = Math.max(3, Math.round(size * 0.3));
+  const bar = (util: number) => {
+    const f = util < 0 ? 0 : Math.max(0.08, Math.min(1, util));
     return (
-      <View style={{ height: PANEL_H, justifyContent: "space-between", gap: 12 }}>
-        <View style={{ flex: 1, justifyContent: "center", alignItems: "center" }}>
-          <Text style={{ color: colors.foregroundMuted, fontSize: 13, textAlign: "center" }}>
-            {env?.message ?? "Loading corrall usage…"}
-          </Text>
-        </View>
-        <OpenSettingsButton colors={colors} onPress={() => { close(); onOpenSettings(); }} />
+      <View
+        style={{
+          width: barW,
+          height: size,
+          borderRadius: 1.5,
+          backgroundColor: theme.colors.surface2,
+          justifyContent: "flex-end",
+          overflow: "hidden",
+        }}
+      >
+        <View
+          style={{
+            height: Math.round(size * f),
+            backgroundColor: exhausted ? EXHAUSTED_RED : util < 0 ? color : gradientColorAt(f),
+          }}
+        />
       </View>
     );
-  }
-
+  };
   return (
-    <ScrollView style={{ height: PANEL_H }} contentContainerStyle={{ gap: 16, paddingVertical: 2 }} showsVerticalScrollIndicator={false}>
-      {env.status.pools.map((pool) => (
-        <View key={pool.name} style={{ gap: 2 }}>
-          {/* Pool header doubles as the column header, aligned to the value
-              columns below. */}
-          <View style={{ flexDirection: "row", alignItems: "flex-end", paddingBottom: 4 }}>
-            <Text style={{ flex: 1, color: colors.foreground, fontSize: 13, fontWeight: "700" }}>{pool.name}</Text>
-            <NumCell text="5h" muted colors={colors} />
-            <NumCell text="7d" muted colors={colors} />
-          </View>
-          {pool.accounts.map((a, i) => (
-            <View
-              key={a.id}
-              style={{
-                flexDirection: "row",
-                alignItems: "center",
-                paddingVertical: 5,
-                borderTopWidth: i === 0 ? 0 : 1,
-                borderTopColor: colors.surface2,
-              }}
-            >
-              <View style={{ width: 7, height: 7, borderRadius: 4, marginRight: 8, backgroundColor: dotColor(a, colors) }} />
-              <Text style={{ flex: 1, color: colors.foreground, fontSize: 12 }} numberOfLines={1}>
-                {a.name}
-              </Text>
-              <NumCell text={pct(a.utilization_5h)} colors={colors} tint={utilColor(a.utilization_5h, colors)} />
-              <NumCell text={pct(a.utilization_7d)} colors={colors} tint={utilColor(a.utilization_7d, colors)} />
-            </View>
-          ))}
-        </View>
-      ))}
-      <OpenSettingsButton colors={colors} onPress={() => { close(); onOpenSettings(); }} />
-    </ScrollView>
+    <View style={{ width: size, height: size, flexDirection: "row", justifyContent: "center", gap: 2 }}>
+      {bar(acct.utilization_5h)}
+      {bar(acct.utilization_7d)}
+    </View>
   );
 }
 
-function OpenSettingsButton({
-  colors,
-  onPress,
-}: {
-  colors: { accent: string; accentForeground: string };
-  onPress: () => void;
-}) {
+// ── Popover: an attach-style table ───────────────────────────────────────────
+// One aligned row per account with the window headings printed once, so every
+// figure is there without a label on each bar. A reset countdown replaces the
+// percentage only where it matters: a window 70%+ full, or an account cooling.
+
+const BAR_W = 36;
+const NUM_W = 38;
+const CELL_W = BAR_W + 6 + NUM_W;
+const HOT = 0.7;
+// Keeps the name column readable: the popover sizes to its content.
+const NAME_MIN_W = 104;
+
+function SlimBar({ util, exhausted, theme }: { util: number; exhausted: boolean; theme: PluginTheme }) {
+  const f = util < 0 ? 0 : Math.max(0, Math.min(1, util));
   return (
-    <Pressable
-      accessibilityRole="button"
-      accessibilityLabel="Open Corrall settings"
-      onPress={onPress}
-      style={{
-        flexDirection: "row",
-        alignItems: "center",
-        justifyContent: "center",
-        gap: 6,
-        paddingVertical: 9,
-        borderRadius: 8,
-        backgroundColor: colors.accent,
-      }}
-    >
-      <Icon name="Settings" size={14} color={colors.accentForeground} />
-      <Text style={{ color: colors.accentForeground, fontSize: 13, fontWeight: "600" }}>Manage accounts &amp; pools</Text>
-    </Pressable>
+    <View style={{ width: BAR_W, height: 4, borderRadius: 2, backgroundColor: theme.colors.surface2, overflow: "hidden" }}>
+      <View
+        style={{
+          width: `${f > 0 ? Math.max(8, f * 100) : 0}%`,
+          height: 4,
+          backgroundColor: exhausted ? EXHAUSTED_RED : gradientColorAt(f),
+        }}
+      />
+    </View>
   );
 }
 
-// Fixed popover body height so the anchored popover keeps a stable size (and
-// stays above the pill) when the async data loads in.
-const PANEL_H = 260;
-const COL_W = 46;
-
-// A fixed-width, right-aligned, tabular numeric cell so the % columns line up.
-function NumCell({
-  text,
-  colors,
-  muted,
-  tint,
+function Cell({
+  util,
+  reset,
+  exhausted,
+  now,
+  theme,
 }: {
-  text: string;
-  colors: { foreground: string; foregroundMuted: string };
-  muted?: boolean;
-  tint?: string;
+  util: number;
+  reset?: string;
+  exhausted: boolean;
+  now: number;
+  theme: PluginTheme;
 }) {
+  const hot = exhausted || util >= HOT;
+  const text = hot && reset ? `↻${shortReset(reset, now)}` : pct(util);
+  const color = exhausted ? EXHAUSTED_RED : hot ? theme.colors.statusWarning : theme.colors.foregroundMuted;
   return (
+    <View style={{ width: CELL_W, flexDirection: "row", alignItems: "center", gap: 6 }}>
+      <SlimBar util={util} exhausted={exhausted} theme={theme} />
+      <Text style={{ width: NUM_W, color, fontSize: 11, textAlign: "right", fontVariant: ["tabular-nums"] }} numberOfLines={1}>
+        {text}
+      </Text>
+    </View>
+  );
+}
+
+function Row({
+  a,
+  modelLabel,
+  now,
+  theme,
+}: {
+  a: AccountStatus;
+  modelLabel: string | null;
+  now: number;
+  theme: PluginTheme;
+}) {
+  const cooling = a.state === "cooling";
+  const off = a.disabled || a.state === "needs_login";
+  const note = cooling || off ? stateLabel(a.state, a.disabled, a.serving) : null;
+  const model = modelLabel ? a.models?.find((m) => m.label === modelLabel) : undefined;
+  return (
+    <View style={{ flexDirection: "row", alignItems: "center", gap: 6, paddingVertical: 5, opacity: off ? 0.5 : 1 }}>
+      <Text style={{ width: 10, color: theme.colors.statusSuccess, fontSize: 10 }}>{a.serving ? "►" : ""}</Text>
+      <Text
+        style={{ flex: 1, minWidth: NAME_MIN_W, color: theme.colors.foreground, fontSize: 12, fontWeight: a.serving ? "600" : "400" }}
+        numberOfLines={1}
+      >
+        {shortName(a.name)}
+        {note ? <Text style={{ color: cooling ? theme.colors.statusWarning : theme.colors.foregroundMuted, fontWeight: "400" }}>{`  ${note}`}</Text> : null}
+      </Text>
+      <Cell util={a.utilization_5h} reset={a.reset_5h} exhausted={cooling} now={now} theme={theme} />
+      <Cell util={a.utilization_7d} reset={a.reset_7d} exhausted={cooling} now={now} theme={theme} />
+      {modelLabel ? (
+        model ? (
+          <Cell util={model.utilization} reset={model.reset} exhausted={cooling || model.spent} now={now} theme={theme} />
+        ) : (
+          <View style={{ width: CELL_W }} />
+        )
+      ) : null}
+    </View>
+  );
+}
+
+// "daniel.claude.2@ednition.com" → "daniel.claude.2"; the pool heading already
+// says which fleet it belongs to.
+function shortName(name: string): string {
+  const at = name.indexOf("@");
+  return at > 0 ? name.slice(0, at) : name;
+}
+
+function UsagePopover({
+  store,
+  theme,
+  close,
+  onOpenSettings,
+}: PluginButtonContentProps & { store: StatusStore; onOpenSettings: () => void }) {
+  const env = useStatus(store);
+  // Re-render the countdowns between polls.
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    setNow(Date.now());
+    const id = setInterval(() => setNow(Date.now()), 30000);
+    return () => clearInterval(id);
+  }, [env]);
+
+  const status = env?.state === "ok" ? env.status : undefined;
+  const muted = theme.colors.foregroundMuted;
+  // The per-model weekly column, like attach's "7d fable": the first model
+  // window any account reports.
+  const modelLabel = useMemo(
+    () => status?.pools.flatMap((p) => p.accounts).find((a) => a.models?.length)?.models?.[0]?.label ?? null,
+    [status],
+  );
+  const heading = (text: string, align: "left" | "center" = "center", width?: number) => (
     <Text
       style={{
-        width: COL_W,
-        textAlign: "right",
-        fontSize: muted ? 11 : 12,
-        color: tint ?? (muted ? colors.foregroundMuted : colors.foreground),
-        fontVariant: ["tabular-nums"],
+        width,
+        flex: width ? undefined : 1,
+        minWidth: width ? undefined : NAME_MIN_W,
+        color: muted,
+        fontSize: 10,
+        fontWeight: "600",
+        letterSpacing: 0.5,
+        textTransform: "uppercase",
+        textAlign: align,
       }}
+      numberOfLines={1}
     >
       {text}
     </Text>
   );
+
+  return (
+    <View style={{ gap: 12 }}>
+      {status ? (
+        status.pools.map((pool, i) => (
+          <View key={pool.name}>
+            <View style={{ flexDirection: "row", alignItems: "center", gap: 6, paddingBottom: 2 }}>
+              <View style={{ width: 10 }} />
+              {heading(pool.name, "left")}
+              {heading(i === 0 ? "5h" : "", "center", CELL_W)}
+              {heading(i === 0 ? "7d" : "", "center", CELL_W)}
+              {modelLabel ? heading(i === 0 ? modelLabel : "", "center", CELL_W) : null}
+            </View>
+            {pool.accounts.map((a) => (
+              <Row key={a.id} a={a} modelLabel={modelLabel} now={now} theme={theme} />
+            ))}
+          </View>
+        ))
+      ) : (
+        <Text style={{ color: muted, fontSize: 13, textAlign: "center", paddingVertical: 24 }}>
+          {env?.message ?? "Loading corrall usage…"}
+        </Text>
+      )}
+      <Pressable
+        accessibilityRole="button"
+        accessibilityLabel="Open Corrall settings"
+        onPress={() => {
+          close();
+          onOpenSettings();
+        }}
+        style={{ flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 6, paddingVertical: 4 }}
+      >
+        <Icon name="Settings" size={12} color={muted} />
+        <Text style={{ color: muted, fontSize: 11 }}>Manage accounts &amp; pools</Text>
+      </Pressable>
+    </View>
+  );
 }
 
-// Muted for normal usage; warns/reds as a window fills so hotspots stand out
-// without needing a bar.
-function utilColor(
-  util: number,
-  colors: { foreground: string; foregroundMuted: string; statusWarning: string; statusDanger: string },
-): string {
-  if (util < 0) return colors.foregroundMuted;
-  if (util >= 0.9) return colors.statusDanger;
-  if (util >= 0.7) return colors.statusWarning;
-  return colors.foreground;
-}
+// ── Registration ─────────────────────────────────────────────────────────────
 
-function dotColor(
-  a: { serving: boolean; state: string; disabled: boolean },
-  colors: { statusSuccess: string; statusWarning: string; foregroundMuted: string; border: string },
-): string {
-  if (a.serving) return colors.statusSuccess;
-  if (a.state === "cooling") return colors.statusWarning;
-  if (a.disabled || a.state === "needs_login") return colors.foregroundMuted;
-  return colors.border;
-}
+// Registers the usage pill on every agent composer, following the agent list.
+// Returns cleanup.
+export function registerUsagePill(client: PluginClientContext, settingsId: string): () => void {
+  const store = createStatusStore(() => client.rpc(statusRpc, {}));
+  // agentId → pill and the workspace it was registered in.
+  const pills = new Map<string, { pill: PluginButtonRegistration<string>; workspaceId: string }>();
+  const lifetime = new AbortController();
 
-// Registers the usage pill on every agent composer. The helper manages the
-// per-agent lifecycle and the 0.7-vs-0.8 host-shape difference. Returns cleanup.
-export function registerUsagePill(client: PluginClientContext): () => void {
-  // The helper's registrar accepts both the 0.7 (Component) and 0.8 (button)
-  // pill shapes and probes the host at runtime; our strict 0.8 client type only
-  // advertises the button shape, so bridge the two here. A calm, static
-  // launcher: the product name + a gauge icon. The live per-account detail lives
-  // in the tap-through summary rather than as a scary percentage on the composer.
-  return registerComposerPill(client as unknown as ComposerPillRegistrar, {
-    id: "corrall",
-    title: "corrall",
-    compactTitle: "usage",
-    icon: "Gauge",
-    modalTitle: "corrall usage",
-    modalIcon: "Gauge",
-    renderModal: (props) => <PillModal {...props} onOpenSettings={() => client.openSettings("corrall")} />,
-  });
+  // Stable component identities: the host remounts on a new component type.
+  const PillIcon = (props: PluginButtonIconProps) => <GaugeIcon {...props} store={store} />;
+  const Content = (props: PluginButtonContentProps) => (
+    <UsagePopover {...props} store={store} onOpenSettings={() => client.openSettings(settingsId)} />
+  );
+  const button: PluginButton<string> = {
+    title: "Corrall usage",
+    label: ICON_ONLY_LABEL,
+    icon: PillIcon,
+    behavior: { kind: "popover", Content },
+  };
+
+  const register = (agent: { id: string; workspaceId?: string | null }) => {
+    if (lifetime.signal.aborted || !agent.workspaceId) return;
+    // Agent updates arrive constantly; only (re)register when the agent is new
+    // or moved workspace, so the pill doesn't remount on every status change.
+    if (pills.get(agent.id)?.workspaceId === agent.workspaceId) return;
+    drop(agent.id);
+    const pill = client.addComposerPill({ id: "corrall", workspaceId: agent.workspaceId, agentId: agent.id, button });
+    pills.set(agent.id, { pill, workspaceId: agent.workspaceId });
+  };
+  const drop = (agentId: string) => {
+    pills.get(agentId)?.pill.remove();
+    pills.delete(agentId);
+  };
+  const removeAll = () => {
+    for (const { pill } of pills.values()) pill.remove();
+    pills.clear();
+  };
+
+  void client.paseo.agents
+    .list({ subscribe: {}, signal: lifetime.signal })
+    .then(({ subscription }) => {
+      subscription.subscribe({
+        snapshot: ({ entries }) => {
+          const live = new Set(entries.map(({ agent }) => agent.id));
+          for (const id of [...pills.keys()]) if (!live.has(id)) drop(id);
+          for (const { agent } of entries) register(agent);
+        },
+        update: (message) => {
+          if (message.type !== "agent_update") return;
+          const update = message.payload;
+          if (update.kind === "upsert") register(update.agent);
+          else drop(update.agentId);
+        },
+      });
+      return undefined;
+    })
+    .catch((error) => {
+      if (!lifetime.signal.aborted) console.warn("[corrall] agent observation failed", error);
+    });
+
+  return () => {
+    lifetime.abort();
+    removeAll();
+    store.stop();
+  };
 }

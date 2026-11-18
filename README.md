@@ -401,10 +401,14 @@ mode only), and the Nix packaging.
 
 ## Paseo plugin
 
-`paseo-plugin/` is a [Paseo](https://paseo.sh) plugin (Paseo ≥ 0.8) that shows
+`paseo-plugin/` is a [Paseo](https://paseo.sh) plugin (Paseo ≥ 0.13) that shows
 the same account usage as the TUI inside the Paseo app — one card per account
 with gradient `Session (5h)` / `Weekly (7d)` / per-family bars, `F✓ S✓ O✓`
-family flags, a spend line, plus per-account and per-pool controls.
+family flags, a spend line, plus per-account and per-pool controls. Each
+agent composer also gets a small live gauge icon (the current account's 5h and
+7d windows) that opens an `attach`-style popover of per-account meters.
+Corrall accounts also appear in Paseo's own Usage modal and sidebar, and a
+Claude agent routed through Corrall shows its account in the agent usage popover.
 
 ### Install
 

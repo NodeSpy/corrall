@@ -13,6 +13,7 @@ import {
   statusRpc,
 } from "./shared/contracts";
 import * as handlers from "./server/handlers";
+import { registerUsageSource } from "./server/usage";
 
 export default function contribute(server: PluginServerContext) {
   server.handle(statusRpc, handlers.status);
@@ -25,5 +26,7 @@ export default function contribute(server: PluginServerContext) {
   server.handle(loginStartRpc, handlers.loginStart);
   server.handle(loginSubmitRpc, handlers.loginSubmit);
   server.handle(loginCancelRpc, handlers.loginCancel);
+  // Corrall accounts in Paseo's own Usage modal, sidebar and agent popover.
+  registerUsageSource(server);
   return () => {};
 }

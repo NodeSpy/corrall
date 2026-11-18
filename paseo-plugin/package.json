@@ -5,11 +5,8 @@
   "scripts": {
     "typecheck": "tsc --noEmit"
   },
-  "dependencies": {
-    "paseo-plugin-helper": "^0.4.0-beta.12"
-  },
   "devDependencies": {
-    "@getpaseo/plugin": "0.8.0",
+    "@getpaseo/plugin": "0.13.2",
     "@tanstack/react-query": "^5.90.11",
     "@types/react": "~19.2.0",
     "react": "19.1.0",
