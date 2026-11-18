@@ -7,9 +7,9 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { ActivityIndicator, Pressable, Text, View } from "react-native";
 
 import type { PluginTheme } from "@getpaseo/plugin";
-import type { PluginSurfaceProps } from "@getpaseo/plugin/client";
+import type { PluginScreenProps } from "@getpaseo/plugin/client";
 import { useRpc } from "@getpaseo/plugin/client";
-import { Icon, ScrollView, useToast } from "@getpaseo/plugin/client/react-native";
+import { Icon, ScrollView, useToast } from "@getpaseo/plugin/client/ui";
 
 import type { AccountStatus, PoolStatus, StatusEnvelope } from "../shared/contracts";
 import { disableRpc, enableRpc, priorityRpc, statusRpc } from "../shared/contracts";
@@ -27,7 +27,7 @@ type ModalState =
 
 const POLL_MS = 10000;
 
-export function CorrallSurface({ theme, layout }: PluginSurfaceProps) {
+export function CorrallSurface({ theme, layout }: Pick<PluginScreenProps, "theme" | "layout">) {
   const callStatus = useRpc(statusRpc);
   const [env, setEnv] = useState<StatusEnvelope | null>(null);
   const [loading, setLoading] = useState(true);

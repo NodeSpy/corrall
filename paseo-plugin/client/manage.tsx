@@ -11,7 +11,7 @@ import { ActivityIndicator, Pressable, Text, View } from "react-native";
 
 import type { PluginTheme } from "@getpaseo/plugin";
 import { useRpc } from "@getpaseo/plugin/client";
-import { Modal, TextInput, copyText, useToast } from "@getpaseo/plugin/client/react-native";
+import { Modal, TextInput, copyText, useToast } from "@getpaseo/plugin/client/ui";
 
 import { loginCancelRpc, loginStartRpc, loginSubmitRpc, poolCreateRpc, poolUpdateRpc } from "../shared/contracts";
 import { openExternal } from "./web";
