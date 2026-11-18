@@ -405,8 +405,8 @@ mode only), and the Nix packaging.
 the same account usage as the TUI inside the Paseo app — one card per account
 with gradient `Session (5h)` / `Weekly (7d)` / per-family bars, `F✓ S✓ O✓`
 family flags, a spend line, plus per-account and per-pool controls. Each
-agent composer also gets a small live gauge icon (the current account's 5h and
-7d windows) that opens an `attach`-style popover of per-account meters.
+agent composer also gets a fence icon that opens an `attach`-style table
+of per-account 5h / 7d / per-model meters.
 Corrall accounts also appear in Paseo's own Usage modal and sidebar, and a
 Claude agent routed through Corrall shows its account in the agent usage popover.
 

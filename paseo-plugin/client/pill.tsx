@@ -1,7 +1,7 @@
-// Composer-rail usage pill. One pill per agent composer, collapsed to a live
-// mini-gauge icon; tapping it opens a popover laid out like `corrall attach`:
-// per account, a 10-cell bar for each window (5h, 7d, 7d per model) with the
-// percentage and the reset countdown, and ► on the account currently serving.
+// Composer-rail usage pill. One pill per agent composer, collapsed to a plain
+// fence icon; tapping it opens a popover laid out like `corrall attach`: one
+// row per account with a bar and percentage for each window (5h, 7d, 7d per
+// model), and ► on the account currently serving.
 
 import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import { Pressable, Text, View } from "react-native";
@@ -10,13 +10,12 @@ import type { PluginTheme } from "@getpaseo/plugin";
 import type {
   PluginButton,
   PluginButtonContentProps,
-  PluginButtonIconProps,
   PluginButtonRegistration,
   PluginClientContext,
 } from "@getpaseo/plugin/client";
 import { Icon } from "@getpaseo/plugin/client/ui";
 
-import type { AccountStatus, StatusEnvelope, StatusResponse } from "../shared/contracts";
+import type { AccountStatus, StatusEnvelope } from "../shared/contracts";
 import { statusRpc } from "../shared/contracts";
 import { EXHAUSTED_RED, gradientColorAt, pct, stateLabel } from "./theme";
 
@@ -77,16 +76,6 @@ function useStatus(store: StatusStore): StatusEnvelope | null {
   return useSyncExternalStore(store.subscribe, store.get, store.get);
 }
 
-// The account the header of `corrall attach` calls "current": the serving
-// account of the default pool, else any serving account.
-function currentAccount(status: StatusResponse): AccountStatus | null {
-  const def = status.pools.find((p) => p.default) ?? status.pools[0];
-  return (
-    def?.accounts.find((a) => a.serving) ??
-    status.pools.flatMap((p) => p.accounts).find((a) => a.serving) ??
-    null
-  );
-}
 
 // "2h8m" / "6d18h" / "45m" / "-", the terse countdown `corrall attach` prints.
 function shortReset(iso: string | undefined, now: number): string {
@@ -102,48 +91,6 @@ function shortReset(iso: string | undefined, now: number): string {
   if (h > 0) return `${h}h${m}m`;
   if (m > 0) return `${m}m`;
   return `${secs}s`;
-}
-
-// ── Pill icon: a two-bar live gauge ─────────────────────────────────────────
-
-// Two vertical bars filling from the bottom: the current account's 5h and 7d
-// windows, coloured along the attach gradient. Falls back to a plain gauge
-// glyph until data arrives or when Corrall is unreachable.
-function GaugeIcon({ store, size, color, theme }: PluginButtonIconProps & { store: StatusStore }) {
-  const env = useStatus(store);
-  const acct = env?.state === "ok" && env.status ? currentAccount(env.status) : null;
-  if (!acct) return <Icon name="Gauge" size={size} color={color} />;
-
-  const exhausted = acct.state === "cooling";
-  const barW = Math.max(3, Math.round(size * 0.3));
-  const bar = (util: number) => {
-    const f = util < 0 ? 0 : Math.max(0.08, Math.min(1, util));
-    return (
-      <View
-        style={{
-          width: barW,
-          height: size,
-          borderRadius: 1.5,
-          backgroundColor: theme.colors.surface2,
-          justifyContent: "flex-end",
-          overflow: "hidden",
-        }}
-      >
-        <View
-          style={{
-            height: Math.round(size * f),
-            backgroundColor: exhausted ? EXHAUSTED_RED : util < 0 ? color : gradientColorAt(f),
-          }}
-        />
-      </View>
-    );
-  };
-  return (
-    <View style={{ width: size, height: size, flexDirection: "row", justifyContent: "center", gap: 2 }}>
-      {bar(acct.utilization_5h)}
-      {bar(acct.utilization_7d)}
-    </View>
-  );
 }
 
 // ── Popover: an attach-style table ───────────────────────────────────────────
@@ -335,14 +282,15 @@ export function registerUsagePill(client: PluginClientContext, settingsId: strin
   const lifetime = new AbortController();
 
   // Stable component identities: the host remounts on a new component type.
-  const PillIcon = (props: PluginButtonIconProps) => <GaugeIcon {...props} store={store} />;
   const Content = (props: PluginButtonContentProps) => (
     <UsagePopover {...props} store={store} onOpenSettings={() => client.openSettings(settingsId)} />
   );
   const button: PluginButton<string> = {
     title: "Corrall usage",
     label: ICON_ONLY_LABEL,
-    icon: PillIcon,
+    // A plain line icon in the host's own colour, like the other composer
+    // pills: a fence, for the corral the accounts live in.
+    icon: "Fence",
     behavior: { kind: "popover", Content },
   };
 
