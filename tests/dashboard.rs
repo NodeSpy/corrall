@@ -154,9 +154,14 @@ async fn the_dashboard_manages_accounts_and_settings() {
     keys(&mut tui, &[KeyCode::Down, KeyCode::Down, KeyCode::Down, KeyCode::Down, KeyCode::Enter]).await;
     assert!(Config::load().unwrap().unwrap().session_titles.enabled);
 
+    // The identity line for other apps: on by default, Enter turns it off.
+    keys(&mut tui, &[KeyCode::Down, KeyCode::Down, KeyCode::Enter]).await;
+    assert!(!Config::load().unwrap().unwrap().proxy.inject_claude_code_identity);
+    assert!(line(&tui.screen_text(W, 30), "identity line").contains("off"));
+
     // A row that runs something asks first, and `n` does nothing.
     // The weekly column order is a choice too, kept in the config.
-    keys(&mut tui, &[KeyCode::Down, KeyCode::Down, KeyCode::Down, KeyCode::Enter]).await;
+    keys(&mut tui, &[KeyCode::Down, KeyCode::Down, KeyCode::Enter]).await;
     assert!(Config::load().unwrap().unwrap().fable_column_first);
     assert!(line(&tui.screen_text(W, 30), "Weekly window shown first").contains("7d fable"));
 

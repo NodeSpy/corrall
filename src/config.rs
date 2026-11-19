@@ -155,6 +155,13 @@ pub struct ProxyConfig {
     pub usage_dimensions: Vec<UsageDimension>,
     /// Largest request body accepted from a client, in bytes.
     pub max_body_bytes: u64,
+    /// Prepend Claude Code's identity line to the system prompt of a
+    /// `/v1/messages` request served by a subscription (OAuth) account when
+    /// the client did not send it. Anthropic refuses current models on a
+    /// subscription token without it (a headerless 429), so this is what lets
+    /// an ordinary Anthropic SDK app use the proxy. Claude Code's own requests
+    /// already carry it and are left alone.
+    pub inject_claude_code_identity: bool,
 }
 
 /// The shared client key. The `tc-` prefix is what tells an operator what they
@@ -184,6 +191,7 @@ impl Default for ProxyConfig {
             session_detail: false,
             usage_dimensions: Vec::new(),
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+            inject_claude_code_identity: true,
         }
     }
 }

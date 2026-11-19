@@ -140,6 +140,7 @@ pub enum Setting {
     Expiry,
     Names,
     Telemetry,
+    Identity,
     Warmup,
     WeeklyFirst,
     PointClaude,
@@ -159,9 +160,9 @@ pub enum Kind {
 }
 
 impl Setting {
-    pub const ALL: [Setting; 14] = {
+    pub const ALL: [Setting; 15] = {
         use Setting::*;
-        [Pool, Threshold, Distribute, Probe, Hold, SoonestReset, Expiry, Names, Telemetry, Warmup, WeeklyFirst, PointClaude, UnpointClaude, Service]
+        [Pool, Threshold, Distribute, Probe, Hold, SoonestReset, Expiry, Names, Telemetry, Identity, Warmup, WeeklyFirst, PointClaude, UnpointClaude, Service]
     };
 
     pub fn label(self) -> &'static str {
@@ -176,6 +177,7 @@ impl Setting {
             Expiry => "Expiry-pressure routing",
             Names => "Name sessions from Claude Code's files",
             Telemetry => "Telemetry requests",
+            Identity => "Add Claude Code's identity line for other apps",
             Warmup => "Keep-warm interval",
             WeeklyFirst => "Weekly window shown first",
             PointClaude => "Point Claude Code at the proxy",
@@ -197,6 +199,7 @@ impl Setting {
             Expiry => "Prefer the account whose unused weekly quota is closest to being forfeited.",
             Names => "Read session names, titles and directories from ~/.claude on this machine, for the sessions table and the log.",
             Telemetry => "What happens to Claude Code's /api/event_logging requests: forwarded quietly, forwarded and logged, or answered here without leaving the machine.",
+            Identity => "On subscription accounts, start a request's system prompt with Claude Code's identity line when it lacks one. Without it Anthropic answers current models with a 429, so off breaks Anthropic SDK apps that are not Claude Code.",
             Warmup => "Send a tiny request through each idle account this often so its 5h window is already running. Seconds, 60 or more; off for never.",
             WeeklyFirst => "Which weekly quota column comes first in the accounts table: the shared 7d window or the Fable one. On a narrow terminal only the first is shown.",
             PointClaude => "Write the proxy into ~/.claude/settings.json so every Claude Code session uses it. What `corrall setup claude` does.",
@@ -208,7 +211,7 @@ impl Setting {
     pub fn kind(self) -> Kind {
         use Setting::*;
         match self {
-            Pool | Distribute | SoonestReset | Expiry | Names | Telemetry | WeeklyFirst => Kind::Cycle,
+            Pool | Distribute | SoonestReset | Expiry | Names | Telemetry | Identity | WeeklyFirst => Kind::Cycle,
             Threshold | Probe | Hold | Warmup => Kind::Edit,
             PointClaude | UnpointClaude | Service => Kind::Run,
         }
@@ -236,6 +239,7 @@ impl Setting {
                 EventLogging::Block => "answered here, never forwarded",
             }
             .to_string(),
+            Identity => on_off(cfg.proxy.inject_claude_code_identity),
             Warmup => secs(cfg.warmup_seconds),
             WeeklyFirst => if cfg.fable_column_first { "7d fable" } else { "7d" }.to_string(),
             PointClaude | UnpointClaude | Service => String::new(),
@@ -281,6 +285,7 @@ impl Setting {
             }
             Setting::Names => cfg.session_titles.enabled = !cfg.session_titles.enabled,
             Setting::WeeklyFirst => cfg.fable_column_first = !cfg.fable_column_first,
+            Setting::Identity => cfg.proxy.inject_claude_code_identity = !cfg.proxy.inject_claude_code_identity,
             Setting::Telemetry => {
                 cfg.event_logging = match cfg.event_logging {
                     EventLogging::Hide => EventLogging::Show,
@@ -648,6 +653,11 @@ mod tests {
         }
         assert!(cfg.pool("work").unwrap().soonest_reset && !cfg.pool("default").unwrap().soonest_reset);
         assert!(cfg.session_titles.enabled);
+
+        assert_eq!(show(&cfg, Setting::Identity, "work"), "on");
+        Setting::Identity.step(&mut cfg, "work").unwrap();
+        assert_eq!(show(&cfg, Setting::Identity, "work"), "off");
+        assert!(!cfg.proxy.inject_claude_code_identity);
 
         let mut telemetry = vec![cfg.event_logging];
         for _ in 0..3 {

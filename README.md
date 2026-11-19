@@ -190,6 +190,7 @@ corrall warmup 600           # keep idle accounts' 5h windows running (spends a 
 corrall expiry on            # expiry-pressure routing (--tolerance 1.5 --preempt on)
 corrall soonest-reset on     # spend the soonest-ending week first, then the soonest 5h window
 corrall titles on            # name sessions the way Claude Code does, in the sessions table and the log
+corrall identity off         # stop adding Claude Code's identity line to other apps' requests (on by default)
 corrall login --codex        # add an OpenAI Codex subscription
 corrall import --codex       # or import the Codex CLI's login
 corrall import-claudeacrobat --dry-run   # accounts from a claudeacrobat install
