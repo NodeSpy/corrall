@@ -126,6 +126,8 @@ pub enum Command {
     },
     /// Name sessions from Claude Code's own files, in the sessions table and the activity log (on|off)
     Titles { value: Option<String> },
+    /// Start the system prompt of requests from other apps with Claude Code's identity line on subscription accounts, which Anthropic requires for current models (on|off)
+    Identity { value: Option<String> },
     /// Per-model routing rules
     Route {
         #[command(subcommand)]
@@ -1518,6 +1520,26 @@ pub async fn titles(value: Option<String>) -> Result<()> {
             Config::update(|c| {
                 c.session_titles.enabled = on;
                 eprintln!("sessionTitles.enabled: {on}");
+                Ok(())
+            })?
+        }
+    };
+    notify_reload(&cfg).await;
+    Ok(())
+}
+
+pub async fn identity(value: Option<String>) -> Result<()> {
+    let cfg = match value {
+        None => {
+            let c = Config::load()?.unwrap_or_default();
+            println!("injectClaudeCodeIdentity: {}", if c.proxy.inject_claude_code_identity { "on" } else { "off" });
+            return Ok(());
+        }
+        Some(v) => {
+            let on = parse_on_off(&v)?;
+            Config::update(|c| {
+                c.proxy.inject_claude_code_identity = on;
+                eprintln!("injectClaudeCodeIdentity: {}", if on { "on" } else { "off" });
                 Ok(())
             })?
         }

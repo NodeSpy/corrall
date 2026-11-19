@@ -121,6 +121,7 @@ directory, for a wrapper resolving a project it has not entered yet.
 | `proxy.sessionDetail` | `false` | Include a per-session breakdown in `/corrall/status` |
 | `proxy.usageDimensions` | `[]` | `[{ "name", "header" }]`: request headers consumed by the proxy for attribution (not forwarded) |
 | `proxy.maxBodyBytes` | `67108864` | Largest client request body accepted |
+| `proxy.injectClaudeCodeIdentity` | `true` | On subscription (OAuth) accounts, add Claude Code's identity line ("You are Claude Code, Anthropic's official CLI for Claude.") to the start of a `/v1/messages` system prompt that lacks it. Anthropic answers current models on a subscription token with a bare 429 without it, so this is what lets an ordinary Anthropic SDK app use the proxy. API-key accounts and requests that already carry the line are untouched. Toggle with `corrall identity on|off` or the settings screen |
 | `upstream` | `https://api.anthropic.com` | Upstream base URL. Must be https unless loopback |
 | `switchThreshold` | `0.98` | Number, or table `{ "default": 0.98, "unified7d": 0.9, … }` keyed by bucket |
 | `holdSeconds` | `0` | Hold a request this long when no account can take it, instead of answering at once (429 when the fleet is spent, 502/504 when every account failed; see [When nothing can serve](#when-nothing-can-serve)) |

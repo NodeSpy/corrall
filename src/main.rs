@@ -80,6 +80,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Command::Expiry { value, tolerance, preempt, pool } => cli::expiry(value, tolerance, preempt, pool).await,
         Command::SoonestReset { value, pool } => cli::soonest_reset(value, pool).await,
         Command::Titles { value } => cli::titles(value).await,
+        Command::Identity { value } => cli::identity(value).await,
         Command::Route { cmd, pool } => cli::route(cmd, pool).await,
         Command::Pool { cmd } => cli::pool(cmd).await,
         Command::Env(a) => cli::env(a),

@@ -157,6 +157,46 @@ pub fn sanitize_tool_pairs(m: &mut Obj) -> bool {
     changed
 }
 
+/// The line Anthropic looks for at the head of the system prompt before it
+/// serves current models on a Claude subscription (OAuth) token.
+pub const CLAUDE_CODE_IDENTITY: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
+
+/// What counts as already identified. Unterminated so the Agent SDK variant
+/// ("…for Claude, running within the Claude Agent SDK.") matches too.
+const IDENTITY_PREFIX: &str = "You are Claude Code, Anthropic's official CLI for Claude";
+
+fn identity_block() -> Value {
+    serde_json::json!({ "type": "text", "text": CLAUDE_CODE_IDENTITY })
+}
+
+/// Put [`CLAUDE_CODE_IDENTITY`] at the head of `system` unless some system
+/// text already starts with it. Any block is checked, not only the first:
+/// Claude Code may lead with a billing-header block. A string `system`
+/// becomes `[identity, original]`; a missing one becomes `[identity]`. The
+/// added block carries no `cache_control`, so it takes no cache breakpoint,
+/// and being constant it leaves the cached prefix stable across turns.
+pub fn ensure_claude_code_identity(m: &mut Obj) -> bool {
+    let has = |t: &str| t.trim_start().starts_with(IDENTITY_PREFIX);
+    let new = match m.get("system") {
+        None | Some(Value::Null) => Value::Array(vec![identity_block()]),
+        Some(Value::String(s)) if has(s) => return false,
+        Some(Value::String(s)) if s.trim().is_empty() => Value::Array(vec![identity_block()]),
+        Some(Value::String(s)) => Value::Array(vec![identity_block(), serde_json::json!({ "type": "text", "text": s })]),
+        Some(Value::Array(blocks)) => {
+            if blocks.iter().any(|b| b.get("text").and_then(Value::as_str).is_some_and(has)) {
+                return false;
+            }
+            let mut v = Vec::with_capacity(blocks.len() + 1);
+            v.push(identity_block());
+            v.extend(blocks.iter().cloned());
+            Value::Array(v)
+        }
+        Some(_) => return false, // not a shape we understand; let upstream judge it
+    };
+    m.insert("system".into(), new);
+    true
+}
+
 /// Everything the forwarder applies for an Anthropic-shaped account, in one
 /// pass over an already-parsed body. Returns the bytes to send.
 pub fn apply_all(
@@ -164,6 +204,7 @@ pub fn apply_all(
     parsed: Option<&Obj>,
     account_uuid: Option<&str>,
     anthropic_shaped: bool,
+    inject_identity: bool,
     model_map: &BTreeMap<String, String>,
     strip: &[String],
 ) -> Bytes {
@@ -174,6 +215,13 @@ pub fn apply_all(
         changed |= sanitize_tool_pairs(&mut m);
         if let Some(u) = account_uuid {
             changed |= patch_account_uuid(&mut m, u);
+        }
+        if inject_identity {
+            let added = ensure_claude_code_identity(&mut m);
+            if added {
+                tracing::debug!("added the Claude Code identity line to the system prompt");
+            }
+            changed |= added;
         }
     }
     changed |= rewrite_model(&mut m, model_map);
@@ -240,7 +288,63 @@ mod tests {
     fn apply_all_is_identity_when_nothing_changes() {
         let b = Bytes::from_static(br#"{"model":"claude-opus-5","messages":[]}"#);
         let p = parse(&b);
-        assert_eq!(apply_all(&b, p.as_ref(), None, true, &BTreeMap::new(), &[]), b);
-        assert_eq!(apply_all(&Bytes::from_static(b"not json"), None, None, true, &BTreeMap::new(), &[]), Bytes::from_static(b"not json"));
+        assert_eq!(apply_all(&b, p.as_ref(), None, true, false, &BTreeMap::new(), &[]), b);
+        assert_eq!(apply_all(&Bytes::from_static(b"not json"), None, None, true, false, &BTreeMap::new(), &[]), Bytes::from_static(b"not json"));
+    }
+
+    fn system(m: &Obj) -> Value {
+        m.get("system").cloned().unwrap_or(Value::Null)
+    }
+
+    #[test]
+    fn identity_added_when_system_missing() {
+        let mut m = obj(r#"{"model":"m","messages":[]}"#);
+        assert!(ensure_claude_code_identity(&mut m));
+        assert_eq!(system(&m), serde_json::json!([{ "type": "text", "text": CLAUDE_CODE_IDENTITY }]));
+    }
+
+    #[test]
+    fn identity_prepended_to_string_system() {
+        let mut m = obj(r#"{"system":"Be brief."}"#);
+        assert!(ensure_claude_code_identity(&mut m));
+        assert_eq!(
+            system(&m),
+            serde_json::json!([{ "type": "text", "text": CLAUDE_CODE_IDENTITY }, { "type": "text", "text": "Be brief." }])
+        );
+    }
+
+    #[test]
+    fn identity_prepended_to_block_system_keeping_cache_control() {
+        let mut m = obj(r#"{"system":[{"type":"text","text":"Be brief.","cache_control":{"type":"ephemeral"}}]}"#);
+        assert!(ensure_claude_code_identity(&mut m));
+        let s = system(&m);
+        assert_eq!(s[0], serde_json::json!({ "type": "text", "text": CLAUDE_CODE_IDENTITY }));
+        assert_eq!(s[1], serde_json::json!({ "type": "text", "text": "Be brief.", "cache_control": { "type": "ephemeral" } }));
+    }
+
+    #[test]
+    fn identity_left_alone_when_present() {
+        let cases = [
+            format!(r#"{{"system":"{CLAUDE_CODE_IDENTITY}\nMore."}}"#),
+            format!(r#"{{"system":[{{"type":"text","text":"{CLAUDE_CODE_IDENTITY}"}}]}}"#),
+            // Claude Code leading with a billing-header block.
+            format!(r#"{{"system":[{{"type":"text","text":"x-anthropic-billing-header: cc_version=1"}},{{"type":"text","text":"{CLAUDE_CODE_IDENTITY}"}}]}}"#),
+            r#"{"system":"You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK."}"#.to_string(),
+        ];
+        for c in cases {
+            let mut m = obj(&c);
+            let before = m.clone();
+            assert!(!ensure_claude_code_identity(&mut m), "{c}");
+            assert_eq!(m, before);
+        }
+    }
+
+    #[test]
+    fn apply_all_injects_only_when_asked() {
+        let b = Bytes::from_static(br#"{"model":"m","system":"Be brief.","messages":[]}"#);
+        let p = parse(&b);
+        assert_eq!(apply_all(&b, p.as_ref(), None, true, false, &BTreeMap::new(), &[]), b);
+        let out = parse(&apply_all(&b, p.as_ref(), None, true, true, &BTreeMap::new(), &[])).unwrap();
+        assert_eq!(out["system"][0]["text"], CLAUDE_CODE_IDENTITY);
     }
 }
