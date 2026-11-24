@@ -461,6 +461,28 @@ async fn headerless_429_pauses_briefly_and_retries_the_same_account() {
 }
 
 #[tokio::test]
+async fn a_repeat_headerless_429_on_a_working_account_does_not_hold_it() {
+    let mock = spawn_mock().await;
+    let p = spawn_proxy(cfg_with(vec![account("a", "tok-a", 0, &mock.url())])).await;
+    // The first bare 429 holds the account for its pause, as before, and the
+    // retry is served: the account works.
+    mock.queue("tok-a", Behaviour::RateLimitedNoHeader);
+    let (st, _, _) = post(&p, "/v1/messages", msg("claude-opus-5")).await;
+    assert_eq!(st, 200);
+    // Another one right after is about the request, not the account: it is
+    // still retried, but the account stays in rotation meanwhile.
+    mock.queue("tok-a", Behaviour::RateLimitedNoHeader);
+    let during = async {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        p.manager.status(false)["accounts"][0]["status"].clone()
+    };
+    let ((st, v, _), status) = tokio::join!(post(&p, "/v1/messages", msg("claude-opus-5")), during);
+    assert_eq!(status, "active", "not held while the request waits to retry");
+    assert_eq!(st, 200);
+    assert_eq!(v["served_by"], "tok-a");
+}
+
+#[tokio::test]
 async fn headerless_429s_on_two_accounts_are_answered_without_retrying() {
     let mock = spawn_mock().await;
     let p = spawn_proxy(cfg_with(vec![account("a", "tok-a", 0, &mock.url()), account("b", "tok-b", 0, &mock.url())])).await;

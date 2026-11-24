@@ -486,6 +486,9 @@ async fn attempt(ctx: &Ctx, mgr: &Manager, info: &ReqInfo, account: &Selected, h
     if status.as_u16() != 429 {
         mgr.clear_rate_limited(&account.id);
     }
+    if status.is_success() {
+        mgr.note_answered(&account.id);
+    }
 
     match status.as_u16() {
         429 => {
@@ -533,6 +536,8 @@ async fn attempt(ctx: &Ctx, mgr: &Manager, info: &ReqInfo, account: &Selected, h
             // The same bare 429 on several accounts at once is a throttle
             // in front of all of them: another attempt on any account only
             // adds load to it, and the client retries on its own anyway.
+            // Read before this 429 is noted, which moves the mark it compares.
+            let request_specific = retry_after_parsed.is_none() && mgr.answered_since_headerless_429(&account.id);
             if retry_after_parsed.is_none() && mgr.note_headerless_429(&account.id) {
                 mgr.log(format!(
                     "Headerless 429 on \"{}\" with another account in the last 30s; upstream-wide, answering request {} without retrying",
@@ -547,7 +552,17 @@ async fn attempt(ctx: &Ctx, mgr: &Manager, info: &ReqInfo, account: &Selected, h
                 Some(v) => v.clamp(1, 300) as u64,
                 None => HEADERLESS_429_PAUSE_SECONDS,
             };
-            mgr.mark_rate_limited(&account.id, ra);
+            if request_specific {
+                // The account has served other requests since its last bare
+                // 429, so it is this request upstream refuses. Holding the
+                // account would only move every other session off it.
+                mgr.log(format!(
+                    "Headerless 429 on \"{}\" again while it serves other requests; not holding the account for request {}",
+                    account.name, info.id
+                ));
+            } else {
+                mgr.mark_rate_limited(&account.id, ra);
+            }
             if ra <= INLINE_RETRY_AFTER_MAX_SECONDS || (ra <= rate_limit_absorb_max() && info.hold_ms > 0) {
                 mgr.log(format!("Rate-limit 429 on \"{}\"; waiting {ra}s and retrying the same account", account.name));
                 return Attempt::RetrySame { wait: Duration::from_secs(ra) };
