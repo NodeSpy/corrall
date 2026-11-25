@@ -307,10 +307,7 @@ mod tests {
     fn identity_prepended_to_string_system() {
         let mut m = obj(r#"{"system":"Be brief."}"#);
         assert!(ensure_claude_code_identity(&mut m));
-        assert_eq!(
-            system(&m),
-            serde_json::json!([{ "type": "text", "text": CLAUDE_CODE_IDENTITY }, { "type": "text", "text": "Be brief." }])
-        );
+        assert_eq!(system(&m), serde_json::json!([{ "type": "text", "text": CLAUDE_CODE_IDENTITY }, { "type": "text", "text": "Be brief." }]));
     }
 
     #[test]

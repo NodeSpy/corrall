@@ -388,10 +388,17 @@ async fn attempt(ctx: &Ctx, mgr: &Manager, info: &ReqInfo, account: &Selected, h
     let send = match account.provider {
         Provider::Codex => body.clone(),
         Provider::Anthropic => {
-            let identity = account.kind == AccountType::Oauth
-                && info.path_and_query.starts_with("/v1/messages")
-                && ctx.config().proxy.inject_claude_code_identity;
-            super::body::apply_all(body, info.parsed.as_deref(), account.account_uuid.as_deref(), true, identity, &account.model_map, &account.strip_request_fields)
+            let identity =
+                account.kind == AccountType::Oauth && info.path_and_query.starts_with("/v1/messages") && ctx.config().proxy.inject_claude_code_identity;
+            super::body::apply_all(
+                body,
+                info.parsed.as_deref(),
+                account.account_uuid.as_deref(),
+                true,
+                identity,
+                &account.model_map,
+                &account.strip_request_fields,
+            )
         }
     };
 
