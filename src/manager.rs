@@ -200,6 +200,8 @@ pub struct Account {
     pub throttled_at: Option<i64>,
     /// When this account last answered a 429 with no `retry-after`.
     pub headerless_429_at: Option<i64>,
+    /// When this account last answered a request with a 2xx.
+    pub answered_at: Option<i64>,
     pub last_probe_at: Option<i64>,
     pub entitlement_denied_until: Option<i64>,
     pub dead_refresh_token: Option<String>,
@@ -275,6 +277,7 @@ impl Account {
             quota_hold: false,
             throttled_at: None,
             headerless_429_at: None,
+            answered_at: None,
             last_probe_at: None,
             entitlement_denied_until: None,
             dead_refresh_token: None,
@@ -1165,6 +1168,34 @@ impl Manager {
                 a.headerless_429_at = Some(now);
             }
             f.accounts.iter().filter(|a| a.headerless_429_at.is_some_and(|t| now - t < FLEET_429_WINDOW_MS)).count() >= FLEET_429_ACCOUNTS
+        })
+    }
+
+    /// Record that `id` just answered a request with a 2xx.
+    pub fn note_answered(&self, id: &str) {
+        let now = now_ms();
+        self.with(|f| {
+            if let Some(a) = f.account_mut(id) {
+                a.answered_at = Some(now);
+            }
+        });
+    }
+
+    /// Whether `id` has served a request since its last 429 without a
+    /// `retry-after`, that 429 being recent. If so the account works, and
+    /// another bare 429 now is about the request that drew it: Anthropic
+    /// answers a subscription token that way when the system prompt lacks
+    /// Claude Code's identity line, however much quota the account has. On
+    /// 2026-11-24 one such 313-byte request, retried five times, put its
+    /// account on hold five times in twenty seconds and bounced ten healthy
+    /// sessions between accounts, each paying for a cold prompt cache.
+    pub fn answered_since_headerless_429(&self, id: &str) -> bool {
+        let now = now_ms();
+        self.with(|f| {
+            f.account_mut(id).is_some_and(|a| match (a.headerless_429_at, a.answered_at) {
+                (Some(bare), Some(ok)) => now - bare < FLEET_429_WINDOW_MS && ok > bare,
+                _ => false,
+            })
         })
     }
 

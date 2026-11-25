@@ -181,10 +181,11 @@ impl Prober {
     /// are spread across the interval: account `i` of `n` is next due at
     /// `now + interval + i * interval / n`, and every `interval` after that.
     /// An account without a booking (added since the last tick) is due now and
-    /// then keeps the phase of its arrival; so is one named in `recheck`,
-    /// whose credential a reload just replaced or whose quota window just
-    /// rolled over. A booking that has slipped
-    /// more than a whole interval (a long backoff) restarts from `now`.
+    /// then keeps the phase of its arrival. One named in `recheck`, whose
+    /// credential a reload just replaced or whose quota window just rolled
+    /// over, is due now as well but keeps the slot it already had. A booking
+    /// that has slipped (a long backoff) moves to the next turn of its own
+    /// phase that is still ahead.
     ///
     /// Sync on purpose: it keeps the lock guard out of `run`'s future, which
     /// otherwise would not be `Send`.
@@ -201,16 +202,29 @@ impl Prober {
         let interval = Duration::from_secs(secs.max(MIN_INTERVAL));
         let newly_on = !entry.on;
         entry.on = true;
-        entry.due.retain(|id, _| accounts.iter().any(|(a, _)| a == id) && !recheck.contains(id));
+        entry.due.retain(|id, _| accounts.iter().any(|(a, _)| a == id));
         let n = accounts.len().max(1) as u32;
         let mut picked = Vec::new();
         for (i, (id, name)) in accounts.iter().enumerate() {
             let next = match entry.due.get(id) {
+                // Asked for out of turn: probe it now and leave it in its
+                // slot, one turn on if that turn is less than half an interval
+                // away. Rebooking it from `now` instead would move it onto the
+                // phase of whatever caused the recheck, and quota windows end
+                // on round minutes: every account would drift onto the same
+                // tick and the fleet would be probed in one burst.
+                Some(&t) if t > now && recheck.contains(id) => {
+                    if t - now < interval / 2 {
+                        t + interval
+                    } else {
+                        t
+                    }
+                }
                 Some(&t) if t > now => continue,
-                // Already booked: keep the phase unless it has slipped a whole
-                // interval, which would only queue up a burst of catch-up runs.
-                Some(&t) if t + interval > now => t + interval,
-                Some(_) => now + interval,
+                // Already booked: the next turn of its own phase that is still
+                // ahead, so a booking that slipped several intervals (a long
+                // backoff) neither queues up catch-up runs nor loses its slot.
+                Some(&t) => t + interval * ((now - t).as_nanos() / interval.as_nanos() + 1) as u32,
                 // First tick of the pool: spread the second round out. Later
                 // arrivals simply keep the phase of the tick they arrived on.
                 None if newly_on => now + interval + interval * i as u32 / n,
@@ -461,7 +475,7 @@ mod tests {
     }
 
     #[test]
-    fn a_changed_credential_is_probed_at_once_and_rebooked() {
+    fn a_recheck_is_probed_at_once_and_keeps_its_slot() {
         let p = prober();
         let t0 = Instant::now();
         let a = accts(&["a", "b"]);
@@ -470,12 +484,49 @@ mod tests {
         let c = p.claim_due("default", 300, &a, &["b".to_string()], t0 + Duration::from_secs(20)).unwrap();
         assert_eq!(ids(&c), ["b"]);
         assert_eq!(c.next, Some(t0 + Duration::from_secs(300)));
-        // b's old booking of 450 is gone; it is next due at 320.
+        // b's booking of 450 stands: it is not moved to 320.
         assert_eq!(ids(&p.claim_due("default", 300, &a, &[], t0 + Duration::from_secs(300)).unwrap()), ["a"]);
-        assert_eq!(ids(&p.claim_due("default", 300, &a, &[], t0 + Duration::from_secs(320)).unwrap()), ["b"]);
-        assert_eq!(p.claim_due("default", 300, &a, &[], t0 + Duration::from_secs(450)), None);
+        assert_eq!(p.claim_due("default", 300, &a, &[], t0 + Duration::from_secs(320)), None);
+        assert_eq!(ids(&p.claim_due("default", 300, &a, &[], t0 + Duration::from_secs(450)).unwrap()), ["b"]);
+        // A recheck just ahead of the account's own turn takes that turn's
+        // place: a, due at 600, is probed at 590 and next at 900.
+        assert_eq!(ids(&p.claim_due("default", 300, &a, &["a".to_string()], t0 + Duration::from_secs(590)).unwrap()), ["a"]);
+        assert_eq!(p.claim_due("default", 300, &a, &[], t0 + Duration::from_secs(600)), None);
+        assert_eq!(ids(&p.claim_due("default", 300, &a, &[], t0 + Duration::from_secs(750)).unwrap()), ["b"]);
+        assert_eq!(ids(&p.claim_due("default", 300, &a, &[], t0 + Duration::from_secs(900)).unwrap()), ["a"]);
         // A recheck for an account the pool no longer has is ignored.
-        assert_eq!(p.claim_due("default", 300, &a, &["zz".to_string()], t0 + Duration::from_secs(460)), None);
+        assert_eq!(p.claim_due("default", 300, &a, &["zz".to_string()], t0 + Duration::from_secs(910)), None);
+    }
+
+    #[test]
+    fn windows_that_roll_over_together_do_not_pull_the_fleet_into_one_run() {
+        let p = prober();
+        let t0 = Instant::now();
+        let a = accts(&["a", "b", "c"]);
+        p.claim_due("default", 300, &a, &[], t0).unwrap();
+        // All three windows end on the same round minute: one run now...
+        let all = ["a".to_string(), "b".to_string(), "c".to_string()];
+        assert_eq!(ids(&p.claim_due("default", 300, &a, &all, t0 + Duration::from_secs(60)).unwrap()), ["a", "b", "c"]);
+        // ...and then one at a time again, 100s apart as before.
+        assert_eq!(ids(&p.claim_due("default", 300, &a, &[], t0 + Duration::from_secs(300)).unwrap()), ["a"]);
+        assert_eq!(ids(&p.claim_due("default", 300, &a, &[], t0 + Duration::from_secs(400)).unwrap()), ["b"]);
+        assert_eq!(ids(&p.claim_due("default", 300, &a, &[], t0 + Duration::from_secs(500)).unwrap()), ["c"]);
+    }
+
+    #[test]
+    fn a_long_slip_keeps_each_account_on_its_own_phase() {
+        let p = prober();
+        let t0 = Instant::now();
+        let a = accts(&["a", "b", "c"]);
+        p.claim_due("default", 300, &a, &[], t0).unwrap();
+        // Nothing runs until 1010 (bookings were 300, 400, 500): one run for
+        // all three, then a at 1200, b at 1100, c at 1100 + 100.
+        let c = p.claim_due("default", 300, &a, &[], t0 + Duration::from_secs(1010)).unwrap();
+        assert_eq!(ids(&c), ["a", "b", "c"]);
+        assert_eq!(c.next, Some(t0 + Duration::from_secs(1100)));
+        assert_eq!(ids(&p.claim_due("default", 300, &a, &[], t0 + Duration::from_secs(1100)).unwrap()), ["c"]);
+        assert_eq!(ids(&p.claim_due("default", 300, &a, &[], t0 + Duration::from_secs(1200)).unwrap()), ["a"]);
+        assert_eq!(ids(&p.claim_due("default", 300, &a, &[], t0 + Duration::from_secs(1300)).unwrap()), ["b"]);
     }
 
     #[test]
@@ -509,9 +560,9 @@ mod tests {
         // Due by the plain schedule, but still backing off.
         assert_eq!(p.claim_due("default", 300, &a, &[], t0 + Duration::from_secs(301)), None);
         assert_eq!(p.claim_due("default", 300, &a, &[], t0 + Duration::from_secs(599)), None);
-        // When it lifts, both overdue accounts run in one (staggered) run: a's
-        // booking of 300 has slipped a whole interval and restarts from now;
-        // b's of 450 keeps its phase.
+        // When it lifts, both overdue accounts run in one (staggered) run and
+        // each moves to the next turn of its own phase: a from 300 to 900, b
+        // from 450 to 750.
         let c = p.claim_due("default", 300, &a, &[], t0 + Duration::from_secs(600)).unwrap();
         assert_eq!(ids(&c), ["a", "b"]);
         assert_eq!(c.next, Some(t0 + Duration::from_secs(750)));
